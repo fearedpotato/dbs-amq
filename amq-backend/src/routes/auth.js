@@ -42,7 +42,7 @@ router.post('/register', async (req, res) => {
             to: email,
             subject: 'Verify your account',
             html: `<p>Hi ${username}! Click the link below to verify your account:</p>
-             <a href="${process.env.BASE_URL}/api/auth/verify?token=${verifyToken}">Verify Email</a>`
+             <a href="${process.env.BASE_URL}/verify?token=${verifyToken}">Verify Email</a>`
         });
 
         res.status(201).json({ message: 'User created successfully. Please verify your email.' });

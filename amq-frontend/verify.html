@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Verify Email — DBS</title>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<div class="verify-wrapper">
+  <div class="verify-card" id="card">
+    <div class="verify-icon" id="icon">⏳</div>
+    <h1 id="title">Verifying your email...</h1>
+    <p id="message">Please wait a moment.</p>
+    <a href="login.html" class="btn btn-primary" id="actionBtn" style="display:none">Go to Login</a>
+  </div>
+</div>
+
+<script src="auth.js"></script>
+<script>
+  const icon = document.getElementById('icon');
+  const title = document.getElementById('title');
+  const message = document.getElementById('message');
+  const actionBtn = document.getElementById('actionBtn');
+  console.log('URL:', window.location.href);
+  console.log('Search:', window.location.search);
+  console.log('Token:', new URLSearchParams(window.location.search).get('token'));
+  async function verify() {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('token');
+
+    if (!token) {
+      icon.textContent = '❌';
+      title.textContent = 'Invalid link';
+      message.textContent = 'This verification link is invalid or has already been used.';
+      actionBtn.style.display = 'inline-flex';
+      return;
+    }
+
+    try {
+      await apiFetch(`/auth/verify?token=${token}`);
+      icon.textContent = '✅';
+      title.textContent = 'Email verified!';
+      message.textContent = 'Your account has been verified. You can now sign in.';
+    } catch (err) {
+      icon.textContent = '❌';
+      title.textContent = 'Verification failed';
+      message.textContent = err.message || 'This link may have already been used or expired.';
+    } finally {
+      actionBtn.style.display = 'inline-flex';
+    }
+  }
+
+  verify();
+</script>
+</body>
+</html>
