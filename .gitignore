@@ -1,0 +1,5 @@
+amq-backend/node_modules/
+amq-backend/.env
+amq-backend/src/generated/prisma
+
+amq-frontend/node_modules/
