@@ -15,37 +15,172 @@ datasource db {
 }
 
 model User {
-  id              Int      @id @default(autoincrement())
-  username        String   @unique
-  email           String   @unique
-  password        String
-  nickname        String
-  isVerified      Boolean  @default(false)
-  verifyToken     String?
+  id                   Int       @id @default(autoincrement())
+  username             String    @unique
+  email                String    @unique
+  password             String
+  nickname             String
+  isVerified           Boolean   @default(false)
+  verifyToken          String?
   resetPasswordToken   String?
   resetPasswordExpires DateTime?
-  malAccessToken  String?
-  malRefreshToken String?
-  malUsername     String?
-  createdAt       DateTime @default(now())
-  games           Game[]
+  malAccessToken       String?
+  malRefreshToken      String?
+  malUsername          String?
+  createdAt            DateTime  @default(now())
+
+  hostedLobbies    Lobby[]       @relation("LobbyHost")
+  lobbyMemberships LobbyPlayer[]
+  sourcedRounds    GameRound[]   @relation("RoundSourcePlayer")
+  roundGuesses     RoundGuess[]
 }
 
-model Game {
-  id        Int      @id @default(autoincrement())
-  userId    Int
-  user      User     @relation(fields: [userId], references: [id])
-  score     Int      @default(0)
-  createdAt DateTime @default(now())
-  rounds    Round[]
+model Lobby {
+  id                    Int           @id @default(autoincrement())
+  code                  String        @unique
+  name                  String?
+  hostUserId            Int
+  host                  User          @relation("LobbyHost", fields: [hostUserId], references: [id])
+  status                LobbyStatus   @default(WAITING)
+  isPrivate             Boolean       @default(false)
+  minPlayers            Int           @default(2)
+  maxPlayers            Int           @default(8)
+  roundCount            Int           @default(10)
+  guessSeconds          Int           @default(20)
+  sampleSeconds         Int           @default(10)
+  answersRevealSeconds  Int           @default(3)
+  solutionRevealSeconds Int           @default(8)
+  sourceMode            SourceMode    @default(HYBRID)
+  selectionMode         SelectionMode @default(STANDARD)
+  themeMode             ThemeMode     @default(MIXED)
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  players  LobbyPlayer[]
+  sessions GameSession[]
 }
 
-model Round {
-  id           Int     @id @default(autoincrement())
-  gameId       Int
-  game         Game    @relation(fields: [gameId], references: [id])
-  animeId      Int
-  animeTitle   String
-  openingTitle String
-  correct      Boolean
+model LobbyPlayer {
+  id          Int      @id @default(autoincrement())
+  lobbyId     Int
+  userId      Int
+  displayName String
+  isConnected Boolean  @default(true)
+  joinedAt    DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  lobby Lobby @relation(fields: [lobbyId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([lobbyId, userId])
+  @@index([lobbyId])
+}
+
+model GameSession {
+  id                    Int               @id @default(autoincrement())
+  lobbyId               Int
+  status                GameSessionStatus @default(WAITING)
+  currentRound          Int               @default(0)
+  roundCount            Int
+  guessSeconds          Int
+  sampleSeconds         Int
+  answersRevealSeconds  Int               @default(3)
+  solutionRevealSeconds Int               @default(8)
+  sourceMode            SourceMode
+  selectionMode         SelectionMode
+  themeMode             ThemeMode
+  startedAt             DateTime?
+  endedAt               DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  lobby  Lobby       @relation(fields: [lobbyId], references: [id], onDelete: Cascade)
+  rounds GameRound[]
+
+  @@index([lobbyId, status])
+}
+
+model GameRound {
+  id                   Int         @id @default(autoincrement())
+  sessionId            Int
+  index                Int
+  status               RoundStatus @default(PENDING)
+  animeId              Int
+  animeTitle           String
+  themeType            String
+  themeTitle           String?
+  sampleStartSec       Int         @default(0)
+  sampleDurationSec    Int
+  solutionVideoUrl     String?
+  solutionAudioUrl     String?
+  sourcePlayerId       Int?
+  guessEndsAt          DateTime?
+  answersRevealEndsAt  DateTime?
+  solutionRevealEndsAt DateTime?
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+
+  session      GameSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sourcePlayer User?        @relation("RoundSourcePlayer", fields: [sourcePlayerId], references: [id], onDelete: SetNull)
+  guesses      RoundGuess[]
+
+  @@unique([sessionId, index])
+  @@index([sessionId, status])
+}
+
+model RoundGuess {
+  id           Int      @id @default(autoincrement())
+  roundId      Int
+  userId       Int
+  guessText    String?
+  guessAnimeId Int?
+  isCorrect    Boolean?
+  isReady      Boolean  @default(false)
+  submittedAt  DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  round GameRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  user  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([roundId, userId])
+  @@index([roundId])
+}
+
+enum LobbyStatus {
+  WAITING
+  IN_GAME
+  CLOSED
+}
+
+enum GameSessionStatus {
+  WAITING
+  IN_PROGRESS
+  FINISHED
+  CANCELLED
+}
+
+enum RoundStatus {
+  PENDING
+  GUESSING
+  ANSWERS_REVEAL
+  SOLUTION_REVEAL
+  ROUND_END
+}
+
+enum SourceMode {
+  POPULAR
+  MAL_ONLY
+  HYBRID
+}
+
+enum SelectionMode {
+  STANDARD
+  BALANCED_STRICT
+  BALANCED_RELAXED
+}
+
+enum ThemeMode {
+  OP_ONLY
+  ED_ONLY
+  MIXED
 }
