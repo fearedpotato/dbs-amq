@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/dbs-amq.iml" filepath="$PROJECT_DIR$/.idea/dbs-amq.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/djabusite.iml" filepath="$PROJECT_DIR$/.idea/djabusite.iml" />
     </modules>
   </component>
 </project>

@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, '../../amq-frontend')));
+app.use(express.static(path.join(__dirname, '../../frontend')));
 app.use(session({
     secret: process.env.JWT_SECRET,
     resave: false,
@@ -24,7 +24,7 @@ app.get('/', (req, res) => {
 })
 
 app.get('/verify', (req, res) => {
-    res.sendFile(path.join(__dirname, '../../amq-frontend/verify.html'));
+    res.sendFile(path.join(__dirname, '../../frontend/verify.html'));
 });
 
 app.use('/api/auth', authRoutes);
