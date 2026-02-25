@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const lobbyService = require('../game/lobbyService');
 const sessionService = require('../game/sessionService');
 const { httpError } = require('../game/errors');
+const { createRoundEngine } = require('./roundEngine');
 
 function parseSocketToken(socket) {
     const authToken = socket.handshake?.auth?.token;
@@ -39,7 +40,7 @@ function attachRealtime(httpServer, options = {}) {
         }
     });
 
-    const readyByLobby = new Map();
+    const roundEngine = createRoundEngine(io);
 
     io.use((socket, next) => {
         try {
@@ -95,12 +96,6 @@ function attachRealtime(httpServer, options = {}) {
                 const code = String(payload.lobbyCode || '').toUpperCase();
                 if (!code) throw httpError(400, 'Lobby code is required');
 
-                const ready = readyByLobby.get(code);
-                if (ready) {
-                    ready.delete(userId);
-                    if (ready.size === 0) readyByLobby.delete(code);
-                }
-
                 socket.leave(code);
                 socket.data.lobbies.delete(code);
 
@@ -142,7 +137,11 @@ function attachRealtime(httpServer, options = {}) {
 
                 const session = await sessionService.startSessionFromLobby(lobby);
                 const updatedLobby = await lobbyService.getLobbyByCode(code);
-                readyByLobby.delete(code);
+                await roundEngine.startSession({
+                    lobbyCode: code,
+                    session,
+                    lobby: updatedLobby
+                });
 
                 io.to(code).emit('game:started', {
                     sessionId: session.id,
@@ -156,6 +155,25 @@ function attachRealtime(httpServer, options = {}) {
             }
         });
 
+        socket.on('round:submit_guess', async (payload = {}, ack) => {
+            try {
+                const code = String(payload.lobbyCode || '').toUpperCase();
+                if (!code) throw httpError(400, 'Lobby code is required');
+                if (!socket.data.lobbies.has(code)) {
+                    throw httpError(400, 'Join lobby before submitting guesses');
+                }
+
+                const result = await roundEngine.submitGuess({
+                    lobbyCode: code,
+                    userId,
+                    payload
+                });
+                if (typeof ack === 'function') ack({ ok: true, ...result });
+            } catch (err) {
+                emitSocketError(err, 'round_guess_failed', ack);
+            }
+        });
+
         socket.on('round:set_ready', async (payload = {}, ack) => {
             try {
                 const code = String(payload.lobbyCode || '').toUpperCase();
@@ -163,25 +181,12 @@ function attachRealtime(httpServer, options = {}) {
                 if (!socket.data.lobbies.has(code)) {
                     throw httpError(400, 'Join lobby before setting readiness');
                 }
-
-                const isReady = payload.ready !== false;
-                const set = readyByLobby.get(code) || new Set();
-                if (isReady) set.add(userId);
-                else set.delete(userId);
-                if (set.size === 0) readyByLobby.delete(code);
-                else readyByLobby.set(code, set);
-
-                const lobby = await lobbyService.getLobbyByCode(code);
-                if (!lobby) throw httpError(404, 'Lobby not found');
-
-                const lobbyUserIds = lobby.players.map((player) => player.userId);
-                const readyUserIds = [...set].filter((id) => lobbyUserIds.includes(id));
-                const allReady = lobbyUserIds.length > 0 && lobbyUserIds.every((id) => set.has(id));
-
-                const payloadOut = { lobbyCode: code, readyUserIds, allReady };
-                io.to(code).emit('round:ready_state', payloadOut);
-
-                if (typeof ack === 'function') ack({ ok: true, ...payloadOut });
+                const result = await roundEngine.setReady({
+                    lobbyCode: code,
+                    userId,
+                    ready: payload.ready
+                });
+                if (typeof ack === 'function') ack({ ok: true, ...result });
             } catch (err) {
                 emitSocketError(err, 'round_ready_failed', ack);
             }
@@ -190,12 +195,7 @@ function attachRealtime(httpServer, options = {}) {
         socket.on('disconnect', async () => {
             for (const code of socket.data.lobbies) {
                 try {
-                    const ready = readyByLobby.get(code);
-                    if (ready) {
-                        ready.delete(userId);
-                        if (ready.size === 0) readyByLobby.delete(code);
-                    }
-
+                    await roundEngine.onPlayerDisconnected(code, userId);
                     await lobbyService.setPlayerConnection(code, userId, false);
                     await broadcastLobbyState(io, code);
                 } catch (err) {

@@ -15,8 +15,13 @@ jest.mock('../../game/sessionService', () => ({
     startSessionFromLobby: jest.fn()
 }));
 
+jest.mock('../roundEngine', () => ({
+    createRoundEngine: jest.fn()
+}));
+
 const lobbyService = require('../../game/lobbyService');
 const sessionService = require('../../game/sessionService');
+const { createRoundEngine } = require('../roundEngine');
 const { attachRealtime } = require('../socket');
 
 function buildLobby({ code = 'ABC123', hostId = 1, playerIds = [1, 2] } = {}) {
@@ -50,6 +55,7 @@ describe('socket gateway', () => {
     let io;
     let baseUrl;
     let clients;
+    let roundEngineMock;
 
     beforeAll(() => {
         process.env.JWT_SECRET = 'test-jwt-secret';
@@ -59,6 +65,16 @@ describe('socket gateway', () => {
         clients = [];
         const app = express();
         server = http.createServer(app);
+
+        roundEngineMock = {
+            startSession: jest.fn(),
+            submitGuess: jest.fn(),
+            setReady: jest.fn(),
+            onPlayerDisconnected: jest.fn(),
+            hasActiveSession: jest.fn()
+        };
+        createRoundEngine.mockReturnValue(roundEngineMock);
+
         io = attachRealtime(server, { origin: true });
 
         await new Promise((resolve) => {
@@ -142,6 +158,9 @@ describe('socket gateway', () => {
         lobbyService.joinLobby.mockResolvedValue(lobby);
         lobbyService.setPlayerConnection.mockResolvedValue(lobby);
         lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+        roundEngineMock.setReady
+            .mockResolvedValueOnce({ roundId: 11, readyUserIds: [1], allReady: false })
+            .mockResolvedValueOnce({ roundId: 11, readyUserIds: [1, 2], allReady: true });
 
         const c1 = await connectClient({ userId: 1, username: 'u1' });
         const c2 = await connectClient({ userId: 2, username: 'u2' });
@@ -156,6 +175,27 @@ describe('socket gateway', () => {
         const ack2 = await emitWithAck(c2, 'round:set_ready', { lobbyCode: 'ABC123', ready: true });
         expect(ack2.ok).toBe(true);
         expect(ack2.allReady).toBe(true);
+    });
+
+    test('submits round guess through round engine', async () => {
+        const lobby = buildLobby({ code: 'ABC123', playerIds: [1] });
+        lobbyService.joinLobby.mockResolvedValue(lobby);
+        lobbyService.setPlayerConnection.mockResolvedValue(lobby);
+        lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+        roundEngineMock.submitGuess.mockResolvedValue({ roundId: 77 });
+
+        const client = await connectClient({ userId: 1, username: 'u1' });
+        await emitWithAck(client, 'lobby:join', { lobbyCode: 'ABC123' });
+
+        const ack = await emitWithAck(client, 'round:submit_guess', {
+            lobbyCode: 'ABC123',
+            roundId: 77,
+            guessText: 'Naruto'
+        });
+
+        expect(ack.ok).toBe(true);
+        expect(ack.roundId).toBe(77);
+        expect(roundEngineMock.submitGuess).toHaveBeenCalled();
     });
 
     test('marks player disconnected on socket disconnect', async () => {
