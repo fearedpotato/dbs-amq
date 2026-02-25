@@ -5,8 +5,8 @@ const router = express.Router();
 const prisma = require('../lib/prisma');
 const authMiddleware = require('../middleware/auth');
 
-// Step 1: Redirect user to MAL login
-router.get('/login', authMiddleware, (req, res) => {
+// Step 1: Generate MAL login URL for authenticated user
+router.post('/login', authMiddleware, (req, res) => {
     const codeVerifier = crypto.randomBytes(32).toString('base64url');
 
     req.session.codeVerifier = codeVerifier;
@@ -20,7 +20,7 @@ router.get('/login', authMiddleware, (req, res) => {
         code_challenge_method: 'plain'
     });
 
-    res.redirect(`https://myanimelist.net/v1/oauth2/authorize?${params}`);
+    res.json({ url: `https://myanimelist.net/v1/oauth2/authorize?${params}` });
 });
 
 // Step 2: MAL redirects back here with a code

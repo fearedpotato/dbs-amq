@@ -204,8 +204,14 @@ async function saveNickname() {
     }
 }
 
-function connectMAL() {
-    window.location.href = `/api/mal/login?jwt=${auth.getToken()}`;
+async function connectMAL() {
+    try {
+        const data = await apiFetch('/mal/login', { method: 'POST' });
+        if (!data?.url) throw new Error('Could not start MAL connection');
+        window.location.href = data.url;
+    } catch (err) {
+        alert(err.message);
+    }
 }
 
 function disconnectMAL() {

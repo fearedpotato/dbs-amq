@@ -103,6 +103,10 @@ router.post('/login', async (req, res) => {
             return res.status(400).json({ error: 'Invalid credentials' });
         }
 
+        if (!user.isVerified) {
+            return res.status(403).json({ error: 'Please verify your email before signing in' });
+        }
+
         const token = jwt.sign(
             { userId: user.id, username: user.username },
             process.env.JWT_SECRET,

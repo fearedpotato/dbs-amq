@@ -9,14 +9,28 @@ const malRoutes = require('./routes/mal');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const allowedOrigin = process.env.BASE_URL;
 
-app.use(cors({ origin: '*' }));
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow non-browser requests (no Origin header) and the configured frontend origin.
+        if (!origin || origin === allowedOrigin) {
+            return callback(null, true);
+        }
+        return callback(new Error('Not allowed by CORS'));
+    }
+}));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../../frontend')));
 app.use(session({
-    secret: process.env.JWT_SECRET,
+    secret: process.env.SESSION_SECRET,
     resave: false,
-    saveUninitialized: true
+    saveUninitialized: false,
+    cookie: {
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: process.env.NODE_ENV === 'production'
+    }
 }));
 
 app.get('/', (req, res) => {
