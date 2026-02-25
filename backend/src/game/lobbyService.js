@@ -1,6 +1,12 @@
 const crypto = require('crypto');
 const prisma = require('../lib/prisma');
-const { MAX_LOBBY_SIZE, MIN_LOBBY_SIZE, SELECTION_MODES } = require('./constants');
+const {
+    MAX_LOBBY_SIZE,
+    MIN_LOBBY_SIZE,
+    SOURCE_MODES,
+    SELECTION_MODES,
+    THEME_MODES
+} = require('./constants');
 const { httpError } = require('./errors');
 
 function sanitizeLobbyConfig(input = {}) {
@@ -20,6 +26,15 @@ function sanitizeLobbyConfig(input = {}) {
     };
 
     if (config.name === '') config.name = null;
+    if (!SOURCE_MODES.includes(config.sourceMode)) {
+        throw httpError(400, `sourceMode must be one of: ${SOURCE_MODES.join(', ')}`);
+    }
+    if (!SELECTION_MODES.includes(config.selectionMode)) {
+        throw httpError(400, `selectionMode must be one of: ${SELECTION_MODES.join(', ')}`);
+    }
+    if (!THEME_MODES.includes(config.themeMode)) {
+        throw httpError(400, `themeMode must be one of: ${THEME_MODES.join(', ')}`);
+    }
 
     if (config.minPlayers < MIN_LOBBY_SIZE || config.minPlayers > MAX_LOBBY_SIZE) {
         throw httpError(400, `minPlayers must be between ${MIN_LOBBY_SIZE} and ${MAX_LOBBY_SIZE}`);
@@ -162,6 +177,13 @@ async function joinLobby(code, user, displayName) {
 
     const existing = lobby.players.find((player) => player.userId === user.id);
     if (existing) {
+        if (!existing.isConnected) {
+            await prisma.lobbyPlayer.update({
+                where: { id: existing.id },
+                data: { isConnected: true }
+            });
+            return getLobbyByCode(code);
+        }
         return mapLobby(lobby);
     }
 
@@ -178,6 +200,115 @@ async function joinLobby(code, user, displayName) {
     });
 
     return getLobbyByCode(code);
+}
+
+async function setPlayerConnection(code, userId, isConnected) {
+    const lobby = await prisma.lobby.findUnique({
+        where: { code },
+        include: { players: true }
+    });
+
+    if (!lobby) throw httpError(404, 'Lobby not found');
+
+    const player = lobby.players.find((p) => p.userId === userId);
+    if (!player) throw httpError(404, 'Player is not part of this lobby');
+
+    await prisma.lobbyPlayer.update({
+        where: { id: player.id },
+        data: { isConnected }
+    });
+
+    return getLobbyByCode(code);
+}
+
+async function leaveLobby(code, userId) {
+    const lobby = await prisma.lobby.findUnique({
+        where: { code },
+        include: {
+            players: { orderBy: { joinedAt: 'asc' } }
+        }
+    });
+
+    if (!lobby) throw httpError(404, 'Lobby not found');
+    if (lobby.status !== 'WAITING') {
+        throw httpError(400, 'Cannot leave lobby after game has started');
+    }
+
+    const leavingPlayer = lobby.players.find((player) => player.userId === userId);
+    if (!leavingPlayer) {
+        return getLobbyByCode(code);
+    }
+
+    await prisma.$transaction(async (tx) => {
+        await tx.lobbyPlayer.delete({
+            where: { id: leavingPlayer.id }
+        });
+
+        const remainingPlayers = await tx.lobbyPlayer.findMany({
+            where: { lobbyId: lobby.id },
+            orderBy: { joinedAt: 'asc' }
+        });
+
+        if (remainingPlayers.length === 0) {
+            await tx.lobby.update({
+                where: { id: lobby.id },
+                data: { status: 'CLOSED' }
+            });
+            return;
+        }
+
+        if (lobby.hostUserId === userId) {
+            await tx.lobby.update({
+                where: { id: lobby.id },
+                data: { hostUserId: remainingPlayers[0].userId }
+            });
+        }
+    });
+
+    return getLobbyByCode(code);
+}
+
+async function updateLobbyConfig(code, actorUserId, patch = {}) {
+    const current = await prisma.lobby.findUnique({
+        where: { code },
+        include: {
+            host: { select: { id: true, username: true, nickname: true } },
+            players: true
+        }
+    });
+
+    if (!current) throw httpError(404, 'Lobby not found');
+    if (current.hostUserId !== actorUserId) throw httpError(403, 'Only the host can update lobby settings');
+    if (current.status !== 'WAITING') throw httpError(400, 'Cannot update lobby settings after game start');
+
+    const config = sanitizeLobbyConfig({
+        ...current,
+        ...patch
+    });
+
+    const updated = await prisma.lobby.update({
+        where: { id: current.id },
+        data: {
+            name: config.name,
+            isPrivate: config.isPrivate,
+            minPlayers: config.minPlayers,
+            maxPlayers: config.maxPlayers,
+            roundCount: config.roundCount,
+            guessSeconds: config.guessSeconds,
+            sampleSeconds: config.sampleSeconds,
+            answersRevealSeconds: config.answersRevealSeconds,
+            solutionRevealSeconds: config.solutionRevealSeconds,
+            sourceMode: config.sourceMode,
+            selectionMode: config.selectionMode,
+            themeMode: config.themeMode
+        },
+        include: {
+            host: { select: { id: true, username: true, nickname: true } },
+            players: { orderBy: { joinedAt: 'asc' } }
+        }
+    });
+
+    return mapLobby(updated);
 }
 
 async function listJoinableLobbies({ q, limit = 20, offset = 0 }) {
@@ -214,5 +345,8 @@ module.exports = {
     createLobby,
     getLobbyByCode,
     joinLobby,
+    setPlayerConnection,
+    leaveLobby,
+    updateLobbyConfig,
     listJoinableLobbies
 };

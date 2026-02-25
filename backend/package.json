@@ -21,13 +21,15 @@
     "express-session": "^1.19.0",
     "jsonwebtoken": "^9.0.3",
     "nodemailer": "^8.0.1",
-    "prisma": "^5.22.0"
+    "prisma": "^5.22.0",
+    "socket.io": "^4.8.1"
   },
   "devDependencies": {
     "@types/bcrypt": "^6.0.0",
     "@types/node": "^25.3.0",
     "jest": "^30.2.0",
     "nodemon": "^3.1.14",
+    "socket.io-client": "^4.8.1",
     "supertest": "^7.1.4"
   }
 }
