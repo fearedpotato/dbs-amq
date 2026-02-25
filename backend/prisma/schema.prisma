@@ -22,6 +22,8 @@ model User {
   nickname        String
   isVerified      Boolean  @default(false)
   verifyToken     String?
+  resetPasswordToken   String?
+  resetPasswordExpires DateTime?
   malAccessToken  String?
   malRefreshToken String?
   malUsername     String?

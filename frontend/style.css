@@ -380,6 +380,12 @@ a:hover { color: var(--accent-hover); }
     color: var(--text-muted);
 }
 
+.auth-row-link {
+    text-align: right;
+    margin-bottom: 1rem;
+    font-size: 0.85rem;
+}
+
 /* ── Dashboard ── */
 .dashboard-header { margin-bottom: 2rem; }
 

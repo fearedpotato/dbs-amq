@@ -41,6 +41,10 @@ app.get('/verify', (req, res) => {
     res.sendFile(path.join(__dirname, '../../frontend/verify.html'));
 });
 
+app.get('/reset-password', (req, res) => {
+    res.sendFile(path.join(__dirname, '../../frontend/reset-password.html'));
+});
+
 app.use('/api/auth', authRoutes);
 app.use('/api/mal', malRoutes);
 

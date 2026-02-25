@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Forgot Password - DBS</title>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<div class="auth-wrapper">
+  <div class="auth-card">
+    <a class="auth-logo" href="#">DBS<span>.</span></a>
+    <h1>Reset password</h1>
+    <p class="subtitle">Enter your email and we will send you a reset link.</p>
+
+    <div class="alert" id="alert"></div>
+
+    <form id="forgotForm">
+      <div class="form-group">
+        <label>Email</label>
+        <input type="email" id="email" placeholder="you@example.com" autocomplete="email" required/>
+      </div>
+      <button type="submit" class="btn btn-primary" id="submitBtn" data-label="Send reset link">Send reset link</button>
+    </form>
+
+    <div class="auth-footer">
+      Back to <a href="login.html">Sign in</a>
+    </div>
+  </div>
+</div>
+
+<script src="auth.js"></script>
+<script>
+  auth.requireGuest();
+
+  const form = document.getElementById('forgotForm');
+  const alertEl = document.getElementById('alert');
+  const submitBtn = document.getElementById('submitBtn');
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    setLoading(submitBtn, true);
+
+    try {
+      await apiFetch('/auth/forgot-password', {
+        method: 'POST',
+        body: JSON.stringify({ email: document.getElementById('email').value })
+      });
+
+      showAlert(alertEl, 'A reset link has been sent if an account does exist.', 'success');
+      setLoading(submitBtn, false);
+    } catch (err) {
+      showAlert(alertEl, err.message);
+      setLoading(submitBtn, false);
+    }
+  });
+</script>
+</body>
+</html>

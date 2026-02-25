@@ -9,9 +9,9 @@ const mailer = require('../lib/mailer');
 
 // Register account
 router.post('/register', async (req, res) => {
-    const { username, email, password } = req.body;
+    const { username, email, password, confirmPassword } = req.body;
 
-    if (!username || !email || !password) {
+    if (!username || !email || !password || !confirmPassword) {
         return res.status(400).json({ error: 'All fields are required' });
     }
 
@@ -33,6 +33,9 @@ router.post('/register', async (req, res) => {
     // Password validation
     if (password.length < 8) {
         return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+    if (password !== confirmPassword) {
+        return res.status(400).json({ error: 'Passwords do not match' });
     }
 
     try {
@@ -69,6 +72,88 @@ router.post('/register', async (req, res) => {
         });
 
         res.status(201).json({ message: 'User created successfully. Please verify your email.' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Something went wrong' });
+    }
+});
+
+router.post('/forgot-password', async (req, res) => {
+    const { email } = req.body;
+
+    if (!email) {
+        return res.status(400).json({ error: 'Email is required' });
+    }
+
+    try {
+        const user = await prisma.user.findUnique({ where: { email } });
+
+        // Keep response generic to avoid account enumeration.
+        if (!user) {
+            return res.json({ message: 'If an account exists, a reset link has been sent.' });
+        }
+
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        const resetPasswordExpires = new Date(Date.now() + 10 * 60 * 1000);
+
+        await prisma.user.update({
+            where: { id: user.id },
+            data: { resetPasswordToken: resetToken, resetPasswordExpires }
+        });
+
+        await mailer.sendMail({
+            from: process.env.EMAIL_USER,
+            to: user.email,
+            subject: 'Reset your password',
+            html: `<p>Hi ${user.username}, click below to reset your password:</p>
+             <a href="${process.env.BASE_URL}/reset-password?token=${resetToken}">Reset Password</a>
+             <p>This link expires in 10 minutes.</p>`
+        });
+
+        res.json({ message: 'If an account exists, a reset link has been sent.' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Something went wrong' });
+    }
+});
+
+router.post('/reset-password', async (req, res) => {
+    const { token, password, confirmPassword } = req.body;
+
+    if (!token || !password || !confirmPassword) {
+        return res.status(400).json({ error: 'All fields are required' });
+    }
+    if (password.length < 8) {
+        return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+    if (password !== confirmPassword) {
+        return res.status(400).json({ error: 'Passwords do not match' });
+    }
+
+    try {
+        const user = await prisma.user.findFirst({
+            where: {
+                resetPasswordToken: token,
+                resetPasswordExpires: { gt: new Date() }
+            }
+        });
+
+        if (!user) {
+            return res.status(400).json({ error: 'Invalid or expired reset token' });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        await prisma.user.update({
+            where: { id: user.id },
+            data: {
+                password: hashedPassword,
+                resetPasswordToken: null,
+                resetPasswordExpires: null
+            }
+        });
+
+        res.json({ message: 'Password has been reset successfully' });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Something went wrong' });

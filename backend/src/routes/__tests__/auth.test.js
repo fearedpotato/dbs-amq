@@ -76,4 +76,34 @@ describe('auth routes', () => {
         expect(decoded.userId).toBe(7);
         expect(decoded.username).toBe('verified_user');
     });
+
+    test('POST /api/auth/register rejects when passwords do not match', async () => {
+        const res = await request(createApp())
+            .post('/api/auth/register')
+            .send({
+                username: 'new_user',
+                email: 'new@example.com',
+                password: 'password123',
+                confirmPassword: 'different123'
+            });
+
+        expect(res.status).toBe(400);
+        expect(res.body.error).toBe('Passwords do not match');
+        expect(prisma.user.findFirst).not.toHaveBeenCalled();
+    });
+
+    test('POST /api/auth/reset-password rejects invalid token', async () => {
+        prisma.user.findFirst.mockResolvedValue(null);
+
+        const res = await request(createApp())
+            .post('/api/auth/reset-password')
+            .send({
+                token: 'bad-token',
+                password: 'newpassword123',
+                confirmPassword: 'newpassword123'
+            });
+
+        expect(res.status).toBe(400);
+        expect(res.body.error).toBe('Invalid or expired reset token');
+    });
 });
