@@ -4,24 +4,18 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Dashboard — DBS</title>
+  <script>if (!localStorage.getItem('token')) window.location.replace('login.html');</script>
   <link rel="stylesheet" href="style.css"/>
   <style>
     body { visibility: hidden; }
   </style>
 </head>
 <body class="page">
-<nav class="navbar">
-  <a class="navbar-brand" href="dashboard.html">DBS<span>.</span></a>
-  <div class="navbar-links">
-    <span id="navUsername" style="color: var(--text-muted); font-size: 0.9rem;"></span>
-    <button class="btn btn-ghost" onclick="auth.logout()" style="padding: 0.4rem 1rem; font-size: 0.88rem;">Sign out</button>
-  </div>
-</nav>
 
 <main class="main-content">
   <div class="dashboard-header">
     <h1>Hey, <span id="username" style="color: var(--accent);">...</span> 👋</h1>
-    <p>subtext subtext subtext subtext subtext </p>
+    <p>abcdefghijklmnopqrstuvwxyz</p>
     <div style="margin-top: 0.6rem;">
       <span class="badge" id="verifiedBadge"></span>
     </div>
@@ -38,48 +32,45 @@
       <h3>Stats</h3>
       <p>View your scores and game history</p>
     </div>
-    <div class="card">
-      <div class="card-icon">⚙️</div>
-      <h3>Settings</h3>
-      <p>Manage your account and preferences</p>
-    </div>
   </div>
 </main>
 
 <script src="auth.js"></script>
+<script src="navbar.js"></script>
 <script>
-  if (!auth.isLoggedIn()) {
-    window.location.href = 'login.html';                  // Dashboard remains hidden until user is logged in
-  } else {
-    document.body.style.visibility = 'visible';
+  renderNavbar();
+  document.body.style.visibility = 'visible';
 
-    const user = auth.getUser();
+  const cachedUser = auth.getUser();
+  if (cachedUser) updateUI(cachedUser);
 
-    document.getElementById('username').textContent = user?.username || '';
-    document.getElementById('navUsername').textContent = user?.username || '';
+  apiFetch('/auth/me').then(freshUser => {
+    auth.save(auth.getToken(), freshUser);
+    updateUI(freshUser);
+  }).catch(() => auth.logout());
+
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('mal_connected') === 'true') {
+    history.replaceState({}, '', '/dashboard.html');
+    openSettings();
+  }
+  if (params.get('error') === 'mal_failed') {
+    history.replaceState({}, '', '/dashboard.html');
+    alert('Failed to connect MAL account. Please try again.');
+  }
+
+  function updateUI(user) {
+    if (!user) return;
+
+    document.getElementById('username').textContent = user.nickname || user.username || '';
 
     const badge = document.getElementById('verifiedBadge');
-    if (user?.isVerified) {
-      badge.textContent = '✓ Verified';
-      badge.className = 'badge badge-success';
-    } else {
-      badge.textContent = '⚠ Email not verified';
-      badge.className = 'badge badge-warning';
+    if (badge) {
+      badge.textContent = user.isVerified ? '✓ Verified' : '⚠ Email not verified';
+      badge.className = user.isVerified ? 'badge badge-success' : 'badge badge-warning';
     }
 
-    apiFetch('/auth/me').then(freshUser => {
-      auth.save(auth.getToken(), freshUser);
-      document.getElementById('username').textContent = freshUser.username;
-      document.getElementById('navUsername').textContent = freshUser.username;
-
-      if (freshUser.isVerified) {
-        badge.textContent = '✓ Verified';
-        badge.className = 'badge badge-success';
-      } else {
-        badge.textContent = '⚠ Email not verified';
-        badge.className = 'badge badge-warning';
-      }
-    }).catch(() => auth.logout());
+    updateNavbarUI(user);
   }
 </script>
 </body>

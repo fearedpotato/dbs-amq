@@ -7,7 +7,7 @@ const authMiddleware = require('../middleware/auth');
 const crypto = require('crypto');
 const mailer = require('../lib/mailer');
 
-// Register user
+// Register account
 router.post('/register', async (req, res) => {
     const { username, email, password } = req.body;
 
@@ -55,6 +55,7 @@ router.post('/register', async (req, res) => {
                 username,
                 email,
                 password: hashedPassword,
+                nickname: username,
                 verifyToken
             }
         });
@@ -142,13 +143,37 @@ router.get('/verify', async (req, res) => {
     }
 });
 
+// Change username
+router.patch('/nickname', authMiddleware, async (req, res) => {
+    const { nickname } = req.body;
+
+    const forbiddenNickname = ['admin', 'root', 'moderator', 'mod', 'administrator', 'system', 'support'];
+    if (!nickname) return res.status(400).json({ error: 'Nickname is required' });
+    if (nickname.length < 3) return res.status(400).json({ error: 'Nickname must be at least 3 characters' });
+    if (nickname.length > 20) return res.status(400).json({ error: 'Nickname must be at most 20 characters' });
+    if (!/^[a-zA-Z0-9_]+$/.test(nickname)) return res.status(400).json({ error: 'Nickname can only contain letters, numbers and underscores' });
+    if (forbiddenNickname.includes(nickname.toLowerCase())) return res.status(400).json({ error: 'This nickname is not allowed' });
+
+    try {
+        await prisma.user.update({
+            where: { id: req.user.userId },
+            data: { nickname }
+        });
+        res.json({ message: 'Nickname updated' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Something went wrong' });
+    }
+});
+
+// Get user's info
 router.get('/me', authMiddleware, async (req, res) => {
     const user = await prisma.user.findUnique({
         where: { id: req.user.userId },
-        select: { id: true, username: true, email: true, isVerified: true }
-    })
+        select: { id: true, username: true, nickname: true, email: true, isVerified: true, malUsername: true }
+    });
 
     res.json(user);
-})
+});
 
 module.exports = router;

@@ -4,7 +4,7 @@ const res = require("express/lib/response");
 
 module.exports = (req, res, next) => {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
+    const token = (authHeader && authHeader.split(' ')[1]) || req.query.jwt;
 
     if (!token) {
         return res.status(401).json({ error: 'Access denied, no token provided' });
