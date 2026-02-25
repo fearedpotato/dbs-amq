@@ -18,6 +18,7 @@ jest.mock('../../lib/mailer', () => ({
 }));
 
 const prisma = require('../../lib/prisma');
+const mailer = require('../../lib/mailer');
 const authRoutes = require('../auth');
 
 function createApp() {
@@ -92,6 +93,68 @@ describe('auth routes', () => {
         expect(prisma.user.findFirst).not.toHaveBeenCalled();
     });
 
+    test('POST /api/auth/register stores verify token expiry', async () => {
+        prisma.user.findFirst.mockResolvedValue(null);
+        prisma.user.create.mockResolvedValue({
+            id: 9,
+            username: 'new_user',
+            email: 'new@example.com'
+        });
+
+        const res = await request(createApp())
+            .post('/api/auth/register')
+            .send({
+                username: 'new_user',
+                email: 'new@example.com',
+                password: 'password123',
+                confirmPassword: 'password123'
+            });
+
+        expect(res.status).toBe(201);
+        expect(prisma.user.create).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({
+                verifyToken: expect.any(String),
+                verifyTokenExpires: expect.any(Date)
+            })
+        }));
+    });
+
+    test('POST /api/auth/register resends verification for existing unverified account', async () => {
+        prisma.user.findFirst.mockResolvedValue({
+            id: 15,
+            username: 'new_user',
+            email: 'new@example.com',
+            isVerified: false
+        });
+        prisma.user.update.mockResolvedValue({
+            id: 15,
+            username: 'new_user',
+            email: 'new@example.com'
+        });
+
+        const res = await request(createApp())
+            .post('/api/auth/register')
+            .send({
+                username: 'new_user',
+                email: 'new@example.com',
+                password: 'password123',
+                confirmPassword: 'password123'
+            });
+
+        expect(res.status).toBe(200);
+        expect(prisma.user.delete).not.toHaveBeenCalled();
+        expect(prisma.user.create).not.toHaveBeenCalled();
+        expect(prisma.user.update).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 15 },
+            data: expect.objectContaining({
+                password: expect.any(String),
+                verifyToken: expect.any(String),
+                verifyTokenExpires: expect.any(Date)
+            })
+        }));
+        expect(mailer.sendMail).toHaveBeenCalled();
+    });
+
     test('POST /api/auth/reset-password rejects invalid token', async () => {
         prisma.user.findFirst.mockResolvedValue(null);
 
@@ -105,5 +168,41 @@ describe('auth routes', () => {
 
         expect(res.status).toBe(400);
         expect(res.body.error).toBe('Invalid or expired reset token');
+    });
+
+    test('GET /api/auth/verify requires a non-expired token', async () => {
+        prisma.user.findFirst.mockResolvedValue(null);
+
+        const res = await request(createApp())
+            .get('/api/auth/verify')
+            .query({ token: 'some-token' });
+
+        expect(res.status).toBe(400);
+        expect(prisma.user.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+            where: expect.objectContaining({
+                verifyTokenExpires: expect.objectContaining({ gt: expect.any(Date) })
+            })
+        }));
+    });
+
+    test('GET /api/auth/verify clears token and expiry when successful', async () => {
+        prisma.user.findFirst.mockResolvedValue({
+            id: 22,
+            username: 'verified'
+        });
+        prisma.user.update.mockResolvedValue({
+            id: 22,
+            isVerified: true
+        });
+
+        const res = await request(createApp())
+            .get('/api/auth/verify')
+            .query({ token: 'valid-token' });
+
+        expect(res.status).toBe(200);
+        expect(prisma.user.update).toHaveBeenCalledWith({
+            where: { id: 22 },
+            data: { isVerified: true, verifyToken: null, verifyTokenExpires: null }
+        });
     });
 });

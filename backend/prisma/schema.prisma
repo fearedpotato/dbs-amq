@@ -22,6 +22,7 @@ model User {
   nickname             String
   isVerified           Boolean   @default(false)
   verifyToken          String?
+  verifyTokenExpires   DateTime?
   resetPasswordToken   String?
   resetPasswordExpires DateTime?
   malAccessToken       String?
@@ -144,6 +145,16 @@ model RoundGuess {
 
   @@unique([roundId, userId])
   @@index([roundId])
+}
+
+model RateLimitBucket {
+  key       String   @id
+  count     Int
+  resetAt   DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([resetAt])
 }
 
 enum LobbyStatus {

@@ -18,6 +18,25 @@ function createRoundEngine(io) {
         return String(value || '').toUpperCase();
     }
 
+    function buildState(lobbyCode, session, players) {
+        return {
+            lobbyCode,
+            sessionId: session.id,
+            baseRoundCount: session.roundCount,
+            players,
+            config: {
+                guessSeconds: session.guessSeconds,
+                answersRevealSeconds: session.answersRevealSeconds,
+                solutionRevealSeconds: session.solutionRevealSeconds
+            },
+            currentRound: null,
+            phase: 'PENDING',
+            timers: {},
+            readyUserIds: new Set(),
+            suddenDeathRounds: 0
+        };
+    }
+
     async function emitRoundStarted(state) {
         const now = Date.now();
         const endsAt = new Date(now + state.config.guessSeconds * 1000);
@@ -53,10 +72,15 @@ function createRoundEngine(io) {
 
     async function emitSolution(state) {
         const endsAt = new Date(Date.now() + state.config.solutionRevealSeconds * 1000);
-        await roundService.setRoundStatus(state.currentRound.id, {
+        const transitioned = await roundService.compareAndSetRoundStatus(
+            state.currentRound.id,
+            'ANSWERS_REVEAL',
+            {
             status: 'SOLUTION_REVEAL',
             solutionRevealEndsAt: endsAt
-        });
+            }
+        );
+        if (!transitioned) return;
 
         state.phase = 'SOLUTION_REVEAL';
         const scores = await roundService.getScoresForSession({
@@ -91,14 +115,20 @@ function createRoundEngine(io) {
 
         clearTimeout(state.timers.guess);
         state.timers.guess = null;
-        state.phase = 'ANSWERS_REVEAL';
 
         const endsAt = new Date(Date.now() + state.config.answersRevealSeconds * 1000);
-        const result = await roundService.evaluateRound(state.currentRound.id);
-        await roundService.setRoundStatus(state.currentRound.id, {
+        const transitioned = await roundService.compareAndSetRoundStatus(
+            state.currentRound.id,
+            'GUESSING',
+            {
             status: 'ANSWERS_REVEAL',
             answersRevealEndsAt: endsAt
-        });
+            }
+        );
+        if (!transitioned) return;
+
+        state.phase = 'ANSWERS_REVEAL';
+        const result = await roundService.evaluateRound(state.currentRound.id);
 
         io.to(lobbyCode).emit('round:answers_reveal', {
             roundId: state.currentRound.id,
@@ -135,6 +165,7 @@ function createRoundEngine(io) {
         state.players = session.lobby.players;
         state.currentRound = round;
         state.readyUserIds = new Set();
+        await roundService.updateSessionCurrentRound(state.sessionId, round.index);
 
         await roundService.setRoundStatus(round.id, {
             status: 'PENDING'
@@ -169,9 +200,14 @@ function createRoundEngine(io) {
         const state = stateByLobby.get(lobbyCode);
         if (!state) return;
 
-        await roundService.setRoundStatus(state.currentRound.id, {
+        const transitioned = await roundService.compareAndSetRoundStatus(
+            state.currentRound.id,
+            'SOLUTION_REVEAL',
+            {
             status: 'ROUND_END'
-        });
+            }
+        );
+        if (!transitioned) return;
 
         const scores = await roundService.getScoresForSession({
             sessionId: state.sessionId,
@@ -210,29 +246,33 @@ function createRoundEngine(io) {
             lobby
         });
 
-        stateByLobby.set(code, {
-            lobbyCode: code,
-            sessionId: session.id,
-            baseRoundCount: session.roundCount,
-            players: lobby.players,
-            config: {
-                guessSeconds: session.guessSeconds,
-                answersRevealSeconds: session.answersRevealSeconds,
-                solutionRevealSeconds: session.solutionRevealSeconds
-            },
-            currentRound: null,
-            phase: 'PENDING',
-            timers: {},
-            readyUserIds: new Set(),
-            suddenDeathRounds: 0
-        });
+        stateByLobby.set(code, buildState(code, session, lobby.players));
 
         await startRound(code, 1);
     }
 
+    async function ensureStateForLobby(lobbyCode) {
+        const code = sanitizeLobbyCode(lobbyCode);
+        let state = stateByLobby.get(code);
+        if (state) return state;
+
+        const session = await roundService.getSessionForLobbyCode(code);
+        if (!session) return null;
+
+        state = buildState(code, session, session.lobby.players);
+        const activeRound = await roundService.getCurrentActiveRound(session.id);
+        if (activeRound) {
+            state.currentRound = activeRound;
+            state.phase = activeRound.status;
+        }
+
+        stateByLobby.set(code, state);
+        return state;
+    }
+
     async function submitGuess({ lobbyCode, userId, payload = {} }) {
         const code = sanitizeLobbyCode(lobbyCode);
-        const state = stateByLobby.get(code);
+        const state = await ensureStateForLobby(code);
         if (!state) throw httpError(400, 'No active round session');
         if (state.phase !== 'GUESSING') throw httpError(400, 'Round is not accepting guesses');
 
@@ -258,7 +298,7 @@ function createRoundEngine(io) {
 
     async function setReady({ lobbyCode, userId, ready }) {
         const code = sanitizeLobbyCode(lobbyCode);
-        const state = stateByLobby.get(code);
+        const state = await ensureStateForLobby(code);
         if (!state) throw httpError(400, 'No active round session');
         if (state.phase !== 'GUESSING') throw httpError(400, 'Round is not currently in guessing phase');
 
@@ -298,6 +338,63 @@ function createRoundEngine(io) {
         };
     }
 
+    async function recoverActiveSessions() {
+        const now = Date.now();
+        const activeRounds = await roundService.listActiveRounds();
+
+        for (const round of activeRounds) {
+            const lobbyCode = sanitizeLobbyCode(round.session.lobby.code);
+            let state = stateByLobby.get(lobbyCode);
+            if (!state) {
+                state = buildState(lobbyCode, round.session, round.session.lobby.players);
+                stateByLobby.set(lobbyCode, state);
+            }
+
+            state.players = round.session.lobby.players;
+            state.currentRound = round;
+            state.phase = round.status;
+
+            if (round.status === 'GUESSING' && round.guessEndsAt) {
+                const ms = new Date(round.guessEndsAt).getTime() - now;
+                if (ms <= 0) {
+                    await transitionToAnswersReveal(lobbyCode, 'recovery_timeout');
+                } else if (!state.timers.guess) {
+                    state.timers.guess = setTimeout(() => {
+                        transitionToAnswersReveal(lobbyCode, 'timeout').catch((err) => {
+                            console.error('round transition error (recovered guess->answers):', err);
+                        });
+                    }, ms);
+                }
+            }
+
+            if (round.status === 'ANSWERS_REVEAL' && round.answersRevealEndsAt) {
+                const ms = new Date(round.answersRevealEndsAt).getTime() - now;
+                if (ms <= 0) {
+                    await emitSolution(state);
+                } else if (!state.timers.answers) {
+                    state.timers.answers = setTimeout(() => {
+                        emitSolution(state).catch((err) => {
+                            console.error('round transition error (recovered answers->solution):', err);
+                        });
+                    }, ms);
+                }
+            }
+
+            if (round.status === 'SOLUTION_REVEAL' && round.solutionRevealEndsAt) {
+                const ms = new Date(round.solutionRevealEndsAt).getTime() - now;
+                if (ms <= 0) {
+                    await finalizeRound(lobbyCode);
+                } else if (!state.timers.solution) {
+                    state.timers.solution = setTimeout(() => {
+                        finalizeRound(lobbyCode).catch((err) => {
+                            console.error('round transition error (recovered solution->finalize):', err);
+                        });
+                    }, ms);
+                }
+            }
+        }
+    }
+
     async function onPlayerDisconnected(lobbyCode, userId) {
         const code = sanitizeLobbyCode(lobbyCode);
         const state = stateByLobby.get(code);
@@ -318,12 +415,20 @@ function createRoundEngine(io) {
         return stateByLobby.has(sanitizeLobbyCode(lobbyCode));
     }
 
+    const recoveryInterval = setInterval(() => {
+        recoverActiveSessions().catch((err) => {
+            console.error('round recovery sweep failed:', err);
+        });
+    }, 1_500);
+    if (typeof recoveryInterval.unref === 'function') recoveryInterval.unref();
+
     return {
         startSession,
         submitGuess,
         setReady,
         onPlayerDisconnected,
-        hasActiveSession
+        hasActiveSession,
+        recoverActiveSessions
     };
 }
 

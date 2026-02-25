@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const prisma = require('../lib/prisma');
+const { createLobbyInviteToken, verifyLobbyInviteToken } = require('../lib/inviteToken');
 const {
     MAX_LOBBY_SIZE,
     MIN_LOBBY_SIZE,
@@ -108,9 +109,16 @@ function mapLobby(lobby) {
     };
 }
 
-function buildInviteLink(baseUrl, code) {
+function buildInviteLink(baseUrl, code, inviteToken) {
     const origin = (typeof baseUrl === 'string' && baseUrl.trim()) ? baseUrl : 'http://localhost:3000';
-    return `${origin.replace(/\/$/, '')}/game?lobby=${encodeURIComponent(code)}`;
+    const url = `${origin.replace(/\/$/, '')}/game?lobby=${encodeURIComponent(code)}`;
+    if (!inviteToken) return url;
+    return `${url}&inviteToken=${encodeURIComponent(inviteToken)}`;
+}
+
+function generateInviteToken(code, options = {}) {
+    const normalizedCode = String(code || '').toUpperCase();
+    return createLobbyInviteToken(normalizedCode, options);
 }
 
 async function generateLobbyCode() {
@@ -163,43 +171,72 @@ async function getLobbyByCode(code) {
     return mapLobby(lobby);
 }
 
-async function joinLobby(code, user, displayName) {
-    const lobby = await prisma.lobby.findUnique({
-        where: { code },
-        include: {
-            host: { select: { id: true, username: true, nickname: true } },
-            players: { orderBy: { joinedAt: 'asc' } }
-        }
-    });
+async function joinLobby(code, user, displayName, options = {}) {
+    const normalizedCode = String(code || '').toUpperCase();
+    const inviteToken = typeof options.inviteToken === 'string' ? options.inviteToken : null;
+    let attempts = 0;
 
-    if (!lobby) throw httpError(404, 'Lobby not found');
-    if (lobby.status !== 'WAITING') throw httpError(400, 'Lobby is not accepting new players');
+    while (attempts < 3) {
+        attempts += 1;
+        try {
+            await prisma.$transaction(async (tx) => {
+                const lobby = await tx.lobby.findUnique({
+                    where: { code: normalizedCode },
+                    include: {
+                        host: { select: { id: true, username: true, nickname: true } },
+                        players: { orderBy: { joinedAt: 'asc' } }
+                    }
+                });
 
-    const existing = lobby.players.find((player) => player.userId === user.id);
-    if (existing) {
-        if (!existing.isConnected) {
-            await prisma.lobbyPlayer.update({
-                where: { id: existing.id },
-                data: { isConnected: true }
-            });
-            return getLobbyByCode(code);
+                if (!lobby) throw httpError(404, 'Lobby not found');
+                if (lobby.status !== 'WAITING') throw httpError(400, 'Lobby is not accepting new players');
+
+                const existing = lobby.players.find((player) => player.userId === user.id);
+                if (existing) {
+                    if (!existing.isConnected) {
+                        await tx.lobbyPlayer.update({
+                            where: { id: existing.id },
+                            data: { isConnected: true }
+                        });
+                    }
+                    return;
+                }
+
+                if (lobby.isPrivate && lobby.hostUserId !== user.id) {
+                    const validInvite = verifyLobbyInviteToken(inviteToken, normalizedCode);
+                    if (!validInvite) {
+                        throw httpError(403, 'Valid invite token is required for this private lobby');
+                    }
+                }
+
+                if (lobby.players.length >= lobby.maxPlayers) {
+                    throw httpError(400, 'Lobby is full');
+                }
+
+                await tx.lobbyPlayer.create({
+                    data: {
+                        lobbyId: lobby.id,
+                        userId: user.id,
+                        displayName: (displayName && displayName.trim()) || user.nickname || user.username || `user-${user.id}`
+                    }
+                });
+            }, { isolationLevel: 'Serializable' });
+
+            return getLobbyByCode(normalizedCode);
+        } catch (err) {
+            // Prisma write-conflict serialization error; retry briefly.
+            if (err.code === 'P2034' && attempts < 3) {
+                continue;
+            }
+            // Already joined from a concurrent request; return latest lobby snapshot.
+            if (err.code === 'P2002') {
+                return getLobbyByCode(normalizedCode);
+            }
+            throw err;
         }
-        return mapLobby(lobby);
     }
 
-    if (lobby.players.length >= lobby.maxPlayers) {
-        throw httpError(400, 'Lobby is full');
-    }
-
-    await prisma.lobbyPlayer.create({
-        data: {
-            lobbyId: lobby.id,
-            userId: user.id,
-            displayName: (displayName && displayName.trim()) || user.nickname || user.username || `user-${user.id}`
-        }
-    });
-
-    return getLobbyByCode(code);
+    throw httpError(409, 'Please retry joining the lobby');
 }
 
 async function setPlayerConnection(code, userId, isConnected) {
@@ -342,6 +379,7 @@ module.exports = {
     sanitizeLobbyConfig,
     mapLobby,
     buildInviteLink,
+    generateInviteToken,
     createLobby,
     getLobbyByCode,
     joinLobby,

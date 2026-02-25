@@ -5,8 +5,21 @@ const lobbyService = require('../game/lobbyService');
 const searchService = require('../game/searchService');
 const { SOURCE_MODES, SELECTION_MODES, THEME_MODES } = require('../game/constants');
 const { httpError } = require('../game/errors');
+const { createRateLimit } = require('../middleware/rateLimit');
 
 const router = express.Router();
+
+const joinLobbyRateLimit = createRateLimit({
+    keyPrefix: 'game:lobby_join',
+    windowMs: 60 * 1000,
+    max: 30,
+    keyGenerator: (req) => {
+        const userPart = req.user?.userId || req.ip || 'unknown';
+        const codePart = String(req.params?.code || '').toUpperCase();
+        return `${userPart}:${codePart}`;
+    },
+    message: 'Too many lobby join attempts. Please slow down.'
+});
 
 function handleError(res, err) {
     if (err.status) {
@@ -32,6 +45,12 @@ async function getCurrentUserFromToken(req) {
     return user;
 }
 
+function canAccessLobby(lobby, userId) {
+    if (!lobby?.isPrivate) return true;
+    if (lobby.host?.id === userId) return true;
+    return (lobby.players || []).some((player) => player.userId === userId);
+}
+
 router.post('/lobbies', authMiddleware, async (req, res) => {
     try {
         const {
@@ -52,13 +71,18 @@ router.post('/lobbies', authMiddleware, async (req, res) => {
     }
 });
 
-router.post('/lobbies/:code/join', authMiddleware, async (req, res) => {
+router.post('/lobbies/:code/join', authMiddleware, joinLobbyRateLimit, async (req, res) => {
     try {
         const code = String(req.params.code || '').toUpperCase();
         if (!code) throw httpError(400, 'Lobby code is required');
 
         const user = await getCurrentUserFromToken(req);
-        const lobby = await lobbyService.joinLobby(code, user, req.body?.displayName);
+        const inviteToken = typeof req.body?.inviteToken === 'string'
+            ? req.body.inviteToken
+            : (typeof req.query?.inviteToken === 'string'
+                    ? req.query.inviteToken
+                    : (typeof req.headers['x-invite-token'] === 'string' ? req.headers['x-invite-token'] : null));
+        const lobby = await lobbyService.joinLobby(code, user, req.body?.displayName, { inviteToken });
         return res.json({ lobby });
     } catch (err) {
         return handleError(res, err);
@@ -69,9 +93,11 @@ router.get('/lobbies/:code', authMiddleware, async (req, res) => {
     try {
         const code = String(req.params.code || '').toUpperCase();
         if (!code) throw httpError(400, 'Lobby code is required');
+        const user = await getCurrentUserFromToken(req);
 
         const lobby = await lobbyService.getLobbyByCode(code);
         if (!lobby) throw httpError(404, 'Lobby not found');
+        if (!canAccessLobby(lobby, user.id)) throw httpError(403, 'You do not have access to this lobby');
 
         return res.json({ lobby });
     } catch (err) {
@@ -108,14 +134,18 @@ router.get('/lobbies/:code/invite', authMiddleware, async (req, res) => {
     try {
         const code = String(req.params.code || '').toUpperCase();
         if (!code) throw httpError(400, 'Lobby code is required');
+        const user = await getCurrentUserFromToken(req);
 
         const lobby = await lobbyService.getLobbyByCode(code);
         if (!lobby) throw httpError(404, 'Lobby not found');
+        if (!canAccessLobby(lobby, user.id)) throw httpError(403, 'You do not have access to this lobby');
 
-        const inviteUrl = lobbyService.buildInviteLink(process.env.BASE_URL, code);
+        const inviteToken = lobbyService.generateInviteToken(code);
+        const inviteUrl = lobbyService.buildInviteLink(process.env.BASE_URL, code, inviteToken);
         return res.json({
             lobbyCode: code,
-            inviteUrl
+            inviteUrl,
+            inviteToken
         });
     } catch (err) {
         return handleError(res, err);

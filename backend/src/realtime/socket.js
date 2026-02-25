@@ -4,6 +4,7 @@ const lobbyService = require('../game/lobbyService');
 const sessionService = require('../game/sessionService');
 const { httpError } = require('../game/errors');
 const { createRoundEngine } = require('./roundEngine');
+const { consumeRateLimitBucket } = require('../lib/rateLimiterStore');
 
 function parseSocketToken(socket) {
     const authToken = socket.handshake?.auth?.token;
@@ -22,6 +23,7 @@ function toErrorPayload(err, fallbackCode = 'internal_error') {
     if (err.status === 401) return { code: 'unauthorized', message: err.message };
     if (err.status === 403) return { code: 'forbidden', message: err.message };
     if (err.status === 404) return { code: 'not_found', message: err.message };
+    if (err.status === 429) return { code: 'rate_limited', message: err.message };
     return { code: fallbackCode, message: err.message || 'Something went wrong' };
 }
 
@@ -41,6 +43,14 @@ function attachRealtime(httpServer, options = {}) {
     });
 
     const roundEngine = createRoundEngine(io);
+
+    async function assertEventRateLimit(userId, eventName, { windowMs, max }) {
+        const key = `${userId}:${eventName}`;
+        const bucket = await consumeRateLimitBucket(`socket:${key}`, windowMs);
+        if (bucket.count > max) {
+            throw httpError(429, 'Too many realtime actions, slow down');
+        }
+    }
 
     io.use((socket, next) => {
         try {
@@ -71,13 +81,15 @@ function attachRealtime(httpServer, options = {}) {
 
         socket.on('lobby:join', async (payload = {}, ack) => {
             try {
+                await assertEventRateLimit(userId, 'lobby:join', { windowMs: 10_000, max: 20 });
                 const code = String(payload.lobbyCode || '').toUpperCase();
                 if (!code) throw httpError(400, 'Lobby code is required');
 
                 await lobbyService.joinLobby(
                     code,
                     { id: userId, username, nickname: username },
-                    payload.displayName
+                    payload.displayName,
+                    { inviteToken: typeof payload.inviteToken === 'string' ? payload.inviteToken : null }
                 );
                 const lobby = await lobbyService.setPlayerConnection(code, userId, true);
 
@@ -93,6 +105,7 @@ function attachRealtime(httpServer, options = {}) {
 
         socket.on('lobby:leave', async (payload = {}, ack) => {
             try {
+                await assertEventRateLimit(userId, 'lobby:leave', { windowMs: 10_000, max: 20 });
                 const code = String(payload.lobbyCode || '').toUpperCase();
                 if (!code) throw httpError(400, 'Lobby code is required');
 
@@ -112,6 +125,7 @@ function attachRealtime(httpServer, options = {}) {
 
         socket.on('lobby:update_settings', async (payload = {}, ack) => {
             try {
+                await assertEventRateLimit(userId, 'lobby:update_settings', { windowMs: 10_000, max: 15 });
                 const code = String(payload.lobbyCode || '').toUpperCase();
                 if (!code) throw httpError(400, 'Lobby code is required');
 
@@ -126,6 +140,7 @@ function attachRealtime(httpServer, options = {}) {
 
         socket.on('game:start', async (payload = {}, ack) => {
             try {
+                await assertEventRateLimit(userId, 'game:start', { windowMs: 30_000, max: 6 });
                 const code = String(payload.lobbyCode || '').toUpperCase();
                 if (!code) throw httpError(400, 'Lobby code is required');
 
@@ -136,12 +151,18 @@ function attachRealtime(httpServer, options = {}) {
                 }
 
                 const session = await sessionService.startSessionFromLobby(lobby);
-                const updatedLobby = await lobbyService.getLobbyByCode(code);
-                await roundEngine.startSession({
-                    lobbyCode: code,
-                    session,
-                    lobby: updatedLobby
-                });
+                let updatedLobby;
+                try {
+                    updatedLobby = await lobbyService.getLobbyByCode(code);
+                    await roundEngine.startSession({
+                        lobbyCode: code,
+                        session,
+                        lobby: updatedLobby
+                    });
+                } catch (engineErr) {
+                    await sessionService.rollbackSessionStart(session.id);
+                    throw engineErr;
+                }
 
                 io.to(code).emit('game:started', {
                     sessionId: session.id,
@@ -157,6 +178,7 @@ function attachRealtime(httpServer, options = {}) {
 
         socket.on('round:submit_guess', async (payload = {}, ack) => {
             try {
+                await assertEventRateLimit(userId, 'round:submit_guess', { windowMs: 10_000, max: 30 });
                 const code = String(payload.lobbyCode || '').toUpperCase();
                 if (!code) throw httpError(400, 'Lobby code is required');
                 if (!socket.data.lobbies.has(code)) {
@@ -176,6 +198,7 @@ function attachRealtime(httpServer, options = {}) {
 
         socket.on('round:set_ready', async (payload = {}, ack) => {
             try {
+                await assertEventRateLimit(userId, 'round:set_ready', { windowMs: 10_000, max: 40 });
                 const code = String(payload.lobbyCode || '').toUpperCase();
                 if (!code) throw httpError(400, 'Lobby code is required');
                 if (!socket.data.lobbies.has(code)) {

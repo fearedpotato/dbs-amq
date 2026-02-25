@@ -13,10 +13,12 @@ jest.mock('../../lib/prisma', () => ({
     },
     lobbyPlayer: {
         create: jest.fn()
-    }
+    },
+    $transaction: jest.fn()
 }));
 
 const prisma = require('../../lib/prisma');
+const { createLobbyInviteToken } = require('../../lib/inviteToken');
 const gameRoutes = require('../game');
 
 function createApp() {
@@ -35,6 +37,7 @@ function buildLobby({
     id = 1,
     code = 'ABC123',
     hostId = 1,
+    isPrivate = false,
     selectionMode = 'STANDARD',
     maxPlayers = 8,
     minPlayers = 1,
@@ -45,7 +48,7 @@ function buildLobby({
         code,
         name: 'Test Lobby',
         status: 'WAITING',
-        isPrivate: false,
+        isPrivate,
         minPlayers,
         maxPlayers,
         roundCount: 10,
@@ -78,6 +81,10 @@ describe('game routes', () => {
 
     beforeEach(() => {
         jest.clearAllMocks();
+        prisma.$transaction.mockImplementation(async (fn) => fn({
+            lobby: prisma.lobby,
+            lobbyPlayer: prisma.lobbyPlayer
+        }));
     });
 
     test('POST /api/game/lobbies requires auth', async () => {
@@ -155,6 +162,51 @@ describe('game routes', () => {
         expect(res.body.lobby.playerCount).toBe(2);
     });
 
+    test('POST /api/game/lobbies/:code/join blocks private lobby join without invite token', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+            id: 2,
+            username: 'guest',
+            nickname: 'Guest'
+        });
+        prisma.lobby.findUnique.mockResolvedValue(buildLobby({ code: 'ABC123', isPrivate: true, playerIds: [1] }));
+
+        const res = await request(createApp())
+            .post('/api/game/lobbies/ABC123/join')
+            .set(authHeader(2, 'guest'))
+            .send({});
+
+        expect(res.status).toBe(403);
+        expect(res.body.error).toBe('Valid invite token is required for this private lobby');
+        expect(prisma.lobbyPlayer.create).not.toHaveBeenCalled();
+    });
+
+    test('POST /api/game/lobbies/:code/join allows private lobby join with valid invite token', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+            id: 2,
+            username: 'guest',
+            nickname: 'Guest'
+        });
+        prisma.lobby.findUnique
+            .mockResolvedValueOnce(buildLobby({ code: 'ABC123', isPrivate: true, playerIds: [1] }))
+            .mockResolvedValueOnce(buildLobby({ code: 'ABC123', isPrivate: true, playerIds: [1, 2] }));
+        prisma.lobbyPlayer.create.mockResolvedValue({
+            id: 2,
+            lobbyId: 1,
+            userId: 2,
+            displayName: 'Guest',
+            isConnected: true
+        });
+
+        const inviteToken = createLobbyInviteToken('ABC123');
+        const res = await request(createApp())
+            .post('/api/game/lobbies/ABC123/join')
+            .set(authHeader(2, 'guest'))
+            .send({ inviteToken });
+
+        expect(res.status).toBe(200);
+        expect(res.body.lobby.playerCount).toBe(2);
+    });
+
     test('GET /api/game/lobbies/:code returns lobby snapshot', async () => {
         prisma.lobby.findUnique.mockResolvedValue(buildLobby({ code: 'ABC123', playerIds: [1, 2] }));
 
@@ -192,6 +244,7 @@ describe('game routes', () => {
         expect(res.status).toBe(200);
         expect(res.body.lobbyCode).toBe('ZZZ999');
         expect(res.body.inviteUrl).toContain('/game?lobby=ZZZ999');
+        expect(typeof res.body.inviteToken).toBe('string');
     });
 
     test('POST /api/game/search validates minimum query length', async () => {

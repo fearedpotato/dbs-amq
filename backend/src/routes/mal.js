@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const router = express.Router();
 const prisma = require('../lib/prisma');
 const authMiddleware = require('../middleware/auth');
+const { encryptToken } = require('../lib/tokenCipher');
 
 // Step 1: Generate MAL login URL for authenticated user
 router.post('/login', authMiddleware, (req, res) => {
@@ -57,7 +58,11 @@ router.get('/callback', async (req, res) => {
 
         await prisma.user.update({
             where: { id: userId },
-            data: { malAccessToken: access_token, malRefreshToken: refresh_token, malUsername }
+            data: {
+                malAccessToken: encryptToken(access_token),
+                malRefreshToken: encryptToken(refresh_token),
+                malUsername
+            }
         });
 
         req.session.codeVerifier = null;

@@ -6,9 +6,47 @@ const prisma = require('../lib/prisma');
 const authMiddleware = require('../middleware/auth');
 const crypto = require('crypto');
 const mailer = require('../lib/mailer');
+const { createRateLimit } = require('../middleware/rateLimit');
+
+const registerRateLimit = createRateLimit({
+    keyPrefix: 'auth:register',
+    windowMs: 10 * 60 * 1000,
+    max: 10,
+    message: 'Too many registration attempts. Please try again later.'
+});
+
+const loginRateLimit = createRateLimit({
+    keyPrefix: 'auth:login',
+    windowMs: 5 * 60 * 1000,
+    max: 20,
+    keyGenerator: (req) => `${req.ip}:${String(req.body?.identifier || '').toLowerCase()}`,
+    message: 'Too many login attempts. Please try again later.'
+});
+
+const forgotPasswordRateLimit = createRateLimit({
+    keyPrefix: 'auth:forgot_password',
+    windowMs: 10 * 60 * 1000,
+    max: 10,
+    keyGenerator: (req) => `${req.ip}:${String(req.body?.email || '').toLowerCase()}`,
+    message: 'Too many password reset requests. Please try again later.'
+});
+
+const resetPasswordRateLimit = createRateLimit({
+    keyPrefix: 'auth:reset_password',
+    windowMs: 10 * 60 * 1000,
+    max: 20,
+    keyGenerator: (req) => `${req.ip}:${String(req.body?.token || '').slice(0, 12)}`,
+    message: 'Too many reset attempts. Please try again later.'
+});
+
+function hashToken(token) {
+    return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+const VERIFY_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
 // Register account
-router.post('/register', async (req, res) => {
+router.post('/register', registerRateLimit, async (req, res) => {
     const { username, email, password, confirmPassword } = req.body;
 
     if (!username || !email || !password || !confirmPassword) {
@@ -47,11 +85,44 @@ router.post('/register', async (req, res) => {
             if (existing.isVerified) {
                 return res.status(400).json({ error: 'Username or email already taken' });
             }
-            await prisma.user.delete({ where: { id: existing.id } });
+
+            const sameEmail = String(existing.email || '').toLowerCase() === String(email).toLowerCase();
+            const sameUsername = String(existing.username || '').toLowerCase() === String(username).toLowerCase();
+            if (!sameEmail || !sameUsername) {
+                return res.status(400).json({ error: 'Username or email already taken' });
+            }
+
+            const hashedPassword = await bcrypt.hash(password, 10);
+            const verifyToken = crypto.randomBytes(32).toString('hex');
+            const verifyTokenHash = hashToken(verifyToken);
+            const verifyTokenExpires = new Date(Date.now() + VERIFY_TOKEN_TTL_MS);
+
+            await prisma.user.update({
+                where: { id: existing.id },
+                data: {
+                    password: hashedPassword,
+                    nickname: username,
+                    isVerified: false,
+                    verifyToken: verifyTokenHash,
+                    verifyTokenExpires
+                }
+            });
+
+            await mailer.sendMail({
+                from: process.env.EMAIL_USER,
+                to: email,
+                subject: 'Verify your account',
+                html: `<p>Hi ${username}! Click the link below to verify your account:</p>
+             <a href="${process.env.BASE_URL}/verify?token=${verifyToken}">Verify Email</a>`
+            });
+
+            return res.status(200).json({ message: 'Account exists but is unverified. Verification email resent.' });
         }
 
         const hashedPassword = await bcrypt.hash(password, 10);
         const verifyToken = crypto.randomBytes(32).toString('hex');
+        const verifyTokenHash = hashToken(verifyToken);
+        const verifyTokenExpires = new Date(Date.now() + VERIFY_TOKEN_TTL_MS);
 
         const user = await prisma.user.create({
             data: {
@@ -59,7 +130,8 @@ router.post('/register', async (req, res) => {
                 email,
                 password: hashedPassword,
                 nickname: username,
-                verifyToken
+                verifyToken: verifyTokenHash,
+                verifyTokenExpires
             }
         });
 
@@ -78,7 +150,7 @@ router.post('/register', async (req, res) => {
     }
 });
 
-router.post('/forgot-password', async (req, res) => {
+router.post('/forgot-password', forgotPasswordRateLimit, async (req, res) => {
     const { email } = req.body;
 
     if (!email) {
@@ -94,11 +166,12 @@ router.post('/forgot-password', async (req, res) => {
         }
 
         const resetToken = crypto.randomBytes(32).toString('hex');
+        const resetTokenHash = hashToken(resetToken);
         const resetPasswordExpires = new Date(Date.now() + 10 * 60 * 1000);
 
         await prisma.user.update({
             where: { id: user.id },
-            data: { resetPasswordToken: resetToken, resetPasswordExpires }
+            data: { resetPasswordToken: resetTokenHash, resetPasswordExpires }
         });
 
         await mailer.sendMail({
@@ -117,7 +190,7 @@ router.post('/forgot-password', async (req, res) => {
     }
 });
 
-router.post('/reset-password', async (req, res) => {
+router.post('/reset-password', resetPasswordRateLimit, async (req, res) => {
     const { token, password, confirmPassword } = req.body;
 
     if (!token || !password || !confirmPassword) {
@@ -131,9 +204,13 @@ router.post('/reset-password', async (req, res) => {
     }
 
     try {
+        const tokenHash = hashToken(token);
         const user = await prisma.user.findFirst({
             where: {
-                resetPasswordToken: token,
+                OR: [
+                    { resetPasswordToken: tokenHash }, // hashed-at-rest format (current)
+                    { resetPasswordToken: token } // backward compatibility for pre-hash records
+                ],
                 resetPasswordExpires: { gt: new Date() }
             }
         });
@@ -161,7 +238,7 @@ router.post('/reset-password', async (req, res) => {
 });
 
 // Login
-router.post('/login', async (req, res) => {
+router.post('/login', loginRateLimit, async (req, res) => {
     const { identifier, password } = req.body;
 
     if (!identifier || !password) {
@@ -214,7 +291,16 @@ router.get('/verify', async (req, res) => {
     }
 
     try {
-        const user = await prisma.user.findFirst({ where: { verifyToken: token } });
+        const tokenHash = hashToken(token);
+        const user = await prisma.user.findFirst({
+            where: {
+                verifyTokenExpires: { gt: new Date() },
+                OR: [
+                    { verifyToken: tokenHash }, // hashed-at-rest format (current)
+                    { verifyToken: token } // backward compatibility for pre-hash records
+                ]
+            }
+        });
 
         if (!user) {
             return res.status(400).json({ error: 'Invalid or expired token' });
@@ -222,7 +308,7 @@ router.get('/verify', async (req, res) => {
 
         await prisma.user.update({
             where: { id: user.id },
-            data: { isVerified: true, verifyToken: null }
+            data: { isVerified: true, verifyToken: null, verifyTokenExpires: null }
         });
 
         res.json({ message: 'Email verified successfully!' });

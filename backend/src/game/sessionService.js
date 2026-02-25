@@ -55,7 +55,33 @@ async function startSessionFromLobby(lobby) {
     };
 }
 
+async function rollbackSessionStart(sessionId) {
+    const session = await prisma.gameSession.findUnique({
+        where: { id: sessionId },
+        select: { id: true, lobbyId: true }
+    });
+    if (!session) return;
+
+    await prisma.$transaction([
+        prisma.gameRound.deleteMany({
+            where: { sessionId: session.id }
+        }),
+        prisma.gameSession.update({
+            where: { id: session.id },
+            data: {
+                status: 'CANCELLED',
+                endedAt: new Date()
+            }
+        }),
+        prisma.lobby.update({
+            where: { id: session.lobbyId },
+            data: { status: 'WAITING' }
+        })
+    ]);
+}
+
 module.exports = {
     assertSelectionModeAllowedForPlayerCount,
-    startSessionFromLobby
+    startSessionFromLobby,
+    rollbackSessionStart
 };

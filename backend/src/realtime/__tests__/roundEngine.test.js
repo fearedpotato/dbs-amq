@@ -1,8 +1,13 @@
 jest.mock('../../game/roundService', () => ({
     generateInitialRoundsForSession: jest.fn(),
     ensureRoundForIndex: jest.fn(),
+    getSessionForLobbyCode: jest.fn(),
     getSessionById: jest.fn(),
+    getCurrentActiveRound: jest.fn(),
+    listActiveRounds: jest.fn(),
+    updateSessionCurrentRound: jest.fn(),
     setRoundStatus: jest.fn(),
+    compareAndSetRoundStatus: jest.fn(),
     submitGuess: jest.fn(),
     setPlayerReady: jest.fn(),
     evaluateRound: jest.fn(),
@@ -64,6 +69,9 @@ describe('round engine', () => {
     beforeEach(() => {
         jest.clearAllMocks();
         jest.useFakeTimers();
+        roundService.compareAndSetRoundStatus.mockResolvedValue(true);
+        roundService.updateSessionCurrentRound.mockResolvedValue();
+        roundService.listActiveRounds.mockResolvedValue([]);
     });
 
     afterEach(() => {

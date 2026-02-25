@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const session = require('express-session');
+const { getSessionStore } = require('./lib/sessionStore');
 
 const authRoutes = require('./routes/auth');
 const malRoutes = require('./routes/mal');
@@ -11,6 +12,11 @@ const gameRoutes = require('./routes/game');
 function createApp() {
     const app = express();
     const allowedOrigin = process.env.BASE_URL;
+    const sessionStore = getSessionStore();
+
+    if (process.env.NODE_ENV === 'production') {
+        app.set('trust proxy', 1);
+    }
 
     app.use(cors({
         origin: (origin, callback) => {
@@ -27,6 +33,7 @@ function createApp() {
         secret: process.env.SESSION_SECRET,
         resave: false,
         saveUninitialized: false,
+        ...(sessionStore ? { store: sessionStore } : {}),
         cookie: {
             httpOnly: true,
             sameSite: 'lax',

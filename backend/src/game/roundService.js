@@ -171,6 +171,17 @@ async function setRoundStatus(roundId, data) {
     });
 }
 
+async function compareAndSetRoundStatus(roundId, expectedStatus, data) {
+    const result = await prisma.gameRound.updateMany({
+        where: {
+            id: roundId,
+            status: expectedStatus
+        },
+        data
+    });
+    return result.count > 0;
+}
+
 async function submitGuess({ roundId, userId, guessText, guessAnimeId }) {
     return prisma.roundGuess.upsert({
         where: { roundId_userId: { roundId, userId } },
@@ -253,6 +264,62 @@ async function getRoundById(roundId) {
     });
 }
 
+async function getRoundContext(roundId) {
+    return prisma.gameRound.findUnique({
+        where: { id: roundId },
+        include: {
+            session: {
+                include: {
+                    lobby: {
+                        include: {
+                            players: { orderBy: { joinedAt: 'asc' } }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async function listActiveRounds() {
+    return prisma.gameRound.findMany({
+        where: {
+            status: { in: ['GUESSING', 'ANSWERS_REVEAL', 'SOLUTION_REVEAL'] },
+            session: { status: 'IN_PROGRESS' }
+        },
+        include: {
+            session: {
+                include: {
+                    lobby: {
+                        include: {
+                            players: { orderBy: { joinedAt: 'asc' } }
+                        }
+                    }
+                }
+            }
+        },
+        orderBy: { updatedAt: 'desc' },
+        take: 200
+    });
+}
+
+async function getCurrentActiveRound(sessionId) {
+    return prisma.gameRound.findFirst({
+        where: {
+            sessionId,
+            status: { in: ['GUESSING', 'ANSWERS_REVEAL', 'SOLUTION_REVEAL'] }
+        },
+        orderBy: { index: 'desc' }
+    });
+}
+
+async function updateSessionCurrentRound(sessionId, currentRound) {
+    await prisma.gameSession.update({
+        where: { id: sessionId },
+        data: { currentRound }
+    });
+}
+
 async function getScoresForSession({ sessionId, lobbyPlayers }) {
     const correct = await prisma.roundGuess.findMany({
         where: {
@@ -305,10 +372,15 @@ module.exports = {
     getSessionForLobbyCode,
     getSessionById,
     setRoundStatus,
+    compareAndSetRoundStatus,
     submitGuess,
     setPlayerReady,
     evaluateRound,
     getRoundById,
+    getRoundContext,
+    listActiveRounds,
+    getCurrentActiveRound,
+    updateSessionCurrentRound,
     getScoresForSession,
     finishSession
 };
