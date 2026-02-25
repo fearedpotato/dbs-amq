@@ -15,21 +15,39 @@ router.post('/register', async (req, res) => {
         return res.status(400).json({ error: 'All fields are required' });
     }
 
+    // Username validation
+    const forbiddenUsernames = ['admin', 'root', 'moderator', 'mod', 'administrator', 'system', 'support'];
+    if (username.length < 4) {
+        return res.status(400).json({ error: 'Username must be at least 4 characters long' });
+    }
+    if (username.length > 20) {
+        return res.status(400).json({ error: 'Username must be at most 20 characters long' });
+    }
+    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+        return res.status(400).json({ error: 'Username can only contain letters, numbers and underscores' });
+    }
+    if (forbiddenUsernames.includes(username.toLowerCase())) {
+        return res.status(400).json({ error: 'This username is not allowed' });
+    }
+
+    // Password validation
+    if (password.length < 8) {
+        return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+
     try {
         const existing = await prisma.user.findFirst({
             where: { OR: [{ email }, { username }] }
         });
 
         if (existing) {
-            if(existing.isVerified) {
+            if (existing.isVerified) {
                 return res.status(400).json({ error: 'Username or email already taken' });
             }
-
             await prisma.user.delete({ where: { id: existing.id } });
         }
 
         const hashedPassword = await bcrypt.hash(password, 10);
-
         const verifyToken = crypto.randomBytes(32).toString('hex');
 
         const user = await prisma.user.create({
