@@ -71,7 +71,8 @@ describe('socket gateway', () => {
             submitGuess: jest.fn(),
             setReady: jest.fn(),
             onPlayerDisconnected: jest.fn(),
-            hasActiveSession: jest.fn()
+            hasActiveSession: jest.fn(),
+            getSyncState: jest.fn()
         };
         createRoundEngine.mockReturnValue(roundEngineMock);
 
@@ -196,6 +197,28 @@ describe('socket gateway', () => {
         expect(ack.ok).toBe(true);
         expect(ack.roundId).toBe(77);
         expect(roundEngineMock.submitGuess).toHaveBeenCalled();
+    });
+
+    test('returns round sync state for joined players', async () => {
+        const lobby = buildLobby({ code: 'ABC123', playerIds: [1] });
+        lobbyService.joinLobby.mockResolvedValue(lobby);
+        lobbyService.setPlayerConnection.mockResolvedValue(lobby);
+        lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+        roundEngineMock.getSyncState.mockResolvedValue({
+            lobbyCode: 'ABC123',
+            phase: 'GUESSING',
+            round: { roundId: 12, index: 2, totalRounds: 10 },
+            readyUserIds: [1],
+            allReady: true
+        });
+
+        const client = await connectClient({ userId: 1, username: 'u1' });
+        await emitWithAck(client, 'lobby:join', { lobbyCode: 'ABC123' });
+
+        const ack = await emitWithAck(client, 'round:sync', { lobbyCode: 'ABC123' });
+        expect(ack.ok).toBe(true);
+        expect(ack.state.phase).toBe('GUESSING');
+        expect(roundEngineMock.getSyncState).toHaveBeenCalledWith('ABC123');
     });
 
     test('marks player disconnected on socket disconnect', async () => {

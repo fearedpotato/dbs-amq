@@ -3,9 +3,10 @@
 <head>
     <meta charset="UTF-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <title>Anime Music Quiz — DBS</title>
+    <title>Anime Music Quiz - DBS</title>
     <script>if (!localStorage.getItem('token')) window.location.replace('login.html');</script>
     <link rel="stylesheet" href="style.css"/>
+    <link rel="stylesheet" href="/game-app/assets/game-client.css"/>
     <style>
         body { visibility: hidden; }
     </style>
@@ -13,8 +14,9 @@
 <body class="page">
 
 <main class="main-content">
-    <h1>Anime Music Quiz</h1>
-    <p style="color: var(--text-muted); margin-top: 0.5rem;">Coming soon...</p>
+    <div id="game-root">
+        <p style="color: var(--text-muted);">Loading game client...</p>
+    </div>
 </main>
 
 <script src="auth.js"></script>
@@ -31,5 +33,6 @@
         updateNavbarUI(freshUser);
     }).catch(() => auth.logout());
 </script>
+<script type="module" src="/game-app/main.js"></script>
 </body>
 </html>

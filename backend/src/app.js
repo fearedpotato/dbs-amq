@@ -53,6 +53,10 @@ function createApp() {
         res.sendFile(path.join(__dirname, '../../frontend/reset-password.html'));
     });
 
+    app.get('/game', (req, res) => {
+        res.sendFile(path.join(__dirname, '../../frontend/game.html'));
+    });
+
     app.use('/api/auth', authRoutes);
     app.use('/api/mal', malRoutes);
     app.use('/api/game', gameRoutes);

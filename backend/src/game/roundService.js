@@ -264,6 +264,13 @@ async function getRoundById(roundId) {
     });
 }
 
+async function getGuessesForRound(roundId) {
+    return prisma.roundGuess.findMany({
+        where: { roundId },
+        orderBy: { submittedAt: 'asc' }
+    });
+}
+
 async function getRoundContext(roundId) {
     return prisma.gameRound.findUnique({
         where: { id: roundId },
@@ -377,6 +384,7 @@ module.exports = {
     setPlayerReady,
     evaluateRound,
     getRoundById,
+    getGuessesForRound,
     getRoundContext,
     listActiveRounds,
     getCurrentActiveRound,

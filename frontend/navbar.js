@@ -1,4 +1,4 @@
-// ── Navbar & Settings Modal ─────────────────────────────────────────────────
+// Navbar & Settings Modal
 
 function renderNavbar() {
     const nav = document.createElement('nav');
@@ -9,12 +9,12 @@ function renderNavbar() {
       <div class="nav-user" id="navUser">
         <button class="nav-user-btn" id="navUserBtn" onclick="toggleDropdown()">
           <span id="navUsername">...</span>
-          <span class="chevron">▼</span>
+          <span class="chevron">v</span>
         </button>
         <div class="dropdown" id="dropdown">
-          <button class="dropdown-item" onclick="openSettings()">⚙️ Settings</button>
+          <button class="dropdown-item" onclick="openSettings()">Settings</button>
           <div class="dropdown-divider"></div>
-          <button class="dropdown-item danger" onclick="auth.logout()">↩ Sign out</button>
+          <button class="dropdown-item danger" onclick="auth.logout()">Sign out</button>
         </div>
       </div>
     </div>
@@ -30,7 +30,7 @@ function renderNavbar() {
     <div class="modal">
       <div class="modal-header">
         <h2>Settings</h2>
-        <button class="modal-close" onclick="closeSettings()">✕</button>
+        <button class="modal-close" onclick="closeSettings()">X</button>
       </div>
       <div class="modal-body">
 
@@ -39,7 +39,7 @@ function renderNavbar() {
           <div class="settings-row">
             <div class="settings-row-info">
               <h4>Nickname</h4>
-              <p id="settingsNickname">—</p>
+              <p id="settingsNickname">-</p>
               <input type="text" id="usernameInput" style="
                 display:none;
                 background: var(--surface2);
@@ -60,7 +60,7 @@ function renderNavbar() {
           <div class="settings-row">
             <div class="settings-row-info">
               <h4>Email</h4>
-              <p id="settingsEmail">—</p>
+              <p id="settingsEmail">-</p>
             </div>
             <div class="settings-row-action">
               <span class="badge" id="settingsVerifiedBadge"></span>
@@ -116,14 +116,14 @@ function updateNavbarUI(user) {
     if (navUsername) navUsername.textContent = user.username || '';
 
     const settingsNickname = document.getElementById('settingsNickname');
-    if (settingsNickname) settingsNickname.textContent = user.nickname || user.username || '—';
+    if (settingsNickname) settingsNickname.textContent = user.nickname || user.username || '-';
 
     const settingsEmail = document.getElementById('settingsEmail');
-    if (settingsEmail) settingsEmail.textContent = user.email || '—';
+    if (settingsEmail) settingsEmail.textContent = user.email || '-';
 
     const settingsBadge = document.getElementById('settingsVerifiedBadge');
     if (settingsBadge) {
-        settingsBadge.textContent = user.isVerified ? '✓ Verified' : '⚠ Not verified';
+        settingsBadge.textContent = user.isVerified ? 'Verified' : 'Not verified';
         settingsBadge.className = user.isVerified ? 'badge badge-success' : 'badge badge-warning';
     }
 

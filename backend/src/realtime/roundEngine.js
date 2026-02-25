@@ -270,6 +270,103 @@ function createRoundEngine(io) {
         return state;
     }
 
+    async function getSyncState(lobbyCode) {
+        const code = sanitizeLobbyCode(lobbyCode);
+        const state = await ensureStateForLobby(code);
+        if (!state || !state.currentRound) {
+            return {
+                lobbyCode: code,
+                phase: 'WAITING',
+                readyUserIds: [],
+                allReady: false
+            };
+        }
+
+        const context = await roundService.getRoundContext(state.currentRound.id);
+        if (!context) {
+            return {
+                lobbyCode: code,
+                phase: 'WAITING',
+                readyUserIds: [],
+                allReady: false
+            };
+        }
+
+        state.currentRound = context;
+        state.players = context.session?.lobby?.players || state.players;
+        state.phase = context.status;
+
+        const guesses = await roundService.getGuessesForRound(context.id);
+        const readyUserIds = guesses.filter((guess) => guess.isReady).map((guess) => guess.userId);
+        state.readyUserIds = new Set(readyUserIds);
+        const allReady = state.players.length > 0 && state.players.every((player) => state.readyUserIds.has(player.userId));
+
+        const baseRound = {
+            roundId: context.id,
+            index: context.index,
+            totalRounds: state.baseRoundCount,
+            isSuddenDeath: context.index > state.baseRoundCount,
+            sample: {
+                animeId: context.animeId,
+                sampleStartSec: context.sampleStartSec,
+                sampleDurationSec: context.sampleDurationSec,
+                themeType: context.themeType
+            }
+        };
+
+        const payload = {
+            lobbyCode: code,
+            phase: context.status,
+            round: baseRound,
+            readyUserIds,
+            allReady
+        };
+
+        if (context.status === 'GUESSING') {
+            payload.endsAt = context.guessEndsAt;
+            return payload;
+        }
+
+        const answers = guesses.map((guess) => ({
+            userId: guess.userId,
+            guessText: guess.guessText,
+            guessAnimeId: guess.guessAnimeId,
+            isCorrect: guess.isCorrect
+        }));
+
+        if (context.status === 'ANSWERS_REVEAL') {
+            payload.answers = answers;
+            payload.endsAt = context.answersRevealEndsAt;
+            return payload;
+        }
+
+        if (context.status === 'SOLUTION_REVEAL') {
+            const scores = await roundService.getScoresForSession({
+                sessionId: state.sessionId,
+                lobbyPlayers: state.players
+            });
+
+            payload.answers = answers;
+            payload.solution = {
+                roundId: context.id,
+                correctAnime: {
+                    animeId: context.animeId,
+                    animeTitle: context.animeTitle,
+                    themeType: context.themeType,
+                    themeTitle: context.themeTitle
+                },
+                video: context.solutionVideoUrl,
+                audio: context.solutionAudioUrl,
+                scores,
+                endsAt: context.solutionRevealEndsAt
+            };
+            payload.endsAt = context.solutionRevealEndsAt;
+            return payload;
+        }
+
+        return payload;
+    }
+
     async function submitGuess({ lobbyCode, userId, payload = {} }) {
         const code = sanitizeLobbyCode(lobbyCode);
         const state = await ensureStateForLobby(code);
@@ -426,6 +523,7 @@ function createRoundEngine(io) {
         startSession,
         submitGuess,
         setReady,
+        getSyncState,
         onPlayerDisconnected,
         hasActiveSession,
         recoverActiveSessions

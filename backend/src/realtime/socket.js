@@ -215,6 +215,22 @@ function attachRealtime(httpServer, options = {}) {
             }
         });
 
+        socket.on('round:sync', async (payload = {}, ack) => {
+            try {
+                await assertEventRateLimit(userId, 'round:sync', { windowMs: 10_000, max: 30 });
+                const code = String(payload.lobbyCode || '').toUpperCase();
+                if (!code) throw httpError(400, 'Lobby code is required');
+                if (!socket.data.lobbies.has(code)) {
+                    throw httpError(400, 'Join lobby before syncing round state');
+                }
+
+                const state = await roundEngine.getSyncState(code);
+                if (typeof ack === 'function') ack({ ok: true, state });
+            } catch (err) {
+                emitSocketError(err, 'round_sync_failed', ack);
+            }
+        });
+
         socket.on('disconnect', async () => {
             for (const code of socket.data.lobbies) {
                 try {
