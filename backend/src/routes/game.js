@@ -21,6 +21,14 @@ const joinLobbyRateLimit = createRateLimit({
     message: 'Too many lobby join attempts. Please slow down.'
 });
 
+const searchRateLimit = createRateLimit({
+    keyPrefix: 'game:search',
+    windowMs: 60 * 1000,
+    max: 80,
+    keyGenerator: (req) => String(req.user?.userId || req.ip || 'unknown'),
+    message: 'Too many anime search requests. Please slow down.'
+});
+
 function handleError(res, err) {
     if (err.status) {
         return res.status(err.status).json({ error: err.message });
@@ -152,7 +160,7 @@ router.get('/lobbies/:code/invite', authMiddleware, async (req, res) => {
     }
 });
 
-router.post('/search', authMiddleware, async (req, res) => {
+router.post('/search', authMiddleware, searchRateLimit, async (req, res) => {
     try {
         const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
         const limit = Number.isInteger(req.body?.limit) ? req.body.limit : 10;
