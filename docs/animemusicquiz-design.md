@@ -2,7 +2,8 @@
 
 ## 1. Purpose
 
-This document defines how the multiplayer anime music quiz should work end-to-end in this project.
+This document defines how the anime music quiz should work end-to-end in this project.
+The game supports both single-player and multiplayer sessions.
 It is written as an implementation spec for the current stack:
 
 - Backend: Express + Prisma
@@ -12,7 +13,7 @@ It is written as an implementation spec for the current stack:
 
 ## 2. Core Game Loop
 
-1. Players join a lobby.
+1. A user creates a lobby and can play solo or wait for additional players.
 2. Host sets game options:
    - Number of rounds (`roundCount`)
    - Guess timer per round (`guessSeconds`)
@@ -39,6 +40,7 @@ It is written as an implementation spec for the current stack:
 - Players can change their guess until they explicitly lock/skip.
 - If no guess submitted before timeout, answer is blank.
 - All round transitions are server-authoritative (clients cannot advance state).
+- Solo mode is valid: host can start a match alone.
 
 ### 3.1 Guess lock / skip behavior
 
@@ -143,6 +145,7 @@ Failure policy:
   - try quotas first, then fill missing slots from other player pools (or fallback source) and emit warning.
 - Default policy for this project: `BALANCED_STRICT`.
 - Note: expected to be rare when candidate pools are large and media filtering is healthy.
+- Balanced selection modes are multiplayer-only. In single-player games, use `STANDARD`.
 
 ## 6. Architecture
 
@@ -186,12 +189,13 @@ Keep REST for:
 
 - A user can create a lobby and become host.
 - Host waits in pre-game lobby until players join.
+- Single-player is allowed: host may start immediately without waiting for others.
 - Maximum lobby size: 8 players.
 - Players can join via:
   - invite link,
   - lobby search menu.
 - Lobby search should return only joinable lobbies (for example: `status=WAITING`, not full, not private if privacy rules exist).
-- Host can start match only when minimum player count is met.
+- Host can start match when minimum player count is met (`minPlayers=1` by default).
 
 ## 7. Data Model (Prisma proposal)
 
@@ -299,7 +303,7 @@ Use server-side scoring only.
 Phase 1:
 
 - Private lobby by code
-- 2 to 6 players
+- 1 to 8 players
 - Popular-only source
 - Fixed config: 10 rounds, 20s guess, 10s sample
 - Jikan live search proxy

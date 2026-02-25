@@ -6,6 +6,7 @@ const session = require('express-session');
 
 const authRoutes = require('./routes/auth');
 const malRoutes = require('./routes/mal');
+const gameRoutes = require('./routes/game');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -47,6 +48,7 @@ app.get('/reset-password', (req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/mal', malRoutes);
+app.use('/api/game', gameRoutes);
 
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
