@@ -1,40 +1,9 @@
 const prisma = require('../lib/prisma');
 const { isGuessCorrect } = require('./scoringService');
 const { httpError } = require('./errors');
-
-const CATALOG = [
-    { animeId: 5114, animeTitle: 'Fullmetal Alchemist: Brotherhood', themeTitle: 'Again' },
-    { animeId: 16498, animeTitle: 'Shingeki no Kyojin', themeTitle: 'Guren no Yumiya' },
-    { animeId: 11061, animeTitle: 'Hunter x Hunter (2011)', themeTitle: 'Departure!' },
-    { animeId: 9253, animeTitle: 'Steins;Gate', themeTitle: 'Hacking to the Gate' },
-    { animeId: 38000, animeTitle: 'Kimetsu no Yaiba', themeTitle: 'Gurenge' },
-    { animeId: 40748, animeTitle: 'Jujutsu Kaisen', themeTitle: 'Kaikai Kitan' },
-    { animeId: 44511, animeTitle: 'Chainsaw Man', themeTitle: 'Kick Back' },
-    { animeId: 41457, animeTitle: '86', themeTitle: '3-pun 29-byou' },
-    { animeId: 30276, animeTitle: 'One Punch Man', themeTitle: 'THE HERO !!' },
-    { animeId: 21, animeTitle: 'One Piece', themeTitle: 'We Are!' },
-    { animeId: 1735, animeTitle: 'Naruto: Shippuuden', themeTitle: 'Blue Bird' },
-    { animeId: 20583, animeTitle: 'Haikyuu!!', themeTitle: 'Imagination' },
-    { animeId: 1575, animeTitle: 'Code Geass', themeTitle: 'COLORS' },
-    { animeId: 4224, animeTitle: 'Toradora!', themeTitle: 'Pre-Parade' },
-    { animeId: 37779, animeTitle: 'Yakusoku no Neverland', themeTitle: 'Touch Off' },
-    { animeId: 1535, animeTitle: 'Death Note', themeTitle: 'The World' },
-    { animeId: 918, animeTitle: 'Gintama', themeTitle: 'Pray' },
-    { animeId: 40028, animeTitle: 'Shingeki no Kyojin: The Final Season', themeTitle: 'Boku no Sensou' },
-    { animeId: 457, animeTitle: 'Mushishi', themeTitle: 'The Sore Feet Song' },
-    { animeId: 30240, animeTitle: 'Prison School', themeTitle: 'Ai no Prison' },
-    { animeId: 23273, animeTitle: 'Shigatsu wa Kimi no Uso', themeTitle: 'Hikaru Nara' },
-    { animeId: 1, animeTitle: 'Cowboy Bebop', themeTitle: 'Tank!' },
-    { animeId: 43, animeTitle: 'Ghost in the Shell', themeTitle: 'Inner Universe' },
-    { animeId: 199, animeTitle: 'Sen to Chihiro no Kamikakushi', themeTitle: 'Itsumo Nando Demo' },
-    { animeId: 35968, animeTitle: 'Wotaku ni Koi wa Muzukashii', themeTitle: 'Fiction' }
-];
-
-function chooseThemeType(themeMode, index) {
-    if (themeMode === 'OP_ONLY') return 'OP';
-    if (themeMode === 'ED_ONLY') return 'ED';
-    return index % 2 === 0 ? 'ED' : 'OP';
-}
+const { resolveRoundMedia } = require('./mediaService');
+const { POPULAR_CATALOG } = require('./catalog');
+const { buildRoundSeedPlan } = require('./malSelectionService');
 
 function buildSourceAssignments({ lobbyPlayers, roundCount, selectionMode }) {
     const playerIds = lobbyPlayers.map((player) => player.userId);
@@ -64,6 +33,73 @@ function buildSourceAssignments({ lobbyPlayers, roundCount, selectionMode }) {
     return assignments;
 }
 
+function rotateCatalogForSession(sessionId) {
+    if (POPULAR_CATALOG.length === 0) return [];
+    const offset = Math.abs(Number(sessionId) || 0) % POPULAR_CATALOG.length;
+    return [...POPULAR_CATALOG.slice(offset), ...POPULAR_CATALOG.slice(0, offset)];
+}
+
+function isProviderFailure(err) {
+    return Number.isInteger(err?.status) && err.status >= 500;
+}
+
+async function selectRoundMedia({
+    session,
+    roundIndex,
+    usedAnimeIds,
+    allowReuse = false
+}) {
+    const catalog = rotateCatalogForSession(session.id);
+    if (catalog.length === 0) return null;
+
+    const start = (roundIndex - 1) % catalog.length;
+    const ordered = [...catalog.slice(start), ...catalog.slice(0, start)];
+
+    let bestFallback = null;
+    for (const seed of ordered) {
+        if (!allowReuse && usedAnimeIds.has(seed.animeId)) continue;
+
+        let media;
+        try {
+            media = await resolveRoundMedia({
+                animeId: seed.animeId,
+                animeTitle: seed.animeTitle,
+                themeMode: session.themeMode,
+                sampleSeconds: session.sampleSeconds,
+                roundIndex
+            });
+        } catch (err) {
+            if (isProviderFailure(err)) throw err;
+            continue;
+        }
+
+        if (!media?.solutionVideoUrl) continue;
+        if (!allowReuse && usedAnimeIds.has(media.animeId)) continue;
+
+        if (media.animeId === seed.animeId) return media;
+        if (!bestFallback) bestFallback = media;
+    }
+
+    return bestFallback;
+}
+
+function buildRoundRow({ sessionId, roundIndex, media, sourcePlayerId }) {
+    return {
+        sessionId,
+        index: roundIndex,
+        status: 'PENDING',
+        animeId: media.animeId,
+        animeTitle: media.animeTitle,
+        themeType: media.themeType,
+        themeTitle: media.themeTitle,
+        sampleStartSec: media.sampleStartSec,
+        sampleDurationSec: media.sampleDurationSec,
+        solutionVideoUrl: media.solutionVideoUrl,
+        solutionAudioUrl: media.solutionAudioUrl,
+        sourcePlayerId: sourcePlayerId ?? null
+    };
+}
+
 async function generateInitialRoundsForSession({ session, lobby }) {
     const existingCount = await prisma.gameRound.count({
         where: { sessionId: session.id }
@@ -76,26 +112,56 @@ async function generateInitialRoundsForSession({ session, lobby }) {
         selectionMode: session.selectionMode
     });
 
-    const now = Date.now();
+    const plannedSeeds = await buildRoundSeedPlan({ session, lobby });
+    if (!Array.isArray(plannedSeeds) || plannedSeeds.length < session.roundCount) {
+        throw httpError(503, 'Could not prepare enough round seeds for this match');
+    }
+
+    const usedAnimeIds = new Set();
     const rows = [];
     for (let i = 1; i <= session.roundCount; i += 1) {
-        const entry = CATALOG[(i - 1) % CATALOG.length];
-        rows.push({
-            sessionId: session.id,
-            index: i,
-            status: 'PENDING',
-            animeId: entry.animeId + i, // keep reasonably unique per round
-            animeTitle: entry.animeTitle,
-            themeType: chooseThemeType(session.themeMode, i),
-            themeTitle: entry.themeTitle,
-            sampleStartSec: (i * 7) % 45,
-            sampleDurationSec: session.sampleSeconds,
-            solutionVideoUrl: `https://media.example.com/anime/${entry.animeId}/video`,
-            solutionAudioUrl: `https://media.example.com/anime/${entry.animeId}/audio`,
-            sourcePlayerId: sourceAssignments[i - 1] || null,
-            createdAt: new Date(now),
-            updatedAt: new Date(now)
+        const seed = plannedSeeds[i - 1];
+        let resolvedSourcePlayerId = seed.sourcePlayerId ?? sourceAssignments[i - 1] ?? null;
+        let media = await resolveRoundMedia({
+            animeId: seed.animeId,
+            animeTitle: seed.animeTitle,
+            themeMode: session.themeMode,
+            sampleSeconds: session.sampleSeconds,
+            roundIndex: i
         });
+
+        const mediaUnavailable = !media?.solutionVideoUrl || usedAnimeIds.has(media.animeId);
+        if (mediaUnavailable) {
+            media = await selectRoundMedia({
+                session,
+                roundIndex: i,
+                usedAnimeIds,
+                allowReuse: false
+            });
+            resolvedSourcePlayerId = null;
+        }
+
+        if (!media) {
+            media = await selectRoundMedia({
+                session,
+                roundIndex: i,
+                usedAnimeIds,
+                allowReuse: true
+            });
+            resolvedSourcePlayerId = null;
+        }
+
+        if (!media) {
+            throw httpError(503, `Could not resolve enough playable round media (${rows.length}/${session.roundCount})`);
+        }
+
+        usedAnimeIds.add(media.animeId);
+        rows.push(buildRoundRow({
+            sessionId: session.id,
+            roundIndex: i,
+            media,
+            sourcePlayerId: resolvedSourcePlayerId
+        }));
     }
 
     await prisma.gameRound.createMany({ data: rows });
@@ -113,22 +179,39 @@ async function ensureRoundForIndex({ session, index, lobbyPlayers }) {
         selectionMode: session.selectionMode
     });
 
-    const entry = CATALOG[(index - 1) % CATALOG.length];
+    const existingRounds = await prisma.gameRound.findMany({
+        where: { sessionId: session.id },
+        select: { animeId: true }
+    });
+    const usedAnimeIds = new Set(existingRounds.map((row) => row.animeId));
+
+    let media = await selectRoundMedia({
+        session,
+        roundIndex: index,
+        usedAnimeIds,
+        allowReuse: false
+    });
+
+    if (!media) {
+        media = await selectRoundMedia({
+            session,
+            roundIndex: index,
+            usedAnimeIds,
+            allowReuse: true
+        });
+    }
+
+    if (!media) {
+        throw httpError(503, 'Could not resolve playable media for this round');
+    }
+
     return prisma.gameRound.create({
-        data: {
+        data: buildRoundRow({
             sessionId: session.id,
-            index,
-            status: 'PENDING',
-            animeId: entry.animeId + index,
-            animeTitle: entry.animeTitle,
-            themeType: chooseThemeType(session.themeMode, index),
-            themeTitle: entry.themeTitle,
-            sampleStartSec: (index * 7) % 45,
-            sampleDurationSec: session.sampleSeconds,
-            solutionVideoUrl: `https://media.example.com/anime/${entry.animeId}/video`,
-            solutionAudioUrl: `https://media.example.com/anime/${entry.animeId}/audio`,
+            roundIndex: index,
+            media,
             sourcePlayerId: sourceAssignments[index - 1] || null
-        }
+        })
     });
 }
 

@@ -17,14 +17,14 @@ const CREATE_DEFAULTS = {
     themeMode: 'MIXED'
 };
 
-function emitWithAck(socket, eventName, payload) {
+function emitWithAck(socket, eventName, payload, { timeoutMs = 10_000 } = {}) {
     return new Promise((resolve, reject) => {
         let done = false;
         const timer = window.setTimeout(() => {
             if (done) return;
             done = true;
             reject(new Error('Request timed out'));
-        }, 10_000);
+        }, timeoutMs);
 
         socket.emit(eventName, payload, (ack) => {
             if (done) return;
@@ -274,7 +274,7 @@ export default function App() {
         setBusy('start');
         setError('');
         try {
-            await emitWithAck(socketRef.current, 'game:start', { lobbyCode: lobby.code });
+            await emitWithAck(socketRef.current, 'game:start', { lobbyCode: lobby.code }, { timeoutMs: 120_000 });
         } catch (err) {
             setError(err.message);
         } finally {
