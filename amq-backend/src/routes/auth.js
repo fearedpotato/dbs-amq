@@ -21,7 +21,11 @@ router.post('/register', async (req, res) => {
         });
 
         if (existing) {
-            return res.status(400).json({ error: 'Username or email already taken' });
+            if(existing.isVerified) {
+                return res.status(400).json({ error: 'Username or email already taken' });
+            }
+
+            await prisma.user.delete({ where: { id: existing.id } });
         }
 
         const hashedPassword = await bcrypt.hash(password, 10);

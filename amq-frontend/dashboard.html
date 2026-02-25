@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Dashboard — DBS</title>
   <link rel="stylesheet" href="style.css"/>
+  <style>
+    body { visibility: hidden; }
+  </style>
 </head>
 <body class="page">
 <nav class="navbar">
@@ -45,36 +48,39 @@
 
 <script src="auth.js"></script>
 <script>
-  auth.requireAuth();
-
-  const user = auth.getUser();
-
-  document.getElementById('username').textContent = user?.username || '';
-  document.getElementById('navUsername').textContent = user?.username || '';
-
-  const badge = document.getElementById('verifiedBadge');
-  if (user?.isVerified) {
-    badge.textContent = '✓ Verified';
-    badge.className = 'badge badge-success';
+  if (!auth.isLoggedIn()) {
+    window.location.href = 'login.html';                  // Dashboard remains hidden until user is logged in
   } else {
-    badge.textContent = '⚠ Email not verified';
-    badge.className = 'badge badge-warning';
-  }
+    document.body.style.visibility = 'visible';
 
-  // Refresh user data from server
-  apiFetch('/auth/me').then(freshUser => {
-    auth.save(auth.getToken(), freshUser);
-    document.getElementById('username').textContent = freshUser.username;
-    document.getElementById('navUsername').textContent = freshUser.username;
+    const user = auth.getUser();
 
-    if (freshUser.isVerified) {
+    document.getElementById('username').textContent = user?.username || '';
+    document.getElementById('navUsername').textContent = user?.username || '';
+
+    const badge = document.getElementById('verifiedBadge');
+    if (user?.isVerified) {
       badge.textContent = '✓ Verified';
       badge.className = 'badge badge-success';
     } else {
       badge.textContent = '⚠ Email not verified';
       badge.className = 'badge badge-warning';
     }
-  }).catch(() => auth.logout());
+
+    apiFetch('/auth/me').then(freshUser => {
+      auth.save(auth.getToken(), freshUser);
+      document.getElementById('username').textContent = freshUser.username;
+      document.getElementById('navUsername').textContent = freshUser.username;
+
+      if (freshUser.isVerified) {
+        badge.textContent = '✓ Verified';
+        badge.className = 'badge badge-success';
+      } else {
+        badge.textContent = '⚠ Email not verified';
+        badge.className = 'badge badge-warning';
+      }
+    }).catch(() => auth.logout());
+  }
 </script>
 </body>
 </html>
