@@ -6,8 +6,35 @@ function normalizeGuess(value) {
         .replace(/\s+/g, ' ');
 }
 
-function isGuessCorrect({ guessAnimeId, expectedAnimeId, guessText, expectedTitle }) {
-    if (guessAnimeId && expectedAnimeId && Number(guessAnimeId) === Number(expectedAnimeId)) {
+function normalizeAcceptedAnimeIds(acceptedAnimeIds, expectedAnimeId) {
+    const set = new Set();
+    if (Array.isArray(acceptedAnimeIds)) {
+        for (const value of acceptedAnimeIds) {
+            const parsed = Number.parseInt(value, 10);
+            if (Number.isInteger(parsed) && parsed > 0) {
+                set.add(parsed);
+            }
+        }
+    }
+
+    const expected = Number.parseInt(expectedAnimeId, 10);
+    if (Number.isInteger(expected) && expected > 0) {
+        set.add(expected);
+    }
+
+    return set;
+}
+
+function isGuessCorrect({
+    guessAnimeId,
+    expectedAnimeId,
+    acceptedAnimeIds,
+    guessText,
+    expectedTitle
+}) {
+    const parsedGuessAnimeId = Number.parseInt(guessAnimeId, 10);
+    const acceptedIds = normalizeAcceptedAnimeIds(acceptedAnimeIds, expectedAnimeId);
+    if (Number.isInteger(parsedGuessAnimeId) && acceptedIds.has(parsedGuessAnimeId)) {
         return true;
     }
     return normalizeGuess(guessText) === normalizeGuess(expectedTitle);
@@ -15,5 +42,6 @@ function isGuessCorrect({ guessAnimeId, expectedAnimeId, guessText, expectedTitl
 
 module.exports = {
     normalizeGuess,
+    normalizeAcceptedAnimeIds,
     isGuessCorrect
 };

@@ -48,15 +48,24 @@ describe('mal routes', () => {
 
         expect(res.status).toBe(200);
         expect(typeof res.body.url).toBe('string');
+        expect(typeof res.body.browserUrl).toBe('string');
+        expect(typeof res.body.authorizeUrl).toBe('string');
 
-        const url = new URL(res.body.url);
-        expect(url.origin).toBe('https://myanimelist.net');
-        expect(url.pathname).toBe('/v1/oauth2/authorize');
-        expect(url.searchParams.get('response_type')).toBe('code');
-        expect(url.searchParams.get('client_id')).toBe('test-client-id');
-        expect(url.searchParams.get('redirect_uri')).toBe(process.env.MAL_REDIRECT_URI);
-        expect(url.searchParams.get('code_challenge_method')).toBe('plain');
-        expect(url.searchParams.get('code_challenge')).toBeTruthy();
-        expect(url.searchParams.get('state')).toBeTruthy();
+        const browserUrl = new URL(res.body.url);
+        expect(browserUrl.origin).toBe('https://myanimelist.net');
+        expect(browserUrl.pathname).toBe('/login.php');
+        const from = browserUrl.searchParams.get('from');
+        expect(typeof from).toBe('string');
+        expect(from).toContain('/v1/oauth2/authorize?');
+
+        const authorizeUrl = new URL(res.body.authorizeUrl);
+        expect(authorizeUrl.origin).toBe('https://myanimelist.net');
+        expect(authorizeUrl.pathname).toBe('/v1/oauth2/authorize');
+        expect(authorizeUrl.searchParams.get('response_type')).toBe('code');
+        expect(authorizeUrl.searchParams.get('client_id')).toBe('test-client-id');
+        expect(authorizeUrl.searchParams.get('redirect_uri')).toBe(process.env.MAL_REDIRECT_URI);
+        expect(authorizeUrl.searchParams.get('code_challenge_method')).toBe('plain');
+        expect(authorizeUrl.searchParams.get('code_challenge')).toBeTruthy();
+        expect(authorizeUrl.searchParams.get('state')).toBeTruthy();
     });
 });

@@ -8,9 +8,11 @@ const DEFAULT_CACHE_MAX_ENTRIES = 400;
 const DEFAULT_BLACKLIST_TTL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_PROVIDER_STATUS_CACHE_MS = 15_000;
 const PROVIDER_PROBE_TIMEOUT_CAP_MS = 5_000;
+const SONG_EQUIVALENTS_FETCH_BATCH_SIZE = 40;
 
 const animeCache = new Map();
 const unplayableBlacklist = new Map();
+const songEquivalentAnimeIdsCache = new Map();
 const providerStatusCache = {
     value: null,
     expiresAt: 0
@@ -49,6 +51,19 @@ function getProbeTimeoutMs() {
     return Math.max(500, Math.min(getTimeoutMs(), PROVIDER_PROBE_TIMEOUT_CAP_MS));
 }
 
+function toPositiveInt(value) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function chunkValues(values, size = SONG_EQUIVALENTS_FETCH_BATCH_SIZE) {
+    const chunks = [];
+    for (let i = 0; i < values.length; i += size) {
+        chunks.push(values.slice(i, i + size));
+    }
+    return chunks;
+}
+
 function sanitizeTitle(value, fallback = null) {
     const title = typeof value === 'string' ? value.trim() : '';
     return title || fallback;
@@ -62,6 +77,10 @@ function parseDurationSeconds(...values) {
         }
     }
     return null;
+}
+
+function normalizeSiteName(value) {
+    return String(value || '').trim().toLowerCase().replace(/\s+/g, '');
 }
 
 function pickSampleStartSec(totalDurationSec, sampleDurationSec) {
@@ -112,6 +131,39 @@ function pruneCache(now = Date.now()) {
     }
 }
 
+function pruneSongEquivalentCache(now = Date.now()) {
+    for (const [key, entry] of songEquivalentAnimeIdsCache) {
+        if (now >= entry.expiresAt) {
+            songEquivalentAnimeIdsCache.delete(key);
+        }
+    }
+
+    const maxEntries = getCacheMaxEntries();
+    while (songEquivalentAnimeIdsCache.size > maxEntries) {
+        const first = songEquivalentAnimeIdsCache.keys().next();
+        if (first.done) break;
+        songEquivalentAnimeIdsCache.delete(first.value);
+    }
+}
+
+function readSongEquivalentCache(songId, now = Date.now()) {
+    const entry = songEquivalentAnimeIdsCache.get(String(songId));
+    if (!entry) return null;
+    if (now >= entry.expiresAt) {
+        songEquivalentAnimeIdsCache.delete(String(songId));
+        return null;
+    }
+    return Array.isArray(entry.value) ? entry.value : [];
+}
+
+function writeSongEquivalentCache(songId, malAnimeIds, now = Date.now()) {
+    songEquivalentAnimeIdsCache.set(String(songId), {
+        value: Array.isArray(malAnimeIds) ? malAnimeIds : [],
+        expiresAt: now + getCacheTtlMs()
+    });
+    pruneSongEquivalentCache(now);
+}
+
 function blacklistKey(animeId, themeMode) {
     return `${animeId}:${String(themeMode || 'MIXED').toUpperCase()}`;
 }
@@ -158,7 +210,16 @@ function writeCache(cacheKey, value, now = Date.now()) {
     pruneCache(now);
 }
 
-function normalizeCandidate({ animeId, animeTitle, themeType, themeTitle, videoUrl, audioUrl, mediaDurationSec }) {
+function normalizeCandidate({
+    animeId,
+    animeTitle,
+    themeType,
+    themeTitle,
+    themeSongId,
+    videoUrl,
+    audioUrl,
+    mediaDurationSec
+}) {
     if (!Number.isInteger(animeId) || animeId <= 0) return null;
     if (!videoUrl) return null;
     if (!themeType) return null;
@@ -168,6 +229,7 @@ function normalizeCandidate({ animeId, animeTitle, themeType, themeTitle, videoU
         animeTitle: sanitizeTitle(animeTitle, `Anime ${animeId}`),
         themeType,
         themeTitle: sanitizeTitle(themeTitle),
+        themeSongId: toPositiveInt(themeSongId),
         mediaDurationSec: Number.isFinite(mediaDurationSec) ? mediaDurationSec : null,
         solutionVideoUrl: String(videoUrl),
         solutionAudioUrl: audioUrl ? String(audioUrl) : null
@@ -182,6 +244,7 @@ function extractThemeCandidates(animeEntry, malAnimeId, fallbackTitle) {
     for (const theme of animethemes) {
         const themeType = normalizeThemeType(theme?.type);
         if (!themeType) continue;
+        const themeSongId = toPositiveInt(theme?.song?.id);
 
         const themeTitle = sanitizeTitle(
             theme?.song?.title,
@@ -209,6 +272,7 @@ function extractThemeCandidates(animeEntry, malAnimeId, fallbackTitle) {
                     animeTitle,
                     themeType,
                     themeTitle,
+                    themeSongId,
                     videoUrl,
                     audioUrl,
                     mediaDurationSec
@@ -312,6 +376,93 @@ function pickCandidate(candidates, themeMode, roundIndex) {
     return filtered[resolvedIndex % filtered.length];
 }
 
+function extractSongPayload(data) {
+    if (data?.song && typeof data.song === 'object') return data.song;
+    if (Array.isArray(data?.songs) && data.songs[0]) return data.songs[0];
+    return null;
+}
+
+function extractAnimeThemesAnimeIdsFromSong(songPayload) {
+    const ids = new Set();
+    const animethemes = Array.isArray(songPayload?.animethemes) ? songPayload.animethemes : [];
+    for (const theme of animethemes) {
+        const animeThemesAnimeId = toPositiveInt(theme?.anime?.id);
+        if (animeThemesAnimeId) ids.add(animeThemesAnimeId);
+    }
+    return [...ids];
+}
+
+function extractMalAnimeIdFromAnimeEntry(animeEntry) {
+    const resources = Array.isArray(animeEntry?.resources) ? animeEntry.resources : [];
+    for (const resource of resources) {
+        if (normalizeSiteName(resource?.site) !== 'myanimelist') continue;
+        const malAnimeId = toPositiveInt(resource?.external_id);
+        if (malAnimeId) return malAnimeId;
+    }
+    return null;
+}
+
+async function fetchMalAnimeIdsForAnimeThemesIds(animeThemesAnimeIds = []) {
+    const ids = [...new Set(
+        animeThemesAnimeIds
+            .map((value) => toPositiveInt(value))
+            .filter((value) => Number.isInteger(value))
+    )];
+    if (ids.length === 0) return [];
+
+    const malAnimeIds = new Set();
+    for (const chunk of chunkValues(ids)) {
+        const response = await axios.get(`${getBaseUrl()}/anime`, {
+            timeout: getTimeoutMs(),
+            params: {
+                'filter[anime][id]': chunk.join(','),
+                include: 'resources'
+            }
+        });
+
+        const rows = listFromResponse(response.data, ['anime']);
+        for (const row of rows) {
+            const malAnimeId = extractMalAnimeIdFromAnimeEntry(row);
+            if (malAnimeId) malAnimeIds.add(malAnimeId);
+        }
+    }
+
+    return [...malAnimeIds];
+}
+
+async function resolveAcceptedAnimeIdsForSong({ songId, fallbackAnimeId }) {
+    const fallback = toPositiveInt(fallbackAnimeId);
+    const fallbackList = fallback ? [fallback] : [];
+
+    const resolvedSongId = toPositiveInt(songId);
+    if (!resolvedSongId) return fallbackList;
+
+    const cached = readSongEquivalentCache(resolvedSongId);
+    if (cached) {
+        return [...new Set([...cached, ...fallbackList])];
+    }
+
+    try {
+        const response = await axios.get(`${getBaseUrl()}/song/${resolvedSongId}`, {
+            timeout: getTimeoutMs(),
+            params: {
+                include: 'animethemes.anime'
+            }
+        });
+
+        const songPayload = extractSongPayload(response.data);
+        if (!songPayload) return fallbackList;
+
+        const animeThemesAnimeIds = extractAnimeThemesAnimeIdsFromSong(songPayload);
+        const malAnimeIds = await fetchMalAnimeIdsForAnimeThemesIds(animeThemesAnimeIds);
+        writeSongEquivalentCache(resolvedSongId, malAnimeIds);
+
+        return [...new Set([...malAnimeIds, ...fallbackList])];
+    } catch (_err) {
+        return fallbackList;
+    }
+}
+
 async function resolveRoundMedia({ animeId, animeTitle, themeMode = 'MIXED', sampleSeconds = 10, roundIndex = 1 } = {}) {
     const malAnimeId = Number.parseInt(animeId, 10);
     if (!Number.isInteger(malAnimeId) || malAnimeId <= 0) {
@@ -332,11 +483,17 @@ async function resolveRoundMedia({ animeId, animeTitle, themeMode = 'MIXED', sam
     clearBlacklist(malAnimeId, themeMode);
 
     const sampleDurationSec = Math.max(3, Number.parseInt(sampleSeconds, 10) || 10);
+    const acceptedAnimeIds = await resolveAcceptedAnimeIdsForSong({
+        songId: selected.themeSongId,
+        fallbackAnimeId: selected.animeId
+    });
+
     return {
         animeId: selected.animeId,
         animeTitle: selected.animeTitle,
         themeType: selected.themeType,
         themeTitle: selected.themeTitle,
+        acceptedAnimeIds,
         sampleDurationSec,
         sampleStartSec: pickSampleStartSec(
             selected.mediaDurationSec,
@@ -350,6 +507,7 @@ async function resolveRoundMedia({ animeId, animeTitle, themeMode = 'MIXED', sam
 function __clearMediaCache() {
     animeCache.clear();
     unplayableBlacklist.clear();
+    songEquivalentAnimeIdsCache.clear();
     providerStatusCache.value = null;
     providerStatusCache.expiresAt = 0;
 }

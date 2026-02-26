@@ -30,7 +30,18 @@ router.post('/login', authMiddleware, (req, res) => {
         state: oauthState
     });
 
-    res.json({ url: `https://myanimelist.net/v1/oauth2/authorize?${params}` });
+    const authorizeUrl = `https://myanimelist.net/v1/oauth2/authorize?${params}`;
+    const loginPathWithReturn = `/v1/oauth2/authorize?${params}`;
+    const browserUrl = `https://myanimelist.net/login.php?from=${encodeURIComponent(loginPathWithReturn)}`;
+
+    // MAL may return HTTP Basic challenge from /oauth2/authorize when no active MAL cookie exists.
+    // Sending browsers through login.php avoids the native browser credential popup.
+    res.json({
+        // Keep `url` as the browser-safe URL for compatibility with older cached frontends.
+        url: browserUrl,
+        browserUrl,
+        authorizeUrl
+    });
 });
 
 // Step 2: MAL redirects back here with a code

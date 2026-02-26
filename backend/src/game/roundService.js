@@ -85,6 +85,16 @@ async function selectRoundMedia({
 }
 
 function buildRoundRow({ sessionId, roundIndex, media, sourcePlayerId, lobbyCode = null }) {
+    const acceptedAnimeIds = Array.isArray(media.acceptedAnimeIds)
+        ? media.acceptedAnimeIds
+            .map((value) => Number.parseInt(value, 10))
+            .filter((value) => Number.isInteger(value) && value > 0)
+        : [];
+    const uniqueAcceptedAnimeIds = [...new Set([
+        Number.parseInt(media.animeId, 10),
+        ...acceptedAnimeIds
+    ].filter((value) => Number.isInteger(value) && value > 0))];
+
     return {
         sessionId,
         index: roundIndex,
@@ -97,6 +107,7 @@ function buildRoundRow({ sessionId, roundIndex, media, sourcePlayerId, lobbyCode
         sampleDurationSec: media.sampleDurationSec,
         solutionVideoUrl: buildMediaProxyUrl(media.solutionVideoUrl, { lobbyCode }),
         solutionAudioUrl: buildMediaProxyUrl(media.solutionAudioUrl, { lobbyCode }),
+        acceptedAnimeIds: uniqueAcceptedAnimeIds,
         sourcePlayerId: sourcePlayerId ?? null
     };
 }
@@ -317,6 +328,7 @@ async function evaluateRound(roundId) {
         const correct = isGuessCorrect({
             guessAnimeId: guess.guessAnimeId,
             expectedAnimeId: round.animeId,
+            acceptedAnimeIds: round.acceptedAnimeIds,
             guessText: guess.guessText,
             expectedTitle: round.animeTitle
         });

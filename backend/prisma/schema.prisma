@@ -114,6 +114,7 @@ model GameRound {
   sampleDurationSec    Int
   solutionVideoUrl     String?
   solutionAudioUrl     String?
+  acceptedAnimeIds     Int[]       @default([])
   sourcePlayerId       Int?
   guessEndsAt          DateTime?
   answersRevealEndsAt  DateTime?

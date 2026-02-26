@@ -158,4 +158,25 @@ describe('malSelectionService.buildRoundSeedPlan', () => {
             lobby: baseLobby([1])
         })).rejects.toMatchObject({ status: 400 });
     });
+
+    test('MAL pool includes only watching/completed statuses', async () => {
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: 'token-1' }
+        ]);
+        axios.get.mockResolvedValueOnce(malListResponse([
+            { id: 10, title: 'Completed A', status: 'completed' },
+            { id: 20, title: 'Watching B', status: 'watching' },
+            { id: 30, title: 'Dropped C', status: 'dropped' },
+            { id: 40, title: 'On Hold D', status: 'on_hold' },
+            { id: 50, title: 'Plan E', status: 'plan_to_watch' }
+        ]));
+
+        const plan = await buildRoundSeedPlan({
+            session: baseSession({ roundCount: 2, sourceMode: 'MAL_ONLY', selectionMode: 'STANDARD' }),
+            lobby: baseLobby([1])
+        });
+
+        const ids = plan.map((item) => item.animeId).sort((a, b) => a - b);
+        expect(ids).toEqual([10, 20]);
+    });
 });

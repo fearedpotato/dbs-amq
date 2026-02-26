@@ -1,5 +1,7 @@
 const axios = require('axios');
 const { httpError } = require('./errors');
+const animeCatalogService = require('./animeCatalogService');
+const telemetry = require('../lib/telemetry');
 
 const DEFAULT_JIKAN_BASE_URL = 'https://api.jikan.moe/v4';
 const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -83,14 +85,39 @@ function mapAnimeResult(item) {
     const animeId = Number.parseInt(item.mal_id, 10);
     if (!Number.isInteger(animeId)) return null;
 
+    const title = [
+        item.title_english,
+        item.title,
+        item.title_japanese
+    ].map((value) => String(value || '').trim()).find(Boolean) || '';
+
     return {
         id: animeId,
-        title: String(item.title || item.title_english || item.title_japanese || ''),
+        title,
         titleEnglish: item.title_english ? String(item.title_english) : null,
         titleJapanese: item.title_japanese ? String(item.title_japanese) : null,
         year: Number.isInteger(item.year) ? item.year : null,
         imageUrl: item.images?.jpg?.image_url || item.images?.webp?.image_url || null
     };
+}
+
+function isReleasedAnime(item, now = Date.now()) {
+    if (!item || typeof item !== 'object') return false;
+
+    const status = String(item.status || '').trim().toLowerCase();
+    if (status.includes('not yet aired') || status.includes('upcoming')) {
+        return false;
+    }
+
+    const airedFromRaw = item.aired?.from;
+    if (typeof airedFromRaw === 'string' && airedFromRaw.trim()) {
+        const airedFromTs = Date.parse(airedFromRaw);
+        if (Number.isFinite(airedFromTs) && airedFromTs > now) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 async function searchAnime(query, { limit = 10 } = {}) {
@@ -111,6 +138,27 @@ async function searchAnime(query, { limit = 10 } = {}) {
     }
 
     try {
+        const localResults = await animeCatalogService.searchCatalog(normalizedQuery, { limit: resolvedLimit });
+        if (Array.isArray(localResults) && localResults.length > 0) {
+            const payload = {
+                query: normalizedQuery,
+                source: 'local_catalog',
+                results: localResults.slice(0, resolvedLimit),
+                limit: resolvedLimit
+            };
+            writeCache(cacheKey, payload);
+            return {
+                ...payload,
+                cached: false
+            };
+        }
+    } catch (err) {
+        telemetry.warn('search.local_catalog_failed', {
+            error: err?.message || String(err)
+        });
+    }
+
+    try {
         const response = await axios.get(`${getJikanBaseUrl()}/anime`, {
             timeout: getRequestTimeoutMs(),
             params: {
@@ -121,7 +169,14 @@ async function searchAnime(query, { limit = 10 } = {}) {
         });
 
         const rows = Array.isArray(response.data?.data) ? response.data.data : [];
+        animeCatalogService.upsertCatalogEntries(rows, { source: 'search_fallback' }).catch((err) => {
+            telemetry.warn('search.catalog_upsert_failed', {
+                error: err?.message || String(err)
+            });
+        });
+
         const results = rows
+            .filter((entry) => isReleasedAnime(entry))
             .map(mapAnimeResult)
             .filter((entry) => entry && entry.title)
             .slice(0, resolvedLimit);

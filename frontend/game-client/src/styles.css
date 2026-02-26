@@ -214,6 +214,12 @@
     border: 1px solid #225475;
 }
 
+.gmq-alert-warning {
+    color: #ffe5b0;
+    background: #3b2a12;
+    border: 1px solid #725427;
+}
+
 .gmq-lobby-list,
 .gmq-player-list,
 .gmq-answer-list,

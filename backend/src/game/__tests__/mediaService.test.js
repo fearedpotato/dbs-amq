@@ -241,4 +241,64 @@ describe('mediaService.resolveRoundMedia', () => {
         expect(status.cached).toBe(false);
         expect(status.statusCode).toBeNull();
     });
+
+    test('resolves equivalent MAL anime ids for same song across seasons', async () => {
+        axios.get
+            // fetchAnimeThemesIdByMalId
+            .mockResolvedValueOnce({
+                data: {
+                    resources: [{ anime: [{ id: 999 }] }]
+                }
+            })
+            // fetchAnimeThemesEntryByInternalId
+            .mockResolvedValueOnce({
+                data: {
+                    anime: [{
+                        name: 'Demo Anime Season 2',
+                        animethemes: [{
+                            type: 'OP',
+                            song: { id: 555, title: 'Shared OP' },
+                            animethemeentries: [{ videos: [{ link: 'https://cdn.example/s2-op.mp4' }] }]
+                        }]
+                    }]
+                }
+            })
+            // /song/{id}
+            .mockResolvedValueOnce({
+                data: {
+                    song: {
+                        id: 555,
+                        animethemes: [
+                            { anime: { id: 1001 } },
+                            { anime: { id: 1002 } }
+                        ]
+                    }
+                }
+            })
+            // /anime with resources for both anime ids
+            .mockResolvedValueOnce({
+                data: {
+                    anime: [
+                        {
+                            id: 1001,
+                            resources: [{ site: 'MyAnimeList', external_id: 111 }]
+                        },
+                        {
+                            id: 1002,
+                            resources: [{ site: 'MyAnimeList', external_id: 222 }]
+                        }
+                    ]
+                }
+            });
+
+        const media = await resolveRoundMedia({
+            animeId: 222,
+            themeMode: 'OP_ONLY',
+            sampleSeconds: 10,
+            roundIndex: 1
+        });
+
+        expect(media.acceptedAnimeIds).toEqual(expect.arrayContaining([111, 222]));
+        expect(media.acceptedAnimeIds.length).toBeGreaterThanOrEqual(2);
+    });
 });

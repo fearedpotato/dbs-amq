@@ -175,6 +175,7 @@ export default function App() {
     const preloadDestroyedRef = useRef(false);
     const preloadSessionIdRef = useRef(null);
     const preloadReadySentRef = useRef(false);
+    const searchRequestSeqRef = useRef(0);
 
     const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState('');
@@ -218,6 +219,7 @@ export default function App() {
     const [preloadProgress, setPreloadProgress] = useState({ ready: 0, failed: 0, total: 0 });
     const [preloadGateError, setPreloadGateError] = useState('');
     const [preloadRetrying, setPreloadRetrying] = useState(false);
+    const [suddenDeathState, setSuddenDeathState] = useState(null);
     const [mediaSourceStatus, setMediaSourceStatus] = useState(null);
     const [mediaSourceLoading, setMediaSourceLoading] = useState(false);
     const [mediaSourceError, setMediaSourceError] = useState('');
@@ -875,6 +877,7 @@ export default function App() {
         setSampleAutoplayBlocked(false);
         setSamplePlaybackSource(null);
         setSolutionVideoAutoplayBlocked(false);
+        setSuddenDeathState(null);
     }, [resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback]);
 
     const applySyncState = useCallback((syncState) => {
@@ -884,6 +887,14 @@ export default function App() {
         setRound(state.round || null);
         setReadyUserIds(Array.isArray(state.readyUserIds) ? state.readyUserIds : []);
         setPhaseEndsAt(state.endsAt || state.solution?.endsAt || null);
+        if (!state?.round?.isSuddenDeath) {
+            setSuddenDeathState(null);
+        } else {
+            setSuddenDeathState((prev) => ({
+                roundIndex: Number.parseInt(state?.round?.index, 10) || prev?.roundIndex || null,
+                tiedUserIds: Array.isArray(prev?.tiedUserIds) ? prev.tiedUserIds : []
+            }));
+        }
 
         if (nextPhase === 'ANSWERS_REVEAL') {
             setAnswers(Array.isArray(state.answers) ? state.answers : []);
@@ -1124,6 +1135,7 @@ export default function App() {
             setSessionInfo({ sessionId, ...(config || {}) });
             setFinalResult(null);
             setPhase('PENDING');
+            setSuddenDeathState(null);
             if (lobbyRef.current?.code) {
                 beginSessionPreload({
                     sessionId,
@@ -1155,6 +1167,14 @@ export default function App() {
             setSamplePlaybackSource(null);
             setSolutionVideoAutoplayBlocked(false);
             sampleResolvedStartSecRef.current = null;
+            if (payload?.isSuddenDeath) {
+                setSuddenDeathState((prev) => ({
+                    roundIndex: Number.parseInt(payload?.index, 10) || prev?.roundIndex || null,
+                    tiedUserIds: Array.isArray(prev?.tiedUserIds) ? prev.tiedUserIds : []
+                }));
+            } else {
+                setSuddenDeathState(null);
+            }
             preloadRollingWindow(payload?.index);
         };
         const onAnswersReveal = (payload) => {
@@ -1180,6 +1200,28 @@ export default function App() {
             setMediaError('');
             setSolutionMediaError('');
             setFinalResult(payload || null);
+            setSuddenDeathState(null);
+        };
+        const onSuddenDeath = (payload) => {
+            const tiedUserIds = Array.isArray(payload?.tiedUserIds)
+                ? payload.tiedUserIds.filter((value) => Number.isInteger(value))
+                : [];
+            const roundIndex = Number.parseInt(payload?.roundIndex, 10);
+            setSuddenDeathState({
+                roundIndex: Number.isInteger(roundIndex) ? roundIndex : null,
+                tiedUserIds
+            });
+
+            const tiedNames = tiedUserIds.map((userId) => {
+                const player = (lobbyRef.current?.players || []).find((item) => item.userId === userId);
+                return player?.displayName || null;
+            }).filter(Boolean);
+
+            if (tiedNames.length > 0) {
+                setInfo(`Sudden Death started: ${tiedNames.join(', ')} are tied for first.`);
+            } else {
+                setInfo('Sudden Death started: tie for first place.');
+            }
         };
         const onReadyState = (payload) => {
             setReadyUserIds(Array.isArray(payload?.readyUserIds) ? payload.readyUserIds : []);
@@ -1194,6 +1236,7 @@ export default function App() {
         socket.on('round:answers_reveal', onAnswersReveal);
         socket.on('round:solution', onSolution);
         socket.on('game:finished', onFinished);
+        socket.on('game:sudden_death', onSuddenDeath);
         socket.on('round:ready_state', onReadyState);
         socket.connect();
 
@@ -1207,6 +1250,7 @@ export default function App() {
             socket.off('round:answers_reveal', onAnswersReveal);
             socket.off('round:solution', onSolution);
             socket.off('game:finished', onFinished);
+            socket.off('game:sudden_death', onSuddenDeath);
             socket.off('round:ready_state', onReadyState);
             closeGameSocket();
         };
@@ -1286,29 +1330,34 @@ export default function App() {
 
     useEffect(() => {
         if (phase !== 'GUESSING') {
+            searchRequestSeqRef.current += 1;
             setSearchResults([]);
             setSearchError('');
             return;
         }
         const q = guessText.trim();
         if (q.length < 2) {
+            searchRequestSeqRef.current += 1;
             setSearchResults([]);
             setSearchError('');
             return;
         }
+        const requestSeq = ++searchRequestSeqRef.current;
         const timer = window.setTimeout(async () => {
             try {
                 const data = await apiFetch('/game/search', {
                     method: 'POST',
                     body: JSON.stringify({ query: q, limit: 8 })
                 });
+                if (searchRequestSeqRef.current !== requestSeq) return;
                 setSearchResults(Array.isArray(data.results) ? data.results : []);
                 setSearchError('');
             } catch (err) {
+                if (searchRequestSeqRef.current !== requestSeq) return;
                 setSearchResults([]);
                 setSearchError(toSearchErrorMessage(err?.message));
             }
-        }, 300);
+        }, 120);
         return () => window.clearTimeout(timer);
     }, [guessText, phase]);
 
@@ -1479,6 +1528,15 @@ export default function App() {
         if (phase === 'SOLUTION_REVEAL') return (solution?.scores || []).slice().sort(byScoreDesc);
         return [];
     }, [finalResult, phase, solution]);
+    const suddenDeathMessage = useMemo(() => {
+        if (!round?.isSuddenDeath || phase === 'FINISHED') return '';
+        const tiedUserIds = Array.isArray(suddenDeathState?.tiedUserIds) ? suddenDeathState.tiedUserIds : [];
+        const tiedNames = tiedUserIds.map((userId) => resolvePlayerName(userId)).filter(Boolean);
+        if (tiedNames.length > 0) {
+            return `Sudden Death: tie for first between ${tiedNames.join(', ')}.`;
+        }
+        return 'Sudden Death: tie for first place. Extra rounds continue until the tie is broken.';
+    }, [phase, resolvePlayerName, round?.isSuddenDeath, suddenDeathState?.tiedUserIds]);
 
     if (loading) return <section className="gmq-shell">Loading game...</section>;
 
@@ -1611,6 +1669,7 @@ export default function App() {
                     <article className="gmq-card gmq-card-round">
                         <h2>Round</h2>
                         <p className="gmq-round-phase">{phase} | {countdown}</p>
+                        {suddenDeathMessage ? <div className="gmq-alert gmq-alert-warning">{suddenDeathMessage}</div> : null}
                         {phase === 'PENDING' && preloadBlocking ? (
                             <div className="gmq-stack">
                                 <p>Preparing media cache before round 1...</p>

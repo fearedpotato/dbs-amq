@@ -5,7 +5,7 @@ const { decryptToken } = require('../lib/tokenCipher');
 const { httpError } = require('./errors');
 const { POPULAR_CATALOG } = require('./catalog');
 
-const WATCHED_STATUSES = new Set(['watching', 'completed', 'on_hold', 'dropped']);
+const WATCHED_STATUSES = new Set(['watching', 'completed']);
 const DEFAULT_MAL_API_BASE_URL = 'https://api.myanimelist.net/v2';
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 20;

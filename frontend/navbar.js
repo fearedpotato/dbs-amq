@@ -207,8 +207,13 @@ async function saveNickname() {
 async function connectMAL() {
     try {
         const data = await apiFetch('/mal/login', { method: 'POST' });
-        if (!data?.url) throw new Error('Could not start MAL connection');
-        window.location.href = data.url;
+        let targetUrl = data?.browserUrl || data?.url;
+        if (typeof targetUrl === 'string' && targetUrl.includes('myanimelist.net/v1/oauth2/authorize?')) {
+            const from = encodeURIComponent(targetUrl.replace('https://myanimelist.net', ''));
+            targetUrl = `https://myanimelist.net/login.php?from=${from}`;
+        }
+        if (!targetUrl) throw new Error('Could not start MAL connection');
+        window.location.href = targetUrl;
     } catch (err) {
         alert(err.message);
     }
