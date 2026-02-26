@@ -62,6 +62,73 @@ function byScoreDesc(a, b) {
     return (b.score || 0) - (a.score || 0);
 }
 
+function normalizeErrorMessage(message) {
+    return String(message || '').trim();
+}
+
+function toStartErrorMessage(message) {
+    const raw = normalizeErrorMessage(message).toLowerCase();
+    if (!raw) return 'Could not start the game right now. Please try again.';
+    if (raw.includes('only host')) return 'Only the host can start the game.';
+    if (raw.includes('not enough players')) return 'Not enough players to start. Invite more players or lower the minimum players setting.';
+    if (raw.includes('balanced strict')) return 'Balanced strict could not build fair rounds from MAL lists. Try BALANCED_RELAXED or HYBRID.';
+    if (raw.includes('mal_only')) return 'MAL_ONLY could not build enough rounds from linked MAL lists. Try HYBRID or POPULAR.';
+    if (raw.includes('playable round media') || raw.includes('round seeds') || raw.includes('media provider')) {
+        return 'Could not prepare enough playable songs for this match. Try fewer rounds or different source/theme settings.';
+    }
+    if (raw.includes('timed out')) return 'Game start timed out. Please try again.';
+    return normalizeErrorMessage(message);
+}
+
+function toSearchErrorMessage(message) {
+    const raw = normalizeErrorMessage(message).toLowerCase();
+    if (!raw) return 'Search is temporarily unavailable. You can still submit a typed guess.';
+    if (raw.includes('at least 2 characters')) return 'Type at least 2 characters to search.';
+    if (raw.includes('too many') || raw.includes('rate')) return 'Search is rate-limited right now. Wait a few seconds and try again.';
+    if (raw.includes('timed out')) return 'Search timed out. Please try again.';
+    return 'Search is temporarily unavailable. You can still submit a typed guess.';
+}
+
+function toMediaErrorMessage(reason) {
+    if (reason === 'autoplay_blocked') {
+        return 'Autoplay was blocked or the sample failed to auto-start. Press Play sample.';
+    }
+    if (reason === 'source_unavailable') {
+        return 'This sample source failed to load for your browser.';
+    }
+    return 'Could not play sample audio for this round.';
+}
+
+function classifyPlaybackError(err) {
+    const name = String(err?.name || '');
+    const message = normalizeErrorMessage(err?.message).toLowerCase();
+
+    if (
+        name === 'NotAllowedError' ||
+        message.includes('notallowederror') ||
+        message.includes('user gesture') ||
+        message.includes('permission') ||
+        message.includes('autoplay')
+    ) {
+        return 'autoplay_blocked';
+    }
+
+    if (name === 'AbortError') {
+        return 'aborted';
+    }
+
+    if (
+        name === 'NotSupportedError' ||
+        message.includes('failed to load') ||
+        message.includes('no supported source') ||
+        message.includes('not supported')
+    ) {
+        return 'source_unavailable';
+    }
+
+    return 'play_failed';
+}
+
 export default function App() {
     const token = getAuthToken();
     const socketRef = useRef(null);
@@ -111,6 +178,9 @@ export default function App() {
     const [samplePlaybackSource, setSamplePlaybackSource] = useState(null);
     const [solutionVideoAutoplayBlocked, setSolutionVideoAutoplayBlocked] = useState(false);
     const [sampleVolume, setSampleVolume] = useState(0.8);
+    const [searchError, setSearchError] = useState('');
+    const [mediaError, setMediaError] = useState('');
+    const [solutionMediaError, setSolutionMediaError] = useState('');
 
     useEffect(() => {
         lobbyRef.current = lobby;
@@ -242,9 +312,18 @@ export default function App() {
         try {
             await video.play();
             setSolutionVideoAutoplayBlocked(false);
+            setSolutionMediaError('');
             return true;
-        } catch (_err) {
-            setSolutionVideoAutoplayBlocked(true);
+        } catch (err) {
+            const reason = classifyPlaybackError(err);
+            if (reason === 'autoplay_blocked') {
+                setSolutionVideoAutoplayBlocked(true);
+                return false;
+            }
+            if (reason !== 'aborted') {
+                setSolutionMediaError('Could not play solution video in this browser. Use "Open video source".');
+            }
+            setSolutionVideoAutoplayBlocked(false);
             return false;
         }
     }, []);
@@ -257,12 +336,13 @@ export default function App() {
 
         clearSampleStopTimer();
         stopSamplePlayback();
+        setMediaError('');
 
         const durationSec = Number.isFinite(sample.sampleDurationSec) ? Math.max(1, sample.sampleDurationSec) : 10;
         const resolvedVolume = Math.max(0, Math.min(1, Number(sampleVolumeRef.current)));
 
         const attemptPlay = async (mediaEl, sourceName) => {
-            if (!mediaEl) return false;
+            if (!mediaEl) return { ok: false, reason: 'source_unavailable' };
             mediaEl.volume = resolvedVolume;
             mediaEl.muted = false;
 
@@ -278,6 +358,7 @@ export default function App() {
                 sampleActiveMediaRef.current = mediaEl;
                 setSamplePlaybackSource(sourceName);
                 setSampleAutoplayBlocked(false);
+                setMediaError('');
                 setSamplePlaying(true);
                 sampleStopTimerRef.current = window.setTimeout(() => {
                     const active = sampleActiveMediaRef.current;
@@ -286,21 +367,38 @@ export default function App() {
                     setSamplePlaying(false);
                     sampleActiveMediaRef.current = null;
                 }, durationSec * 1000);
-                return true;
-            } catch (_err) {
-                return false;
+                return { ok: true, reason: null };
+            } catch (err) {
+                return { ok: false, reason: classifyPlaybackError(err) };
             }
         };
 
-        const playedFromAudio = sample?.audioUrl ? await attemptPlay(audio, 'audio') : false;
-        if (playedFromAudio) return true;
+        const audioResult = sample?.audioUrl
+            ? await attemptPlay(audio, 'audio')
+            : { ok: false, reason: 'source_unavailable' };
+        if (audioResult.ok) return true;
 
-        const playedFromVideo = sample?.videoUrl ? await attemptPlay(video, 'video') : false;
-        if (playedFromVideo) return true;
+        const videoResult = sample?.videoUrl
+            ? await attemptPlay(video, 'video')
+            : { ok: false, reason: 'source_unavailable' };
+        if (videoResult.ok) return true;
 
-        if (isAutoplay) {
+        const reasons = [audioResult.reason, videoResult.reason].filter(Boolean);
+        if (reasons.includes('autoplay_blocked')) {
             setSampleAutoplayBlocked(true);
+            setMediaError(toMediaErrorMessage('autoplay_blocked'));
+            return false;
         }
+
+        setSampleAutoplayBlocked(false);
+        if (reasons.includes('source_unavailable')) {
+            setMediaError(toMediaErrorMessage('source_unavailable'));
+            return false;
+        }
+        if (!reasons.includes('aborted') || !isAutoplay) {
+            setMediaError(toMediaErrorMessage('play_failed'));
+        }
+
         return false;
     }, [clearSampleStopTimer, phase, resolveSampleStartSec, round, stopSamplePlayback]);
 
@@ -318,6 +416,9 @@ export default function App() {
         setGuessText('');
         setGuessAnimeId(null);
         setSearchResults([]);
+        setSearchError('');
+        setMediaError('');
+        setSolutionMediaError('');
         setSampleAutoplayBlocked(false);
         setSamplePlaybackSource(null);
         setSolutionVideoAutoplayBlocked(false);
@@ -467,7 +568,7 @@ export default function App() {
         try {
             await emitWithAck(socketRef.current, 'game:start', { lobbyCode: lobby.code }, { timeoutMs: 120_000 });
         } catch (err) {
-            setError(err.message);
+            setError(toStartErrorMessage(err.message));
         } finally {
             setBusy('');
         }
@@ -556,7 +657,15 @@ export default function App() {
         };
 
         const onDisconnect = () => setSocketConnected(false);
-        const onSocketError = (payload) => setError(payload?.message || 'Realtime error');
+        const onSocketError = (payload) => {
+            const code = String(payload?.code || '');
+            const message = normalizeErrorMessage(payload?.message);
+            if (code === 'game_start_failed') {
+                setError(toStartErrorMessage(message));
+                return;
+            }
+            setError(message || 'Realtime error');
+        };
         const onLobbyState = ({ lobby: nextLobby }) => nextLobby && setLobby(nextLobby);
         const onGameStarted = ({ sessionId, config }) => {
             setSessionInfo({ sessionId, ...(config || {}) });
@@ -579,6 +688,9 @@ export default function App() {
             setGuessText('');
             setGuessAnimeId(null);
             setSearchResults([]);
+            setSearchError('');
+            setMediaError('');
+            setSolutionMediaError('');
             setSampleAutoplayBlocked(false);
             setSamplePlaybackSource(null);
             setSolutionVideoAutoplayBlocked(false);
@@ -594,6 +706,8 @@ export default function App() {
             setPhase('SOLUTION_REVEAL');
             setPhaseEndsAt(payload?.endsAt || null);
             setSolution(payload || null);
+            setMediaError('');
+            setSolutionMediaError('');
             setSolutionVideoAutoplayBlocked(false);
         };
         const onFinished = (payload) => {
@@ -601,6 +715,8 @@ export default function App() {
             stopSolutionVideoPlayback();
             setPhase('FINISHED');
             setPhaseEndsAt(null);
+            setMediaError('');
+            setSolutionMediaError('');
             setFinalResult(payload || null);
         };
         const onReadyState = (payload) => {
@@ -677,9 +793,17 @@ export default function App() {
     }, [phaseEndsAt]);
 
     useEffect(() => {
-        if (phase !== 'GUESSING') return setSearchResults([]);
+        if (phase !== 'GUESSING') {
+            setSearchResults([]);
+            setSearchError('');
+            return;
+        }
         const q = guessText.trim();
-        if (q.length < 2) return setSearchResults([]);
+        if (q.length < 2) {
+            setSearchResults([]);
+            setSearchError('');
+            return;
+        }
         const timer = window.setTimeout(async () => {
             try {
                 const data = await apiFetch('/game/search', {
@@ -687,8 +811,10 @@ export default function App() {
                     body: JSON.stringify({ query: q, limit: 8 })
                 });
                 setSearchResults(Array.isArray(data.results) ? data.results : []);
-            } catch (_err) {
+                setSearchError('');
+            } catch (err) {
                 setSearchResults([]);
+                setSearchError(toSearchErrorMessage(err?.message));
             }
         }, 300);
         return () => window.clearTimeout(timer);
@@ -727,8 +853,25 @@ export default function App() {
     }, [round?.roundId]);
 
     useEffect(() => {
+        if (!sampleAutoplayBlocked || phase !== 'GUESSING') return;
+
+        const retry = () => {
+            playSample({ isAutoplay: false }).catch(() => {});
+        };
+
+        window.addEventListener('pointerdown', retry);
+        window.addEventListener('keydown', retry);
+
+        return () => {
+            window.removeEventListener('pointerdown', retry);
+            window.removeEventListener('keydown', retry);
+        };
+    }, [phase, playSample, sampleAutoplayBlocked]);
+
+    useEffect(() => {
         if (phase !== 'SOLUTION_REVEAL' || !solution?.video) {
             setSolutionVideoAutoplayBlocked(false);
+            setSolutionMediaError('');
             stopSolutionVideoPlayback();
             return;
         }
@@ -745,6 +888,22 @@ export default function App() {
             stopSolutionVideoPlayback();
         };
     }, [phase, playSolutionVideo, solution?.video, stopSolutionVideoPlayback]);
+
+    useEffect(() => {
+        if (!solutionVideoAutoplayBlocked || phase !== 'SOLUTION_REVEAL') return;
+
+        const retry = () => {
+            playSolutionVideo().catch(() => {});
+        };
+
+        window.addEventListener('pointerdown', retry);
+        window.addEventListener('keydown', retry);
+
+        return () => {
+            window.removeEventListener('pointerdown', retry);
+            window.removeEventListener('keydown', retry);
+        };
+    }, [phase, playSolutionVideo, solutionVideoAutoplayBlocked]);
 
     useEffect(() => {
         const resolvedVolume = Math.max(0, Math.min(1, Number(sampleVolume)));
@@ -883,6 +1042,7 @@ export default function App() {
                                         onPlay={() => setSamplePlaying(true)}
                                         onPause={() => setSamplePlaying(false)}
                                         onEnded={() => setSamplePlaying(false)}
+                                        onError={() => setMediaError(toMediaErrorMessage('source_unavailable'))}
                                     />
                                 ) : null}
                                 {round?.sample?.videoUrl ? (
@@ -895,6 +1055,7 @@ export default function App() {
                                         onPlay={() => setSamplePlaying(true)}
                                         onPause={() => setSamplePlaying(false)}
                                         onEnded={() => setSamplePlaying(false)}
+                                        onError={() => setMediaError(toMediaErrorMessage('source_unavailable'))}
                                     />
                                 ) : null}
                                 <label className="gmq-volume-row">
@@ -909,7 +1070,12 @@ export default function App() {
                                     />
                                 </label>
                                 {sampleAutoplayBlocked ? (
-                                    <p className="gmq-muted">Autoplay was blocked by your browser.</p>
+                                    <div className="gmq-stack">
+                                        <p className="gmq-muted">Autoplay was blocked by your browser.</p>
+                                        <button type="button" className="gmq-btn gmq-btn-secondary" onClick={() => playSample({ isAutoplay: false }).catch(() => {})}>
+                                            Play sample
+                                        </button>
+                                    </div>
                                 ) : (samplePlaybackSource === 'video' && !round?.sample?.audioUrl) ? (
                                     <p className="gmq-muted">Using video source audio. {sampleDurationLabel}</p>
                                 ) : samplePlaying ? (
@@ -917,6 +1083,7 @@ export default function App() {
                                 ) : (
                                     <p className="gmq-muted">{sampleDurationLabel}</p>
                                 )}
+                                {mediaError ? <p className="gmq-muted gmq-muted-warning">{mediaError}</p> : null}
                             </div>
                         ) : null}
 
@@ -936,6 +1103,7 @@ export default function App() {
                                         </li>
                                     ))}
                                 </ul>
+                                {searchError ? <p className="gmq-muted gmq-muted-warning">{searchError}</p> : null}
                                 <div className="gmq-actions">
                                     <button type="button" className="gmq-btn gmq-btn-primary" onClick={submitGuess} disabled={busy === 'guess'}>Submit Guess</button>
                                     <button type="button" className="gmq-btn gmq-btn-secondary" onClick={toggleReady} disabled={busy === 'ready'}>
@@ -976,6 +1144,7 @@ export default function App() {
                                             preload="auto"
                                             controls
                                             playsInline
+                                            onError={() => setSolutionMediaError('Could not play solution video in this browser. Use "Open video source".')}
                                         />
                                         {solutionVideoAutoplayBlocked ? (
                                             <div className="gmq-stack">
@@ -985,6 +1154,7 @@ export default function App() {
                                                 </button>
                                             </div>
                                         ) : null}
+                                        {solutionMediaError ? <p className="gmq-muted gmq-muted-warning">{solutionMediaError}</p> : null}
                                         <a href={solution.video} target="_blank" rel="noreferrer">Open video source</a>
                                     </div>
                                 ) : (
