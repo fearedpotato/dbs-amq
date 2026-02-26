@@ -69,6 +69,13 @@ export default function App() {
     const inviteTokenRef = useRef('');
     const pendingJoinRef = useRef(null);
     const autoJoinDoneRef = useRef(false);
+    const sampleAudioRef = useRef(null);
+    const sampleVideoRef = useRef(null);
+    const solutionVideoRef = useRef(null);
+    const sampleActiveMediaRef = useRef(null);
+    const sampleStopTimerRef = useRef(null);
+    const sampleVolumeRef = useRef(0.8);
+    const sampleResolvedStartSecRef = useRef(null);
 
     const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState('');
@@ -99,6 +106,11 @@ export default function App() {
     const [guessText, setGuessText] = useState('');
     const [guessAnimeId, setGuessAnimeId] = useState(null);
     const [searchResults, setSearchResults] = useState([]);
+    const [sampleAutoplayBlocked, setSampleAutoplayBlocked] = useState(false);
+    const [samplePlaying, setSamplePlaying] = useState(false);
+    const [samplePlaybackSource, setSamplePlaybackSource] = useState(null);
+    const [solutionVideoAutoplayBlocked, setSolutionVideoAutoplayBlocked] = useState(false);
+    const [sampleVolume, setSampleVolume] = useState(0.8);
 
     useEffect(() => {
         lobbyRef.current = lobby;
@@ -107,6 +119,10 @@ export default function App() {
     useEffect(() => {
         inviteTokenRef.current = inviteToken;
     }, [inviteToken]);
+
+    useEffect(() => {
+        sampleVolumeRef.current = sampleVolume;
+    }, [sampleVolume]);
 
     const playerNameById = useMemo(() => {
         const map = new Map();
@@ -118,7 +134,179 @@ export default function App() {
 
     const resolvePlayerName = useCallback((userId) => playerNameById.get(userId) || `User ${userId}`, [playerNameById]);
 
+    const clearSampleStopTimer = useCallback(() => {
+        if (!sampleStopTimerRef.current) return;
+        window.clearTimeout(sampleStopTimerRef.current);
+        sampleStopTimerRef.current = null;
+    }, []);
+
+    const stopSamplePlayback = useCallback(() => {
+        clearSampleStopTimer();
+        if (sampleAudioRef.current) sampleAudioRef.current.pause();
+        if (sampleVideoRef.current) sampleVideoRef.current.pause();
+        sampleActiveMediaRef.current = null;
+        setSamplePlaying(false);
+    }, [clearSampleStopTimer]);
+
+    const stopSolutionVideoPlayback = useCallback(() => {
+        const video = solutionVideoRef.current;
+        if (!video) return;
+        video.pause();
+        try {
+            video.currentTime = 0;
+        } catch (_err) {
+            // Ignore seek failures for not-yet-ready media.
+        }
+    }, []);
+
+    const seededUnitInterval = useCallback((seedInput) => {
+        const seed = String(seedInput || '0');
+        let hash = 2166136261;
+        for (let i = 0; i < seed.length; i += 1) {
+            hash ^= seed.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+        return (hash >>> 0) / 4294967295;
+    }, []);
+
+    const waitForMediaDurationSec = useCallback(async (mediaEl) => {
+        if (!mediaEl) return null;
+
+        const current = Number(mediaEl.duration);
+        if (Number.isFinite(current) && current > 0) return current;
+
+        await new Promise((resolve) => {
+            let done = false;
+            const finish = () => {
+                if (done) return;
+                done = true;
+                cleanup();
+                resolve();
+            };
+            const cleanup = () => {
+                mediaEl.removeEventListener('loadedmetadata', finish);
+                mediaEl.removeEventListener('durationchange', finish);
+                mediaEl.removeEventListener('loadeddata', finish);
+                mediaEl.removeEventListener('error', finish);
+            };
+
+            mediaEl.addEventListener('loadedmetadata', finish);
+            mediaEl.addEventListener('durationchange', finish);
+            mediaEl.addEventListener('loadeddata', finish);
+            mediaEl.addEventListener('error', finish);
+            window.setTimeout(finish, 2000);
+        });
+
+        const next = Number(mediaEl.duration);
+        return Number.isFinite(next) && next > 0 ? next : null;
+    }, []);
+
+    const resolveSampleStartSec = useCallback(async (mediaEl, sample) => {
+        const cached = sampleResolvedStartSecRef.current;
+        if (Number.isFinite(cached) && cached >= 0) return cached;
+
+        const configuredStart = Number.isFinite(sample?.sampleStartSec)
+            ? Math.max(0, sample.sampleStartSec)
+            : 0;
+
+        if (configuredStart > 0) {
+            sampleResolvedStartSecRef.current = configuredStart;
+            return configuredStart;
+        }
+
+        const sampleDurationSec = Number.isFinite(sample?.sampleDurationSec) ? Math.max(1, sample.sampleDurationSec) : 10;
+        const mediaDurationSec = await waitForMediaDurationSec(mediaEl);
+        if (!Number.isFinite(mediaDurationSec) || mediaDurationSec <= 0) {
+            sampleResolvedStartSecRef.current = configuredStart;
+            return configuredStart;
+        }
+
+        const maxStart = Math.floor(mediaDurationSec - sampleDurationSec);
+        if (maxStart <= 0) {
+            sampleResolvedStartSecRef.current = 0;
+            return 0;
+        }
+
+        const seed = `${round?.roundId || 0}:${sample?.animeId || 0}:${sampleDurationSec}`;
+        const randomUnit = seededUnitInterval(seed);
+        const randomStartSec = Math.floor(randomUnit * (maxStart + 1));
+        sampleResolvedStartSecRef.current = randomStartSec;
+        return randomStartSec;
+    }, [round?.roundId, seededUnitInterval, waitForMediaDurationSec]);
+
+    const playSolutionVideo = useCallback(async () => {
+        const video = solutionVideoRef.current;
+        if (!video) return false;
+        video.volume = Math.max(0, Math.min(1, Number(sampleVolumeRef.current)));
+        video.muted = false;
+        try {
+            await video.play();
+            setSolutionVideoAutoplayBlocked(false);
+            return true;
+        } catch (_err) {
+            setSolutionVideoAutoplayBlocked(true);
+            return false;
+        }
+    }, []);
+
+    const playSample = useCallback(async ({ isAutoplay = false } = {}) => {
+        const audio = sampleAudioRef.current;
+        const video = sampleVideoRef.current;
+        const sample = round?.sample;
+        if (phase !== 'GUESSING' || (!audio && !video) || (!sample?.audioUrl && !sample?.videoUrl)) return false;
+
+        clearSampleStopTimer();
+        stopSamplePlayback();
+
+        const durationSec = Number.isFinite(sample.sampleDurationSec) ? Math.max(1, sample.sampleDurationSec) : 10;
+        const resolvedVolume = Math.max(0, Math.min(1, Number(sampleVolumeRef.current)));
+
+        const attemptPlay = async (mediaEl, sourceName) => {
+            if (!mediaEl) return false;
+            mediaEl.volume = resolvedVolume;
+            mediaEl.muted = false;
+
+            const startSec = await resolveSampleStartSec(mediaEl, sample);
+            try {
+                mediaEl.currentTime = startSec;
+            } catch (_err) {
+                // Ignore currentTime set failures when metadata is not yet ready.
+            }
+
+            try {
+                await mediaEl.play();
+                sampleActiveMediaRef.current = mediaEl;
+                setSamplePlaybackSource(sourceName);
+                setSampleAutoplayBlocked(false);
+                setSamplePlaying(true);
+                sampleStopTimerRef.current = window.setTimeout(() => {
+                    const active = sampleActiveMediaRef.current;
+                    if (!active) return;
+                    active.pause();
+                    setSamplePlaying(false);
+                    sampleActiveMediaRef.current = null;
+                }, durationSec * 1000);
+                return true;
+            } catch (_err) {
+                return false;
+            }
+        };
+
+        const playedFromAudio = sample?.audioUrl ? await attemptPlay(audio, 'audio') : false;
+        if (playedFromAudio) return true;
+
+        const playedFromVideo = sample?.videoUrl ? await attemptPlay(video, 'video') : false;
+        if (playedFromVideo) return true;
+
+        if (isAutoplay) {
+            setSampleAutoplayBlocked(true);
+        }
+        return false;
+    }, [clearSampleStopTimer, phase, resolveSampleStartSec, round, stopSamplePlayback]);
+
     const clearRoundState = useCallback(() => {
+        stopSamplePlayback();
+        stopSolutionVideoPlayback();
         setSessionInfo(null);
         setPhase('WAITING');
         setPhaseEndsAt(null);
@@ -130,7 +318,10 @@ export default function App() {
         setGuessText('');
         setGuessAnimeId(null);
         setSearchResults([]);
-    }, []);
+        setSampleAutoplayBlocked(false);
+        setSamplePlaybackSource(null);
+        setSolutionVideoAutoplayBlocked(false);
+    }, [stopSamplePlayback, stopSolutionVideoPlayback]);
 
     const applySyncState = useCallback((syncState) => {
         const state = syncState || {};
@@ -376,6 +567,8 @@ export default function App() {
             }
         };
         const onRoundStarted = (payload) => {
+            stopSamplePlayback();
+            stopSolutionVideoPlayback();
             setPhase('GUESSING');
             setPhaseEndsAt(payload?.endsAt || null);
             setRound(payload || null);
@@ -386,6 +579,10 @@ export default function App() {
             setGuessText('');
             setGuessAnimeId(null);
             setSearchResults([]);
+            setSampleAutoplayBlocked(false);
+            setSamplePlaybackSource(null);
+            setSolutionVideoAutoplayBlocked(false);
+            sampleResolvedStartSecRef.current = null;
         };
         const onAnswersReveal = (payload) => {
             setPhase('ANSWERS_REVEAL');
@@ -393,11 +590,15 @@ export default function App() {
             setAnswers(Array.isArray(payload?.answers) ? payload.answers : []);
         };
         const onSolution = (payload) => {
+            stopSamplePlayback();
             setPhase('SOLUTION_REVEAL');
             setPhaseEndsAt(payload?.endsAt || null);
             setSolution(payload || null);
+            setSolutionVideoAutoplayBlocked(false);
         };
         const onFinished = (payload) => {
+            stopSamplePlayback();
+            stopSolutionVideoPlayback();
             setPhase('FINISHED');
             setPhaseEndsAt(null);
             setFinalResult(payload || null);
@@ -431,7 +632,7 @@ export default function App() {
             socket.off('round:ready_state', onReadyState);
             closeGameSocket();
         };
-    }, [requestRoundSync, token]);
+    }, [requestRoundSync, stopSamplePlayback, stopSolutionVideoPlayback, token]);
 
     useEffect(() => {
         if (!token) return;
@@ -493,8 +694,80 @@ export default function App() {
         return () => window.clearTimeout(timer);
     }, [guessText, phase]);
 
+    useEffect(() => {
+        const hasSampleMedia = Boolean(round?.sample?.audioUrl || round?.sample?.videoUrl);
+        if (!hasSampleMedia) {
+            setSampleAutoplayBlocked(false);
+            stopSamplePlayback();
+            return;
+        }
+
+        if (phase !== 'GUESSING') {
+            if (phase === 'SOLUTION_REVEAL' || phase === 'WAITING' || phase === 'FINISHED' || phase === 'PENDING') {
+                setSampleAutoplayBlocked(false);
+                stopSamplePlayback();
+            }
+            return;
+        }
+
+        let cancelled = false;
+        const timer = window.setTimeout(() => {
+            if (cancelled) return;
+            playSample({ isAutoplay: true }).catch(() => {});
+        }, 0);
+
+        return () => {
+            cancelled = true;
+            window.clearTimeout(timer);
+        };
+    }, [phase, playSample, round?.roundId, round?.sample?.audioUrl, round?.sample?.videoUrl, stopSamplePlayback]);
+
+    useEffect(() => {
+        sampleResolvedStartSecRef.current = null;
+    }, [round?.roundId]);
+
+    useEffect(() => {
+        if (phase !== 'SOLUTION_REVEAL' || !solution?.video) {
+            setSolutionVideoAutoplayBlocked(false);
+            stopSolutionVideoPlayback();
+            return;
+        }
+
+        let cancelled = false;
+        const timer = window.setTimeout(() => {
+            if (cancelled) return;
+            playSolutionVideo().catch(() => {});
+        }, 0);
+
+        return () => {
+            cancelled = true;
+            window.clearTimeout(timer);
+            stopSolutionVideoPlayback();
+        };
+    }, [phase, playSolutionVideo, solution?.video, stopSolutionVideoPlayback]);
+
+    useEffect(() => {
+        const resolvedVolume = Math.max(0, Math.min(1, Number(sampleVolume)));
+        if (sampleAudioRef.current) sampleAudioRef.current.volume = resolvedVolume;
+        if (sampleVideoRef.current) sampleVideoRef.current.volume = resolvedVolume;
+        if (solutionVideoRef.current) solutionVideoRef.current.volume = resolvedVolume;
+    }, [sampleVolume, round?.roundId, solution?.video]);
+
     const isHost = useMemo(() => Boolean(lobby && user && lobby.host?.id === user.id), [lobby, user]);
     const myReady = useMemo(() => Boolean(user && readyUserIds.includes(user.id)), [readyUserIds, user]);
+    const hasSampleMedia = useMemo(() => Boolean(round?.sample?.audioUrl || round?.sample?.videoUrl), [round]);
+    const showSamplePlayer = useMemo(() => Boolean(round && hasSampleMedia && (phase === 'GUESSING' || phase === 'ANSWERS_REVEAL')), [hasSampleMedia, phase, round]);
+    const sampleDurationLabel = useMemo(() => {
+        const seconds = Number.parseInt(round?.sample?.sampleDurationSec, 10);
+        if (!Number.isFinite(seconds) || seconds <= 0) return 'Sample ready';
+        return `${seconds}s preview`;
+    }, [round]);
+    const sampleVolumePercent = useMemo(() => `${Math.round(sampleVolume * 100)}%`, [sampleVolume]);
+
+    const onSampleVolumeChange = useCallback((event) => {
+        const next = Math.max(0, Math.min(1, Number.parseFloat(event.target.value)));
+        setSampleVolume(Number.isFinite(next) ? next : 0.8);
+    }, []);
     const displayedScores = useMemo(() => {
         if (phase === 'FINISHED') return (finalResult?.finalScores || []).slice().sort(byScoreDesc);
         if (phase === 'SOLUTION_REVEAL') return (solution?.scores || []).slice().sort(byScoreDesc);
@@ -599,9 +872,60 @@ export default function App() {
                         <h2>Round</h2>
                         <p className="gmq-round-phase">{phase} | {countdown}</p>
 
+                        {showSamplePlayer ? (
+                            <div className="gmq-sample-player">
+                                {round?.sample?.audioUrl ? (
+                                    <audio
+                                        key={`audio-${round.roundId}`}
+                                        ref={sampleAudioRef}
+                                        src={round.sample.audioUrl}
+                                        preload="auto"
+                                        onPlay={() => setSamplePlaying(true)}
+                                        onPause={() => setSamplePlaying(false)}
+                                        onEnded={() => setSamplePlaying(false)}
+                                    />
+                                ) : null}
+                                {round?.sample?.videoUrl ? (
+                                    <video
+                                        key={`video-${round.roundId}`}
+                                        ref={sampleVideoRef}
+                                        src={round.sample.videoUrl}
+                                        preload="auto"
+                                        playsInline
+                                        onPlay={() => setSamplePlaying(true)}
+                                        onPause={() => setSamplePlaying(false)}
+                                        onEnded={() => setSamplePlaying(false)}
+                                    />
+                                ) : null}
+                                <label className="gmq-volume-row">
+                                    <span>Volume {sampleVolumePercent}</span>
+                                    <input
+                                        type="range"
+                                        min="0"
+                                        max="1"
+                                        step="0.01"
+                                        value={sampleVolume}
+                                        onChange={onSampleVolumeChange}
+                                    />
+                                </label>
+                                {sampleAutoplayBlocked ? (
+                                    <p className="gmq-muted">Autoplay was blocked by your browser.</p>
+                                ) : (samplePlaybackSource === 'video' && !round?.sample?.audioUrl) ? (
+                                    <p className="gmq-muted">Using video source audio. {sampleDurationLabel}</p>
+                                ) : samplePlaying ? (
+                                    <p className="gmq-muted">Sample is playing. {sampleDurationLabel}</p>
+                                ) : (
+                                    <p className="gmq-muted">{sampleDurationLabel}</p>
+                                )}
+                            </div>
+                        ) : null}
+
                         {phase === 'GUESSING' && round ? (
                             <div className="gmq-stack">
                                 <p>Round {round.index}/{round.totalRounds}</p>
+                                {!hasSampleMedia ? (
+                                    <p className="gmq-muted">Sample audio is unavailable for this round.</p>
+                                ) : null}
                                 <input value={guessText} onChange={(e) => { setGuessText(e.target.value); setGuessAnimeId(null); }} placeholder="Type anime name"/>
                                 <ul className="gmq-search-results">
                                     {searchResults.map((item) => (
@@ -642,7 +966,30 @@ export default function App() {
                                 <h3>Solution</h3>
                                 <p>{solution.correctAnime?.animeTitle} ({solution.correctAnime?.themeType})</p>
                                 <p className="gmq-muted">{solution.correctAnime?.themeTitle || ''}</p>
-                                {solution.video ? <a href={solution.video} target="_blank" rel="noreferrer">Open video source</a> : null}
+                                {solution.video ? (
+                                    <div className="gmq-solution-video-wrap">
+                                        <video
+                                            key={`solution-${round?.roundId || solution.correctAnime?.animeId || 'video'}`}
+                                            ref={solutionVideoRef}
+                                            className="gmq-solution-video"
+                                            src={solution.video}
+                                            preload="auto"
+                                            controls
+                                            playsInline
+                                        />
+                                        {solutionVideoAutoplayBlocked ? (
+                                            <div className="gmq-stack">
+                                                <p className="gmq-muted">Autoplay was blocked by your browser.</p>
+                                                <button type="button" className="gmq-btn gmq-btn-secondary" onClick={() => playSolutionVideo().catch(() => {})}>
+                                                    Play solution video
+                                                </button>
+                                            </div>
+                                        ) : null}
+                                        <a href={solution.video} target="_blank" rel="noreferrer">Open video source</a>
+                                    </div>
+                                ) : (
+                                    <p className="gmq-muted">Solution video is unavailable for this round.</p>
+                                )}
                             </div>
                         ) : null}
 

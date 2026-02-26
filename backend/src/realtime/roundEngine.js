@@ -59,7 +59,9 @@ function createRoundEngine(io) {
                 animeId: state.currentRound.animeId,
                 sampleStartSec: state.currentRound.sampleStartSec,
                 sampleDurationSec: state.currentRound.sampleDurationSec,
-                themeType: state.currentRound.themeType
+                themeType: state.currentRound.themeType,
+                audioUrl: state.currentRound.solutionAudioUrl || null,
+                videoUrl: state.currentRound.solutionVideoUrl || null
             }
         });
 
@@ -310,7 +312,9 @@ function createRoundEngine(io) {
                 animeId: context.animeId,
                 sampleStartSec: context.sampleStartSec,
                 sampleDurationSec: context.sampleDurationSec,
-                themeType: context.themeType
+                themeType: context.themeType,
+                audioUrl: context.solutionAudioUrl || null,
+                videoUrl: context.solutionVideoUrl || null
             }
         };
 

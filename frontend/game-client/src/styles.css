@@ -42,6 +42,49 @@
     gap: 8px;
 }
 
+.gmq-sample-player {
+    display: grid;
+    gap: 8px;
+    border: 1px dashed #2f4f7f;
+    border-radius: 10px;
+    padding: 10px;
+    background: #0f1a2b;
+}
+
+.gmq-sample-player audio {
+    display: none;
+}
+
+.gmq-sample-player video {
+    display: none;
+}
+
+.gmq-volume-row {
+    display: grid;
+    gap: 6px;
+    color: #dce7ff;
+    font-size: 0.85rem;
+}
+
+.gmq-volume-row input[type="range"] {
+    width: 100%;
+    padding: 0;
+    accent-color: #5dd0ff;
+}
+
+.gmq-solution-video-wrap {
+    display: grid;
+    gap: 8px;
+}
+
+.gmq-solution-video {
+    width: 100%;
+    max-height: 360px;
+    border-radius: 10px;
+    border: 1px solid #2f4f7f;
+    background: #000;
+}
+
 .gmq-actions {
     display: flex;
     gap: 8px;

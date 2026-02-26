@@ -72,6 +72,7 @@ router.post('/lobbies', authMiddleware, async (req, res) => {
         assertEnum(themeMode, THEME_MODES, 'themeMode');
 
         const user = await getCurrentUserFromToken(req);
+        await lobbyService.enforceSingleLobbyMembership(user.id);
         const lobby = await lobbyService.createLobby(user, req.body);
         return res.status(201).json({ lobby });
     } catch (err) {
@@ -85,6 +86,7 @@ router.post('/lobbies/:code/join', authMiddleware, joinLobbyRateLimit, async (re
         if (!code) throw httpError(400, 'Lobby code is required');
 
         const user = await getCurrentUserFromToken(req);
+        await lobbyService.enforceSingleLobbyMembership(user.id, { exceptCode: code });
         const inviteToken = typeof req.body?.inviteToken === 'string'
             ? req.body.inviteToken
             : (typeof req.query?.inviteToken === 'string'

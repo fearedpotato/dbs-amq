@@ -40,6 +40,27 @@ function sanitizeTitle(value, fallback = null) {
     return title || fallback;
 }
 
+function parseDurationSeconds(...values) {
+    for (const value of values) {
+        const parsed = Number.parseFloat(value);
+        if (Number.isFinite(parsed) && parsed > 0) {
+            return parsed;
+        }
+    }
+    return null;
+}
+
+function pickSampleStartSec(totalDurationSec, sampleDurationSec) {
+    const total = Number.parseFloat(totalDurationSec);
+    const sample = Number.parseFloat(sampleDurationSec);
+    if (!Number.isFinite(total) || !Number.isFinite(sample)) return 0;
+
+    const maxStart = Math.floor(total - sample);
+    if (maxStart <= 0) return 0;
+
+    return Math.floor(Math.random() * (maxStart + 1));
+}
+
 function normalizeThemeType(rawType) {
     const value = String(rawType || '').toUpperCase();
     if (value.startsWith('OP')) return 'OP';
@@ -123,7 +144,7 @@ function writeCache(cacheKey, value, now = Date.now()) {
     pruneCache(now);
 }
 
-function normalizeCandidate({ animeId, animeTitle, themeType, themeTitle, videoUrl, audioUrl }) {
+function normalizeCandidate({ animeId, animeTitle, themeType, themeTitle, videoUrl, audioUrl, mediaDurationSec }) {
     if (!Number.isInteger(animeId) || animeId <= 0) return null;
     if (!videoUrl) return null;
     if (!themeType) return null;
@@ -133,6 +154,7 @@ function normalizeCandidate({ animeId, animeTitle, themeType, themeTitle, videoU
         animeTitle: sanitizeTitle(animeTitle, `Anime ${animeId}`),
         themeType,
         themeTitle: sanitizeTitle(themeTitle),
+        mediaDurationSec: Number.isFinite(mediaDurationSec) ? mediaDurationSec : null,
         solutionVideoUrl: String(videoUrl),
         solutionAudioUrl: audioUrl ? String(audioUrl) : null
     };
@@ -158,13 +180,24 @@ function extractThemeCandidates(animeEntry, malAnimeId, fallbackTitle) {
             for (const video of videos) {
                 const videoUrl = sanitizeTitle(video?.link, sanitizeTitle(video?.url));
                 const audioUrl = sanitizeTitle(video?.audio, sanitizeTitle(video?.audio_url));
+                const mediaDurationSec = parseDurationSeconds(
+                    video?.duration,
+                    video?.duration_seconds,
+                    video?.length,
+                    video?.runtime,
+                    entry?.duration,
+                    entry?.duration_seconds,
+                    theme?.duration,
+                    theme?.duration_seconds
+                );
                 const candidate = normalizeCandidate({
                     animeId: malAnimeId,
                     animeTitle,
                     themeType,
                     themeTitle,
                     videoUrl,
-                    audioUrl
+                    audioUrl,
+                    mediaDurationSec
                 });
                 if (candidate) candidates.push(candidate);
             }
@@ -284,13 +317,17 @@ async function resolveRoundMedia({ animeId, animeTitle, themeMode = 'MIXED', sam
 
     clearBlacklist(malAnimeId, themeMode);
 
+    const sampleDurationSec = Math.max(3, Number.parseInt(sampleSeconds, 10) || 10);
     return {
         animeId: selected.animeId,
         animeTitle: selected.animeTitle,
         themeType: selected.themeType,
         themeTitle: selected.themeTitle,
-        sampleStartSec: 0,
-        sampleDurationSec: Math.max(3, Number.parseInt(sampleSeconds, 10) || 10),
+        sampleDurationSec,
+        sampleStartSec: pickSampleStartSec(
+            selected.mediaDurationSec,
+            sampleDurationSec
+        ),
         solutionVideoUrl: selected.solutionVideoUrl,
         solutionAudioUrl: selected.solutionAudioUrl
     };

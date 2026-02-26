@@ -15,7 +15,7 @@ function buildAnimePayload() {
                 song: { title: 'Opening Song' },
                 animethemeentries: [
                     {
-                        videos: [{ link: 'https://cdn.example/op.mp4', audio: 'https://cdn.example/op.mp3' }]
+                        videos: [{ link: 'https://cdn.example/op.mp4', audio: 'https://cdn.example/op.mp3', duration: 90 }]
                     }
                 ]
             },
@@ -25,7 +25,7 @@ function buildAnimePayload() {
                 song: { title: 'Ending Song' },
                 animethemeentries: [
                     {
-                        videos: [{ link: 'https://cdn.example/ed.mp4', audio: 'https://cdn.example/ed.mp3' }]
+                        videos: [{ link: 'https://cdn.example/ed.mp4', audio: 'https://cdn.example/ed.mp3', duration: 90 }]
                     }
                 ]
             },
@@ -35,7 +35,7 @@ function buildAnimePayload() {
                 song: { title: 'Insert Song' },
                 animethemeentries: [
                     {
-                        videos: [{ link: 'https://cdn.example/in.mp4', audio: 'https://cdn.example/in.mp3' }]
+                        videos: [{ link: 'https://cdn.example/in.mp4', audio: 'https://cdn.example/in.mp3', duration: 90 }]
                     }
                 ]
             }
@@ -161,5 +161,49 @@ describe('mediaService.resolveRoundMedia', () => {
         })).rejects.toMatchObject({
             status: 502
         });
+    });
+
+    test('picks bounded random sample start when duration is known', async () => {
+        mockProviderSuccess();
+        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.5);
+
+        const media = await resolveRoundMedia({
+            animeId: 321,
+            themeMode: 'OP_ONLY',
+            sampleSeconds: 15,
+            roundIndex: 1
+        });
+
+        // duration=90s and sample=15s => maxStart=75
+        expect(media.sampleDurationSec).toBe(15);
+        expect(media.sampleStartSec).toBeGreaterThanOrEqual(0);
+        expect(media.sampleStartSec).toBeLessThanOrEqual(75);
+        expect(media.sampleStartSec).toBe(38);
+
+        randomSpy.mockRestore();
+    });
+
+    test('uses sample start 0 when media duration is too short', async () => {
+        const shortPayload = {
+            name: 'Short Anime',
+            animethemes: [
+                {
+                    type: 'OP',
+                    song: { title: 'Short OP' },
+                    animethemeentries: [{ videos: [{ link: 'https://cdn.example/short-op.mp4', duration: 10 }] }]
+                }
+            ]
+        };
+        mockProviderSuccess(shortPayload);
+
+        const media = await resolveRoundMedia({
+            animeId: 654,
+            themeMode: 'OP_ONLY',
+            sampleSeconds: 15,
+            roundIndex: 1
+        });
+
+        expect(media.sampleDurationSec).toBe(15);
+        expect(media.sampleStartSec).toBe(0);
     });
 });

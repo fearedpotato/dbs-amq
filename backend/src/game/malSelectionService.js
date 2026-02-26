@@ -43,6 +43,15 @@ function tokenFingerprint(token) {
     return crypto.createHash('sha256').update(String(token)).digest('hex');
 }
 
+function shuffledCopy(items = []) {
+    const copy = Array.isArray(items) ? items.slice() : [];
+    for (let i = copy.length - 1; i > 0; i -= 1) {
+        const j = crypto.randomInt(i + 1);
+        [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
+}
+
 function pruneCache(now = Date.now()) {
     for (const [key, entry] of watchedCache) {
         if (now >= entry.expiresAt) watchedCache.delete(key);
@@ -208,13 +217,16 @@ function buildAssignmentOrder(roundCount, playerIds) {
 function buildPlayerPoolsInOrder(playerIds, poolByPlayer) {
     return playerIds.map((userId) => ({
         userId,
-        pool: poolByPlayer.get(userId) || [],
+        pool: shuffledCopy(poolByPlayer.get(userId) || []),
         cursorRef: { index: 0 }
     }));
 }
 
-function fillFromPopular({ plan, roundCount, usedAnimeIds }) {
-    for (const seed of POPULAR_CATALOG) {
+function fillFromPopular({ plan, roundCount, usedAnimeIds, popularCatalog }) {
+    const source = Array.isArray(popularCatalog) && popularCatalog.length > 0
+        ? popularCatalog
+        : POPULAR_CATALOG;
+    for (const seed of source) {
         if (plan.length >= roundCount) break;
         if (usedAnimeIds.has(seed.animeId)) continue;
         usedAnimeIds.add(seed.animeId);
@@ -234,7 +246,8 @@ function selectStandard({
     roundCount,
     sourceMode,
     playerIds,
-    poolByPlayer
+    poolByPlayer,
+    popularCatalog
 }) {
     const plan = [];
     const usedAnimeIds = new Set();
@@ -267,7 +280,7 @@ function selectStandard({
     }
 
     if (sourceMode === 'HYBRID' || sourceMode === 'POPULAR') {
-        fillFromPopular({ plan, roundCount, usedAnimeIds });
+        fillFromPopular({ plan, roundCount, usedAnimeIds, popularCatalog });
     }
 
     if (plan.length < roundCount) {
@@ -282,7 +295,8 @@ function selectBalanced({
     sourceMode,
     selectionMode,
     playerIds,
-    poolByPlayer
+    poolByPlayer,
+    popularCatalog
 }) {
     const strict = selectionMode === 'BALANCED_STRICT';
     const assignment = buildAssignmentOrder(roundCount, playerIds);
@@ -317,7 +331,10 @@ function selectBalanced({
         }
 
         if (!picked && !strict && sourceMode === 'HYBRID') {
-            for (const seed of POPULAR_CATALOG) {
+            const fallbackCatalog = Array.isArray(popularCatalog) && popularCatalog.length > 0
+                ? popularCatalog
+                : POPULAR_CATALOG;
+            for (const seed of fallbackCatalog) {
                 if (usedAnimeIds.has(seed.animeId)) continue;
                 picked = seed;
                 sourcePlayerId = null;
@@ -408,13 +425,15 @@ async function buildRoundSeedPlan({ session, lobby }) {
     const sourceMode = String(session?.sourceMode || 'HYBRID');
     const selectionMode = String(session?.selectionMode || 'STANDARD');
     const playerIds = (lobby?.players || []).map((player) => player.userId);
+    const popularCatalog = shuffledCopy(POPULAR_CATALOG);
 
     if (sourceMode === 'POPULAR') {
         return selectStandard({
             roundCount,
             sourceMode,
             playerIds,
-            poolByPlayer: new Map()
+            poolByPlayer: new Map(),
+            popularCatalog
         });
     }
 
@@ -427,7 +446,8 @@ async function buildRoundSeedPlan({ session, lobby }) {
             sourceMode,
             selectionMode,
             playerIds,
-            poolByPlayer: pools
+            poolByPlayer: pools,
+            popularCatalog
         });
     }
 
@@ -435,7 +455,8 @@ async function buildRoundSeedPlan({ session, lobby }) {
         roundCount,
         sourceMode,
         playerIds,
-        poolByPlayer: pools
+        poolByPlayer: pools,
+        popularCatalog
     });
 }
 

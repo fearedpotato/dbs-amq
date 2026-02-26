@@ -12,7 +12,8 @@ jest.mock('../../lib/prisma', () => ({
         create: jest.fn()
     },
     lobbyPlayer: {
-        create: jest.fn()
+        create: jest.fn(),
+        findMany: jest.fn()
     },
     $transaction: jest.fn()
 }));
@@ -81,6 +82,7 @@ describe('game routes', () => {
 
     beforeEach(() => {
         jest.clearAllMocks();
+        prisma.lobbyPlayer.findMany.mockResolvedValue([]);
         prisma.$transaction.mockImplementation(async (fn) => fn({
             lobby: prisma.lobby,
             lobbyPlayer: prisma.lobbyPlayer

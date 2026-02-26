@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const { io: Client } = require('socket.io-client');
 
 jest.mock('../../game/lobbyService', () => ({
+    enforceSingleLobbyMembership: jest.fn().mockResolvedValue({ removedLobbyCodes: [] }),
     joinLobby: jest.fn(),
     setPlayerConnection: jest.fn(),
     getLobbyByCode: jest.fn(),

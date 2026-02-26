@@ -65,7 +65,7 @@ async function selectRoundMedia({
                 animeId: seed.animeId,
                 animeTitle: seed.animeTitle,
                 themeMode: session.themeMode,
-                sampleSeconds: session.sampleSeconds,
+                sampleSeconds: session.guessSeconds,
                 roundIndex
             });
         } catch (err) {
@@ -121,12 +121,14 @@ async function generateInitialRoundsForSession({ session, lobby }) {
     const rows = [];
     for (let i = 1; i <= session.roundCount; i += 1) {
         const seed = plannedSeeds[i - 1];
-        let resolvedSourcePlayerId = seed.sourcePlayerId ?? sourceAssignments[i - 1] ?? null;
+        let resolvedSourcePlayerId = Object.prototype.hasOwnProperty.call(seed, 'sourcePlayerId')
+            ? seed.sourcePlayerId
+            : (sourceAssignments[i - 1] ?? null);
         let media = await resolveRoundMedia({
             animeId: seed.animeId,
             animeTitle: seed.animeTitle,
             themeMode: session.themeMode,
-            sampleSeconds: session.sampleSeconds,
+            sampleSeconds: session.guessSeconds,
             roundIndex: i
         });
 

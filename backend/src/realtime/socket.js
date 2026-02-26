@@ -85,6 +85,13 @@ function attachRealtime(httpServer, options = {}) {
                 const code = String(payload.lobbyCode || '').toUpperCase();
                 if (!code) throw httpError(400, 'Lobby code is required');
 
+                const staleSocketLobbies = [...socket.data.lobbies].filter((joinedCode) => joinedCode !== code);
+                for (const staleCode of staleSocketLobbies) {
+                    socket.leave(staleCode);
+                    socket.data.lobbies.delete(staleCode);
+                }
+
+                const { removedLobbyCodes = [] } = await lobbyService.enforceSingleLobbyMembership(userId, { exceptCode: code });
                 await lobbyService.joinLobby(
                     code,
                     { id: userId, username, nickname: username },
@@ -92,6 +99,16 @@ function attachRealtime(httpServer, options = {}) {
                     { inviteToken: typeof payload.inviteToken === 'string' ? payload.inviteToken : null }
                 );
                 const lobby = await lobbyService.setPlayerConnection(code, userId, true);
+
+                const affectedPreviousLobbies = [...new Set([...removedLobbyCodes, ...staleSocketLobbies])];
+                for (const removedCode of affectedPreviousLobbies) {
+                    socket.leave(removedCode);
+                    socket.data.lobbies.delete(removedCode);
+                }
+                for (const removedCode of affectedPreviousLobbies) {
+                    await roundEngine.onPlayerDisconnected(removedCode, userId);
+                    await broadcastLobbyState(io, removedCode);
+                }
 
                 socket.join(code);
                 socket.data.lobbies.add(code);

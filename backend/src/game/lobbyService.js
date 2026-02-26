@@ -258,7 +258,8 @@ async function setPlayerConnection(code, userId, isConnected) {
     return getLobbyByCode(code);
 }
 
-async function leaveLobby(code, userId) {
+async function leaveLobby(code, userId, options = {}) {
+    const force = Boolean(options.force);
     const lobby = await prisma.lobby.findUnique({
         where: { code },
         include: {
@@ -267,7 +268,7 @@ async function leaveLobby(code, userId) {
     });
 
     if (!lobby) throw httpError(404, 'Lobby not found');
-    if (lobby.status !== 'WAITING') {
+    if (!force && lobby.status !== 'WAITING') {
         throw httpError(400, 'Cannot leave lobby after game has started');
     }
 
@@ -348,6 +349,37 @@ async function updateLobbyConfig(code, actorUserId, patch = {}) {
     return mapLobby(updated);
 }
 
+async function enforceSingleLobbyMembership(userId, options = {}) {
+    const exceptCode = options?.exceptCode
+        ? String(options.exceptCode).toUpperCase()
+        : null;
+
+    const memberships = await prisma.lobbyPlayer.findMany({
+        where: { userId },
+        include: {
+            lobby: {
+                select: { code: true, status: true }
+            }
+        }
+    });
+
+    const previousLobbyCodes = [...new Set(
+        memberships
+            .filter((entry) => {
+                if (!entry?.lobby) return false;
+                if (exceptCode && entry.lobby.code === exceptCode) return false;
+                return ['WAITING', 'IN_GAME'].includes(entry.lobby.status);
+            })
+            .map((entry) => entry.lobby.code)
+    )];
+
+    for (const code of previousLobbyCodes) {
+        await leaveLobby(code, userId, { force: true });
+    }
+
+    return { removedLobbyCodes: previousLobbyCodes };
+}
+
 async function listJoinableLobbies({ q, limit = 20, offset = 0 }) {
     const search = q && q.trim();
     const lobbies = await prisma.lobby.findMany({
@@ -383,6 +415,7 @@ module.exports = {
     createLobby,
     getLobbyByCode,
     joinLobby,
+    enforceSingleLobbyMembership,
     setPlayerConnection,
     leaveLobby,
     updateLobbyConfig,
