@@ -1,4 +1,5 @@
 const fs = require('fs');
+const dns = require('dns');
 const os = require('os');
 const path = require('path');
 const { Readable } = require('stream');
@@ -19,6 +20,7 @@ const {
 describe('mediaProxyService', () => {
     const originalEnv = { ...process.env };
     let cacheDir;
+    let dnsLookupMock;
 
     beforeEach(async () => {
         jest.clearAllMocks();
@@ -26,10 +28,15 @@ describe('mediaProxyService', () => {
         process.env.MEDIA_PROXY_ENABLED = 'true';
         process.env.MEDIA_PROXY_SIGNING_SECRET = 'proxy-test-secret';
         process.env.MEDIA_PROXY_CACHE_DIR = cacheDir;
+        process.env.MEDIA_PROXY_ALLOWED_HOSTS = 'cdn.example.com,*.example.com';
+        dnsLookupMock = jest.spyOn(dns.promises, 'lookup').mockResolvedValue([
+            { address: '93.184.216.34', family: 4 }
+        ]);
     });
 
     afterEach(async () => {
         process.env = { ...originalEnv };
+        if (dnsLookupMock) dnsLookupMock.mockRestore();
         if (cacheDir) {
             await fs.promises.rm(cacheDir, { recursive: true, force: true });
         }
@@ -67,6 +74,34 @@ describe('mediaProxyService', () => {
         expect(first.size).toBe(payload.length);
         expect(second.size).toBe(payload.length);
         expect(axios.get).toHaveBeenCalledTimes(1);
+    });
+
+    test('rejects signed proxy URL when host is not allowed', () => {
+        const proxied = buildMediaProxyUrl('https://evil.example.net/audio.mp3');
+        const parsed = new URL(`http://localhost${proxied}`);
+        const verification = parseAndVerifyProxyRequest({
+            u: parsed.searchParams.get('u'),
+            exp: parsed.searchParams.get('exp'),
+            sig: parsed.searchParams.get('sig')
+        });
+
+        expect(verification.ok).toBe(false);
+        expect(verification.status).toBe(403);
+        expect(verification.error).toBe('Blocked media source host');
+    });
+
+    test('rejects signed proxy URL for private IP address target', () => {
+        const proxied = buildMediaProxyUrl('http://127.0.0.1/private.mp3');
+        const parsed = new URL(`http://localhost${proxied}`);
+        const verification = parseAndVerifyProxyRequest({
+            u: parsed.searchParams.get('u'),
+            exp: parsed.searchParams.get('exp'),
+            sig: parsed.searchParams.get('sig')
+        });
+
+        expect(verification.ok).toBe(false);
+        expect(verification.status).toBe(403);
+        expect(verification.error).toBe('Blocked private media source address');
     });
 
     test('prewarms first rounds from proxy manifest with dedupe', async () => {
@@ -112,5 +147,16 @@ describe('mediaProxyService', () => {
         const eviction = await evictCacheForMediaUrl(proxied);
         expect(eviction.removed).toBe(true);
         expect(fs.existsSync(created.dataPath)).toBe(false);
+    });
+
+    test('blocks cache download when DNS resolves to private IP', async () => {
+        dnsLookupMock.mockResolvedValueOnce([
+            { address: '10.0.0.7', family: 4 }
+        ]);
+
+        await expect(getOrCreateCacheEntry('https://cdn.example.com/private-hop.mp3')).rejects.toThrow(
+            'Blocked private media source address'
+        );
+        expect(axios.get).not.toHaveBeenCalled();
     });
 });

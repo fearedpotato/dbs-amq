@@ -1,20 +1,154 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const net = require('net');
+const dns = require('dns');
 const axios = require('axios');
 const { pipeline } = require('stream/promises');
+const telemetry = require('../lib/telemetry');
 
 const DEFAULT_PROXY_PATH = '/api/game/media/proxy';
 const DEFAULT_URL_TTL_SEC = 24 * 60 * 60;
 const DEFAULT_CACHE_DIR = path.resolve(__dirname, '../../.cache/media');
 const DEFAULT_FETCH_TIMEOUT_MS = 20_000;
 const DEFAULT_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB
+const DEFAULT_ALLOWED_HOSTS = '';
 
 const inflightDownloads = new Map();
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeHost(value) {
+    return String(value || '').trim().toLowerCase().replace(/\.$/, '');
+}
+
+function parseAllowedHostPatterns() {
+    const raw = String(process.env.MEDIA_PROXY_ALLOWED_HOSTS || DEFAULT_ALLOWED_HOSTS);
+    return raw
+        .split(',')
+        .map((item) => normalizeHost(item))
+        .filter(Boolean);
+}
+
+function isRestrictedHostname(hostname) {
+    const host = normalizeHost(hostname);
+    if (!host) return true;
+    if (host === 'localhost' || host.endsWith('.localhost')) return true;
+    if (host.endsWith('.local') || host.endsWith('.internal')) return true;
+    return false;
+}
+
+function isPrivateIpv4Address(address) {
+    const parts = String(address || '').split('.').map((value) => Number.parseInt(value, 10));
+    if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+        return false;
+    }
+    const [a, b] = parts;
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a >= 224) return true;
+    return false;
+}
+
+function isPrivateIpv6Address(address) {
+    const normalized = String(address || '').toLowerCase();
+    if (!normalized) return false;
+    if (normalized === '::' || normalized === '::1') return true;
+    if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true;
+    if (normalized.startsWith('fe8') || normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb')) {
+        return true;
+    }
+    if (normalized.startsWith('::ffff:')) {
+        const mapped = normalized.slice('::ffff:'.length);
+        if (net.isIP(mapped) === 4) {
+            return isPrivateIpv4Address(mapped);
+        }
+    }
+    return false;
+}
+
+function isPrivateIpAddress(address) {
+    const version = net.isIP(String(address || ''));
+    if (version === 4) return isPrivateIpv4Address(address);
+    if (version === 6) return isPrivateIpv6Address(address);
+    return false;
+}
+
+function isHostnameAllowed(hostname, allowedPatterns) {
+    if (!Array.isArray(allowedPatterns) || allowedPatterns.length === 0) {
+        return true;
+    }
+
+    const host = normalizeHost(hostname);
+    return allowedPatterns.some((pattern) => {
+        if (pattern.startsWith('*.')) {
+            const suffix = pattern.slice(2);
+            return Boolean(suffix) && host.endsWith(`.${suffix}`);
+        }
+        return host === pattern;
+    });
+}
+
+function validateSourceUrlSync(sourceUrl) {
+    let parsed;
+    try {
+        parsed = new URL(String(sourceUrl || '').trim());
+    } catch (_err) {
+        return { ok: false, status: 400, error: 'Invalid media URL', reason: 'invalid_url' };
+    }
+
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+        return { ok: false, status: 400, error: 'Unsupported media URL protocol', reason: 'unsupported_protocol' };
+    }
+
+    const hostname = normalizeHost(parsed.hostname);
+    if (!hostname || isRestrictedHostname(hostname)) {
+        return { ok: false, status: 403, error: 'Blocked media source hostname', reason: 'restricted_hostname' };
+    }
+
+    const ipVersion = net.isIP(hostname);
+    if (ipVersion && isPrivateIpAddress(hostname)) {
+        return { ok: false, status: 403, error: 'Blocked private media source address', reason: 'private_ip' };
+    }
+
+    const allowedPatterns = parseAllowedHostPatterns();
+    if (!isHostnameAllowed(hostname, allowedPatterns)) {
+        return { ok: false, status: 403, error: 'Blocked media source host', reason: 'host_not_allowed' };
+    }
+
+    return {
+        ok: true,
+        sourceUrl: String(sourceUrl),
+        hostname,
+        ipVersion
+    };
+}
+
+async function validateSourceUrl(sourceUrl) {
+    const validated = validateSourceUrlSync(sourceUrl);
+    if (!validated.ok) return validated;
+    if (validated.ipVersion) return validated;
+
+    try {
+        const addresses = await dns.promises.lookup(validated.hostname, { all: true, verbatim: true });
+        if (!Array.isArray(addresses) || addresses.length === 0) {
+            return { ok: false, status: 403, error: 'Could not resolve media source host', reason: 'dns_unresolved' };
+        }
+        for (const row of addresses) {
+            if (isPrivateIpAddress(row?.address)) {
+                return { ok: false, status: 403, error: 'Blocked private media source address', reason: 'private_ip' };
+            }
+        }
+        return validated;
+    } catch (_err) {
+        return { ok: false, status: 403, error: 'Could not resolve media source host', reason: 'dns_lookup_failed' };
+    }
 }
 
 function getProxyPath() {
@@ -119,13 +253,13 @@ function parseAndVerifyProxyRequest(query = {}) {
         return { ok: false, status: 400, error: 'Invalid proxy URL encoding' };
     }
 
-    try {
-        const parsed = new URL(sourceUrl);
-        if (!['http:', 'https:'].includes(parsed.protocol)) {
-            return { ok: false, status: 400, error: 'Unsupported media URL protocol' };
-        }
-    } catch (_err) {
-        return { ok: false, status: 400, error: 'Invalid media URL' };
+    const safety = validateSourceUrlSync(sourceUrl);
+    if (!safety.ok) {
+        telemetry.warn('media.proxy_request_blocked', {
+            reason: safety.reason,
+            sourceUrl: String(sourceUrl || '')
+        });
+        return { ok: false, status: safety.status, error: safety.error };
     }
 
     return { ok: true, sourceUrl };
@@ -143,15 +277,6 @@ function cachePaths(cacheKey) {
         metaPath: path.join(dir, `${cacheKey}.json`),
         tmpPath: path.join(dir, `${cacheKey}.${Date.now()}.tmp`)
     };
-}
-
-function isHttpSourceUrl(value) {
-    try {
-        const parsed = new URL(String(value || '').trim());
-        return ['http:', 'https:'].includes(parsed.protocol);
-    } catch (_err) {
-        return false;
-    }
 }
 
 async function ensureCacheDir() {
@@ -291,6 +416,18 @@ async function downloadToCache(sourceUrl) {
 }
 
 async function getOrCreateCacheEntry(sourceUrl) {
+    const safety = await validateSourceUrl(sourceUrl);
+    if (!safety.ok) {
+        telemetry.warn('media.cache_request_blocked', {
+            reason: safety.reason,
+            sourceUrl: String(sourceUrl || '')
+        });
+        const err = new Error(safety.error);
+        err.status = safety.status;
+        err.code = safety.reason;
+        throw err;
+    }
+
     const existing = await getCacheEntry(sourceUrl);
     if (existing) return { ...existing, cacheStatus: 'HIT' };
 
@@ -350,7 +487,8 @@ function decodeSourceFromProxyQuery(query = {}) {
     if (!encodedUrl) return null;
     try {
         const decoded = base64UrlDecode(encodedUrl);
-        return isHttpSourceUrl(decoded) ? decoded : null;
+        const safety = validateSourceUrlSync(decoded);
+        return safety.ok ? decoded : null;
     } catch (_err) {
         return null;
     }
@@ -365,7 +503,8 @@ function resolveCacheSourceUrl(mediaUrl) {
         return decodeSourceFromProxyQuery(proxyQuery);
     }
 
-    if (!isHttpSourceUrl(raw)) return null;
+    const safety = validateSourceUrlSync(raw);
+    if (!safety.ok) return null;
     return raw;
 }
 
@@ -386,12 +525,23 @@ async function prewarmProxyUrl(proxyUrl) {
         return { ok: false, reason: 'not_proxy_url' };
     }
 
-    const entry = await getOrCreateCacheEntry(sourceUrl);
-    return {
-        ok: true,
-        cacheStatus: entry.cacheStatus,
-        key: entry.key
-    };
+    try {
+        const entry = await getOrCreateCacheEntry(sourceUrl);
+        return {
+            ok: true,
+            cacheStatus: entry.cacheStatus,
+            key: entry.key
+        };
+    } catch (err) {
+        if (typeof err?.code === 'string') {
+            return {
+                ok: false,
+                reason: err.code,
+                status: Number.isInteger(err.status) ? err.status : 403
+            };
+        }
+        throw err;
+    }
 }
 
 async function evictCacheForMediaUrl(mediaUrl) {

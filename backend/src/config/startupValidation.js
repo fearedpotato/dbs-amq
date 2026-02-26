@@ -17,6 +17,18 @@ function isHttpUrl(value) {
     }
 }
 
+function isValidHostPattern(value) {
+    const raw = String(value || '').trim().toLowerCase();
+    if (!raw) return false;
+
+    const base = raw.startsWith('*.') ? raw.slice(2) : raw;
+    if (!base) return false;
+    if (base.includes('*')) return false;
+    if (base.startsWith('.') || base.endsWith('.')) return false;
+    if (base.includes('..')) return false;
+    return /^[a-z0-9.-]+$/.test(base);
+}
+
 function asBoolean(value, fallback = false) {
     const raw = String(value || '').trim().toLowerCase();
     if (!raw) return fallback;
@@ -95,6 +107,24 @@ function validateStartupEnv({ env = process.env, skipInTest = true } = {}) {
             pushIssue(issues, 'MEDIA_PROXY_PATH', 'MEDIA_PROXY_PATH must start with "/"');
         }
 
+        const mediaProxyAllowedHostsRaw = String(env.MEDIA_PROXY_ALLOWED_HOSTS || '').trim();
+        if (!mediaProxyAllowedHostsRaw) {
+            pushIssue(issues, 'MEDIA_PROXY_ALLOWED_HOSTS', 'MEDIA_PROXY_ALLOWED_HOSTS is required when MEDIA_PROXY_ENABLED=true');
+        } else {
+            const hostPatterns = mediaProxyAllowedHostsRaw
+                .split(',')
+                .map((item) => item.trim())
+                .filter(Boolean);
+            if (hostPatterns.length === 0) {
+                pushIssue(issues, 'MEDIA_PROXY_ALLOWED_HOSTS', 'MEDIA_PROXY_ALLOWED_HOSTS must contain at least one host pattern');
+            }
+            for (const pattern of hostPatterns) {
+                if (!isValidHostPattern(pattern)) {
+                    pushIssue(issues, 'MEDIA_PROXY_ALLOWED_HOSTS', `Invalid host pattern "${pattern}"`);
+                }
+            }
+        }
+
         const mediaProxyFetchTimeout = parsePositiveInt(env.MEDIA_PROXY_FETCH_TIMEOUT_MS || 20_000);
         if (!mediaProxyFetchTimeout) {
             pushIssue(issues, 'MEDIA_PROXY_FETCH_TIMEOUT_MS', 'MEDIA_PROXY_FETCH_TIMEOUT_MS must be a positive integer');
@@ -120,7 +150,8 @@ function validateStartupEnv({ env = process.env, skipInTest = true } = {}) {
             'MAL_REDIRECT_URI',
             'ANIMETHEMES_BASE_URL',
             'ANIMETHEMES_TIMEOUT_MS',
-            'MEDIA_PROXY_ENABLED'
+            'MEDIA_PROXY_ENABLED',
+            'MEDIA_PROXY_ALLOWED_HOSTS'
         ]
     });
 
