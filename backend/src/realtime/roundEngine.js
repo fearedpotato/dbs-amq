@@ -2,7 +2,8 @@ const roundService = require('../game/roundService');
 const { httpError } = require('../game/errors');
 const {
     buildMediaProxyUrl,
-    evictCacheForMediaUrls
+    evictCacheForMediaUrls,
+    deleteLobbyCache
 } = require('../game/mediaProxyService');
 const telemetry = require('../lib/telemetry');
 
@@ -232,6 +233,20 @@ function createRoundEngine(io) {
         const winner = scores.length > 0 ? scores[0] : null;
 
         await roundService.finishSession(state.sessionId);
+        try {
+            const summary = await deleteLobbyCache(lobbyCode);
+            telemetry.info('media.cache_lobby_deleted', {
+                lobbyCode,
+                sessionId: state.sessionId,
+                ...summary
+            });
+        } catch (err) {
+            telemetry.warn('media.cache_lobby_delete_failed', {
+                lobbyCode,
+                sessionId: state.sessionId,
+                error: err?.message || String(err)
+            });
+        }
 
         io.to(lobbyCode).emit('game:finished', {
             finalScores: scores,

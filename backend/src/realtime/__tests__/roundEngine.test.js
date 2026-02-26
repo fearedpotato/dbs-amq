@@ -20,6 +20,10 @@ jest.mock('../../game/mediaProxyService', () => ({
         attempted: 0,
         removed: 0,
         skipped: 0
+    }),
+    deleteLobbyCache: jest.fn().mockResolvedValue({
+        removed: true,
+        lobbyCode: 'ABC123'
     })
 }));
 

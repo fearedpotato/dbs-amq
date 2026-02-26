@@ -84,7 +84,7 @@ async function selectRoundMedia({
     return bestFallback;
 }
 
-function buildRoundRow({ sessionId, roundIndex, media, sourcePlayerId }) {
+function buildRoundRow({ sessionId, roundIndex, media, sourcePlayerId, lobbyCode = null }) {
     return {
         sessionId,
         index: roundIndex,
@@ -95,8 +95,8 @@ function buildRoundRow({ sessionId, roundIndex, media, sourcePlayerId }) {
         themeTitle: media.themeTitle,
         sampleStartSec: media.sampleStartSec,
         sampleDurationSec: media.sampleDurationSec,
-        solutionVideoUrl: buildMediaProxyUrl(media.solutionVideoUrl),
-        solutionAudioUrl: buildMediaProxyUrl(media.solutionAudioUrl),
+        solutionVideoUrl: buildMediaProxyUrl(media.solutionVideoUrl, { lobbyCode }),
+        solutionAudioUrl: buildMediaProxyUrl(media.solutionAudioUrl, { lobbyCode }),
         sourcePlayerId: sourcePlayerId ?? null
     };
 }
@@ -163,7 +163,8 @@ async function generateInitialRoundsForSession({ session, lobby }) {
             sessionId: session.id,
             roundIndex: i,
             media,
-            sourcePlayerId: resolvedSourcePlayerId
+            sourcePlayerId: resolvedSourcePlayerId,
+            lobbyCode: lobby?.code || session?.lobby?.code || null
         }));
     }
 
@@ -213,7 +214,8 @@ async function ensureRoundForIndex({ session, index, lobbyPlayers }) {
             sessionId: session.id,
             roundIndex: index,
             media,
-            sourcePlayerId: sourceAssignments[index - 1] || null
+            sourcePlayerId: sourceAssignments[index - 1] || null,
+            lobbyCode: session?.lobby?.code || null
         })
     });
 }

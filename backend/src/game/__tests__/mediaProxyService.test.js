@@ -14,7 +14,8 @@ const {
     parseAndVerifyProxyRequest,
     getOrCreateCacheEntry,
     prewarmManifest,
-    evictCacheForMediaUrl
+    evictCacheForMediaUrl,
+    deleteLobbyCache
 } = require('../mediaProxyService');
 
 describe('mediaProxyService', () => {
@@ -60,6 +61,24 @@ describe('mediaProxyService', () => {
 
         expect(verification.ok).toBe(true);
         expect(verification.sourceUrl).toBe(sourceUrl);
+    });
+
+    test('builds signed proxy URL with lobby scope and validates it', () => {
+        const sourceUrl = 'https://cdn.example.com/audio.mp3';
+        const proxied = buildMediaProxyUrl(sourceUrl, { lobbyCode: 'ab12' });
+        const parsed = new URL(`http://localhost${proxied}`);
+        expect(parsed.searchParams.get('l')).toBe('AB12');
+
+        const verification = parseAndVerifyProxyRequest({
+            u: parsed.searchParams.get('u'),
+            exp: parsed.searchParams.get('exp'),
+            sig: parsed.searchParams.get('sig'),
+            l: parsed.searchParams.get('l')
+        });
+
+        expect(verification.ok).toBe(true);
+        expect(verification.sourceUrl).toBe(sourceUrl);
+        expect(verification.lobbyCode).toBe('AB12');
     });
 
     test('uses MEDIA_PROXY_URL_TTL_SEC override when building signed URL', () => {
@@ -173,5 +192,29 @@ describe('mediaProxyService', () => {
             'Blocked private media source address'
         );
         expect(axios.get).not.toHaveBeenCalled();
+    });
+
+    test('stores cache in per-lobby folders and deletes only targeted lobby folder', async () => {
+        const payload = Buffer.from('demo-media-payload');
+        axios.get.mockResolvedValue({
+            headers: { 'content-type': 'audio/mpeg' },
+            data: Readable.from(payload)
+        });
+
+        const sourceUrl = 'https://cdn.example.com/shared-song.mp3';
+        const alpha = await getOrCreateCacheEntry(sourceUrl, { lobbyCode: 'ALPHA1' });
+        const beta = await getOrCreateCacheEntry(sourceUrl, { lobbyCode: 'BETA2' });
+
+        expect(alpha.dataPath).toContain(path.join('ALPHA1', `${alpha.key}.bin`));
+        expect(beta.dataPath).toContain(path.join('BETA2', `${beta.key}.bin`));
+        expect(fs.existsSync(alpha.dataPath)).toBe(true);
+        expect(fs.existsSync(beta.dataPath)).toBe(true);
+
+        const deletion = await deleteLobbyCache('ALPHA1');
+        expect(deletion.removed).toBe(true);
+        expect(deletion.lobbyCode).toBe('ALPHA1');
+
+        expect(fs.existsSync(alpha.dataPath)).toBe(false);
+        expect(fs.existsSync(beta.dataPath)).toBe(true);
     });
 });

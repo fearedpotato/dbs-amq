@@ -100,7 +100,9 @@ router.get('/media/proxy', mediaProxyRateLimit, async (req, res) => {
 
         let entry;
         try {
-            entry = await mediaProxyService.getOrCreateCacheEntry(parsed.sourceUrl);
+            entry = await mediaProxyService.getOrCreateCacheEntry(parsed.sourceUrl, {
+                lobbyCode: parsed.lobbyCode
+            });
         } catch (_err) {
             throw httpError(502, 'Could not fetch media from upstream provider');
         }

@@ -156,9 +156,10 @@ export default function App() {
     const sampleAudioRef = useRef(null);
     const sampleVideoRef = useRef(null);
     const solutionVideoRef = useRef(null);
+    const guessInputRef = useRef(null);
     const sampleActiveMediaRef = useRef(null);
     const sampleStopTimerRef = useRef(null);
-    const sampleVolumeRef = useRef(0.8);
+    const sampleVolumeRef = useRef(0.25);
     const sampleResolvedStartSecRef = useRef(null);
     const preloadManifestByIndexRef = useRef(new Map());
     const preloadRoundStatusRef = useRef(new Map());
@@ -204,11 +205,12 @@ export default function App() {
     const [guessText, setGuessText] = useState('');
     const [guessAnimeId, setGuessAnimeId] = useState(null);
     const [searchResults, setSearchResults] = useState([]);
+    const [searchMenuOpen, setSearchMenuOpen] = useState(false);
     const [sampleAutoplayBlocked, setSampleAutoplayBlocked] = useState(false);
     const [samplePlaying, setSamplePlaying] = useState(false);
     const [samplePlaybackSource, setSamplePlaybackSource] = useState(null);
     const [solutionVideoAutoplayBlocked, setSolutionVideoAutoplayBlocked] = useState(false);
-    const [sampleVolume, setSampleVolume] = useState(0.8);
+    const [sampleVolume, setSampleVolume] = useState(0.25);
     const [searchError, setSearchError] = useState('');
     const [mediaError, setMediaError] = useState('');
     const [solutionMediaError, setSolutionMediaError] = useState('');
@@ -231,6 +233,27 @@ export default function App() {
     useEffect(() => {
         sampleVolumeRef.current = sampleVolume;
     }, [sampleVolume]);
+
+    useEffect(() => {
+        if (!searchMenuOpen || phase !== 'GUESSING') return undefined;
+
+        const onKeyDown = (event) => {
+            if (event.key === 'Escape') {
+                setSearchMenuOpen(false);
+                guessInputRef.current?.blur?.();
+            }
+        };
+
+        window.addEventListener('keydown', onKeyDown);
+        return () => {
+            window.removeEventListener('keydown', onKeyDown);
+        };
+    }, [phase, searchMenuOpen]);
+
+    useEffect(() => {
+        if (phase === 'GUESSING') return;
+        setSearchMenuOpen(false);
+    }, [phase]);
 
     const playerNameById = useMemo(() => {
         const map = new Map();
@@ -1532,8 +1555,8 @@ export default function App() {
                     </article>
                 </div>
             ) : (
-                <div className="gmq-grid">
-                    <article className="gmq-card">
+                <div className="gmq-grid gmq-grid-match">
+                    <article className="gmq-card gmq-card-lobby">
                         <h2>Lobby {lobby.code}</h2>
                         <p className="gmq-muted">{lobby.name || 'Untitled'} | {lobby.playerCount}/{lobby.maxPlayers} players</p>
                         <ul className="gmq-player-list">
@@ -1551,7 +1574,7 @@ export default function App() {
                         ) : null}
                     </article>
 
-                    <article className="gmq-card">
+                    <article className="gmq-card gmq-card-media">
                         <h2>Media Status</h2>
                         <div className="gmq-status-row">
                             <span className={`gmq-status-dot gmq-status-dot-${mediaSourceHealth.tone}`} />
@@ -1585,7 +1608,7 @@ export default function App() {
                         </button>
                     </article>
 
-                    <article className="gmq-card">
+                    <article className="gmq-card gmq-card-round">
                         <h2>Round</h2>
                         <p className="gmq-round-phase">{phase} | {countdown}</p>
                         {phase === 'PENDING' && preloadBlocking ? (
@@ -1671,16 +1694,35 @@ export default function App() {
                                 {!hasSampleMedia ? (
                                     <p className="gmq-muted">Sample audio is unavailable for this round.</p>
                                 ) : null}
-                                <input value={guessText} onChange={(e) => { setGuessText(e.target.value); setGuessAnimeId(null); }} placeholder="Type anime name"/>
-                                <ul className="gmq-search-results">
-                                    {searchResults.map((item) => (
-                                        <li key={`${item.id}-${item.title}`}>
-                                            <button type="button" onClick={() => { setGuessText(item.title || ''); setGuessAnimeId(Number.isInteger(item.id) ? item.id : null); setSearchResults([]); }}>
-                                                {item.title}
-                                            </button>
-                                        </li>
-                                    ))}
-                                </ul>
+                                <div className="gmq-search-box">
+                                    <input
+                                        ref={guessInputRef}
+                                        value={guessText}
+                                        onChange={(e) => { setGuessText(e.target.value); setGuessAnimeId(null); setSearchMenuOpen(true); }}
+                                        onFocus={() => setSearchMenuOpen(true)}
+                                        onBlur={() => {
+                                            window.setTimeout(() => {
+                                                setSearchMenuOpen(false);
+                                            }, 100);
+                                        }}
+                                        placeholder="Type anime name"
+                                    />
+                                    {(searchMenuOpen && searchResults.length > 0) ? (
+                                        <ul className="gmq-search-results">
+                                            {searchResults.map((item) => (
+                                                <li key={`${item.id}-${item.title}`}>
+                                                    <button
+                                                        type="button"
+                                                        onMouseDown={(event) => event.preventDefault()}
+                                                        onClick={() => { setGuessText(item.title || ''); setGuessAnimeId(Number.isInteger(item.id) ? item.id : null); setSearchResults([]); setSearchMenuOpen(false); }}
+                                                    >
+                                                        {item.title}
+                                                    </button>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    ) : null}
+                                </div>
                                 {searchError ? <p className="gmq-muted gmq-muted-warning">{searchError}</p> : null}
                                 <div className="gmq-actions">
                                     <button type="button" className="gmq-btn gmq-btn-primary" onClick={submitGuess} disabled={busy === 'guess'}>Submit Guess</button>

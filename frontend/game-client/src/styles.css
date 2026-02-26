@@ -26,6 +26,13 @@
     gap: 16px;
 }
 
+.gmq-grid-match {
+    grid-template-columns: repeat(2, minmax(320px, 1fr));
+    grid-template-areas:
+        "round round"
+        "lobby media";
+}
+
 .gmq-card {
     background: var(--surface, #101726);
     border: 1px solid var(--surface-border, #243049);
@@ -33,6 +40,21 @@
     padding: 14px;
     display: grid;
     gap: 10px;
+}
+
+.gmq-card-round {
+    grid-area: round;
+    justify-self: center;
+    width: min(980px, 100%);
+    min-height: clamp(620px, 78vh, 860px);
+}
+
+.gmq-card-lobby {
+    grid-area: lobby;
+}
+
+.gmq-card-media {
+    grid-area: media;
 }
 
 .gmq-inline {
@@ -194,7 +216,6 @@
 
 .gmq-lobby-list,
 .gmq-player-list,
-.gmq-search-results,
 .gmq-answer-list,
 .gmq-score-list {
     list-style: none;
@@ -202,6 +223,29 @@
     margin: 0;
     display: grid;
     gap: 8px;
+}
+
+.gmq-search-box {
+    position: relative;
+}
+
+.gmq-search-results {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    z-index: 50;
+    list-style: none;
+    margin: 0;
+    padding: 6px;
+    display: grid;
+    gap: 4px;
+    max-height: 220px;
+    overflow-y: auto;
+    border: 1px solid #2c3e62;
+    border-radius: 10px;
+    background: #101a2d;
+    box-shadow: 0 14px 32px #020713cc;
 }
 
 .gmq-lobby-item,
@@ -217,12 +261,18 @@
 .gmq-search-results button {
     width: 100%;
     text-align: left;
-    border: 1px solid #2c3e62;
+    border: 0;
     border-radius: 8px;
-    background: #17233a;
+    background: transparent;
     color: #e8efff;
     padding: 8px 10px;
     cursor: pointer;
+}
+
+.gmq-search-results button:hover,
+.gmq-search-results button:focus-visible {
+    background: #223450;
+    outline: none;
 }
 
 .gmq-round-phase {
@@ -245,5 +295,18 @@
 @media (max-width: 760px) {
     .gmq-inline {
         grid-template-columns: 1fr;
+    }
+
+    .gmq-grid-match {
+        grid-template-columns: 1fr;
+        grid-template-areas:
+            "round"
+            "lobby"
+            "media";
+    }
+
+    .gmq-card-round {
+        width: 100%;
+        min-height: 0;
     }
 }

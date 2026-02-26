@@ -4,6 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const session = require('express-session');
 const { getSessionStore } = require('./lib/sessionStore');
+const { getAllowedOrigins, isOriginAllowed } = require('./config/allowedOrigins');
 
 const authRoutes = require('./routes/auth');
 const malRoutes = require('./routes/mal');
@@ -11,7 +12,7 @@ const gameRoutes = require('./routes/game');
 
 function createApp() {
     const app = express();
-    const allowedOrigin = process.env.BASE_URL;
+    const allowedOrigins = getAllowedOrigins(process.env);
     const sessionStore = getSessionStore();
 
     if (process.env.NODE_ENV === 'production') {
@@ -20,11 +21,12 @@ function createApp() {
 
     app.use(cors({
         origin: (origin, callback) => {
-            // Allow non-browser requests (no Origin header) and the configured frontend origin.
-            if (!origin || origin === allowedOrigin) {
+            // Allow non-browser requests (no Origin header) and configured frontend origins.
+            if (isOriginAllowed(origin, allowedOrigins)) {
                 return callback(null, true);
             }
-            return callback(new Error('Not allowed by CORS'));
+            // Reject by omitting CORS headers instead of throwing (prevents noisy 500 logs).
+            return callback(null, false);
         }
     }));
     app.use(express.json());

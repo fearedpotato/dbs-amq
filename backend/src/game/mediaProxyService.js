@@ -13,12 +13,23 @@ const DEFAULT_CACHE_DIR = path.resolve(__dirname, '../../.cache/media');
 const DEFAULT_FETCH_TIMEOUT_MS = 20_000;
 const DEFAULT_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB
 const DEFAULT_ALLOWED_HOSTS = '';
+const DEFAULT_CACHE_SCOPE = '_shared';
 
 const inflightDownloads = new Map();
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeLobbyCode(value) {
+    const code = String(value || '').trim().toUpperCase();
+    if (!code) return null;
+    return /^[A-Z0-9_-]{2,20}$/.test(code) ? code : null;
+}
+
+function resolveCacheScope(lobbyCode) {
+    return normalizeLobbyCode(lobbyCode) || DEFAULT_CACHE_SCOPE;
 }
 
 function normalizeHost(value) {
@@ -192,10 +203,14 @@ function base64UrlDecode(value) {
     return Buffer.from(String(value), 'base64url').toString('utf8');
 }
 
-function signPayload(encodedUrl, expSec) {
+function signPayload(encodedUrl, expSec, lobbyCode = null) {
     const secret = getSigningSecret();
     if (!secret) return null;
-    return crypto.createHmac('sha256', secret).update(`${encodedUrl}.${expSec}`).digest('base64url');
+    const scope = normalizeLobbyCode(lobbyCode) || '';
+    const base = scope
+        ? `${encodedUrl}.${expSec}.${scope}`
+        : `${encodedUrl}.${expSec}`;
+    return crypto.createHmac('sha256', secret).update(base).digest('base64url');
 }
 
 function safeEqual(a, b) {
@@ -221,15 +236,18 @@ function buildMediaProxyUrl(sourceUrl, options = {}) {
     const ttlSec = parsePositiveInt(options.ttlSec, getUrlTtlSec());
     const expSec = Math.floor(Date.now() / 1000) + ttlSec;
     const encodedUrl = base64UrlEncode(raw);
-    const sig = signPayload(encodedUrl, expSec);
+    const lobbyCode = normalizeLobbyCode(options.lobbyCode);
+    const sig = signPayload(encodedUrl, expSec, lobbyCode);
     if (!sig) return raw;
-    return `${getProxyPath()}?u=${encodeURIComponent(encodedUrl)}&exp=${expSec}&sig=${encodeURIComponent(sig)}`;
+    const scopePart = lobbyCode ? `&l=${encodeURIComponent(lobbyCode)}` : '';
+    return `${getProxyPath()}?u=${encodeURIComponent(encodedUrl)}&exp=${expSec}&sig=${encodeURIComponent(sig)}${scopePart}`;
 }
 
 function parseAndVerifyProxyRequest(query = {}) {
     const encodedUrl = typeof query.u === 'string' ? query.u.trim() : '';
     const expRaw = typeof query.exp === 'string' ? query.exp.trim() : '';
     const sig = typeof query.sig === 'string' ? query.sig.trim() : '';
+    const lobbyCode = normalizeLobbyCode(query.l);
     const expSec = Number.parseInt(expRaw, 10);
 
     if (!encodedUrl || !sig || !Number.isFinite(expSec)) {
@@ -241,7 +259,7 @@ function parseAndVerifyProxyRequest(query = {}) {
         return { ok: false, status: 403, error: 'Proxy URL expired' };
     }
 
-    const expected = signPayload(encodedUrl, expSec);
+    const expected = signPayload(encodedUrl, expSec, lobbyCode);
     if (!expected || !safeEqual(sig, expected)) {
         return { ok: false, status: 403, error: 'Invalid proxy signature' };
     }
@@ -262,15 +280,15 @@ function parseAndVerifyProxyRequest(query = {}) {
         return { ok: false, status: safety.status, error: safety.error };
     }
 
-    return { ok: true, sourceUrl };
+    return { ok: true, sourceUrl, lobbyCode };
 }
 
 function cacheKeyForUrl(url) {
     return crypto.createHash('sha256').update(String(url)).digest('hex');
 }
 
-function cachePaths(cacheKey) {
-    const dir = getCacheDir();
+function cachePaths(cacheKey, lobbyCode = null) {
+    const dir = path.join(getCacheDir(), resolveCacheScope(lobbyCode));
     return {
         dir,
         dataPath: path.join(dir, `${cacheKey}.bin`),
@@ -279,8 +297,8 @@ function cachePaths(cacheKey) {
     };
 }
 
-async function ensureCacheDir() {
-    await fs.promises.mkdir(getCacheDir(), { recursive: true });
+async function ensureCacheDir(lobbyCode = null) {
+    await fs.promises.mkdir(path.join(getCacheDir(), resolveCacheScope(lobbyCode)), { recursive: true });
 }
 
 async function readCacheMeta(metaPath) {
@@ -292,9 +310,10 @@ async function readCacheMeta(metaPath) {
     }
 }
 
-async function getCacheEntry(sourceUrl) {
+async function getCacheEntry(sourceUrl, options = {}) {
+    const lobbyCode = normalizeLobbyCode(options.lobbyCode);
     const key = cacheKeyForUrl(sourceUrl);
-    const paths = cachePaths(key);
+    const paths = cachePaths(key, lobbyCode);
     const meta = await readCacheMeta(paths.metaPath);
     if (!meta) return null;
 
@@ -317,22 +336,34 @@ async function pruneCacheIfNeeded() {
     const maxBytes = getCacheMaxBytes();
     if (!Number.isFinite(maxBytes) || maxBytes <= 0) return;
 
-    const dir = getCacheDir();
-    let entries;
-    try {
-        entries = await fs.promises.readdir(dir);
-    } catch (_err) {
-        return;
+    const rootDir = getCacheDir();
+    const metaPaths = [];
+    async function collectMetaPaths(currentDir) {
+        let entries;
+        try {
+            entries = await fs.promises.readdir(currentDir, { withFileTypes: true });
+        } catch (_err) {
+            return;
+        }
+        for (const entry of entries) {
+            const fullPath = path.join(currentDir, entry.name);
+            if (entry.isDirectory()) {
+                await collectMetaPaths(fullPath);
+                continue;
+            }
+            if (entry.isFile() && entry.name.endsWith('.json')) {
+                metaPaths.push(fullPath);
+            }
+        }
     }
+    await collectMetaPaths(rootDir);
 
     const metas = [];
     let totalBytes = 0;
-    for (const name of entries) {
-        if (!name.endsWith('.json')) continue;
-        const metaPath = path.join(dir, name);
+    for (const metaPath of metaPaths) {
         const meta = await readCacheMeta(metaPath);
         if (!meta || typeof meta.key !== 'string') continue;
-        const dataPath = path.join(dir, `${meta.key}.bin`);
+        const dataPath = path.join(path.dirname(metaPath), `${meta.key}.bin`);
         try {
             const stat = await fs.promises.stat(dataPath);
             const size = Number.isFinite(stat.size) ? stat.size : 0;
@@ -361,15 +392,22 @@ async function pruneCacheIfNeeded() {
     }
 }
 
-async function downloadToCache(sourceUrl) {
-    await ensureCacheDir();
+function inflightKeyFor(scope, cacheKey) {
+    return `${scope}:${cacheKey}`;
+}
+
+async function downloadToCache(sourceUrl, options = {}) {
+    const lobbyCode = normalizeLobbyCode(options.lobbyCode);
+    const scope = resolveCacheScope(lobbyCode);
+    await ensureCacheDir(scope);
     const key = cacheKeyForUrl(sourceUrl);
-    if (inflightDownloads.has(key)) {
-        return inflightDownloads.get(key);
+    const inflightKey = inflightKeyFor(scope, key);
+    if (inflightDownloads.has(inflightKey)) {
+        return inflightDownloads.get(inflightKey);
     }
 
     const promise = (async () => {
-        const paths = cachePaths(key);
+        const paths = cachePaths(key, scope);
         const response = await axios.get(sourceUrl, {
             responseType: 'stream',
             timeout: getFetchTimeoutMs(),
@@ -383,6 +421,7 @@ async function downloadToCache(sourceUrl) {
         const stat = await fs.promises.stat(paths.dataPath);
         const meta = {
             key,
+            scope,
             sourceUrl,
             contentType: typeof response.headers?.['content-type'] === 'string'
                 ? response.headers['content-type']
@@ -395,6 +434,7 @@ async function downloadToCache(sourceUrl) {
 
         return {
             key,
+            scope,
             dataPath: paths.dataPath,
             metaPath: paths.metaPath,
             contentType: meta.contentType,
@@ -403,19 +443,20 @@ async function downloadToCache(sourceUrl) {
         };
     })();
 
-    inflightDownloads.set(key, promise);
+    inflightDownloads.set(inflightKey, promise);
     try {
         return await promise;
     } catch (err) {
-        const paths = cachePaths(key);
+        const paths = cachePaths(key, scope);
         await fs.promises.unlink(paths.tmpPath).catch(() => {});
         throw err;
     } finally {
-        inflightDownloads.delete(key);
+        inflightDownloads.delete(inflightKey);
     }
 }
 
-async function getOrCreateCacheEntry(sourceUrl) {
+async function getOrCreateCacheEntry(sourceUrl, options = {}) {
+    const lobbyCode = normalizeLobbyCode(options.lobbyCode);
     const safety = await validateSourceUrl(sourceUrl);
     if (!safety.ok) {
         telemetry.warn('media.cache_request_blocked', {
@@ -428,10 +469,10 @@ async function getOrCreateCacheEntry(sourceUrl) {
         throw err;
     }
 
-    const existing = await getCacheEntry(sourceUrl);
+    const existing = await getCacheEntry(sourceUrl, { lobbyCode });
     if (existing) return { ...existing, cacheStatus: 'HIT' };
 
-    const downloaded = await downloadToCache(sourceUrl);
+    const downloaded = await downloadToCache(sourceUrl, { lobbyCode });
     return { ...downloaded, cacheStatus: 'MISS' };
 }
 
@@ -475,7 +516,8 @@ function parseProxyUrlToQuery(proxyUrl) {
         return {
             u: parsed.searchParams.get('u') || '',
             exp: parsed.searchParams.get('exp') || '',
-            sig: parsed.searchParams.get('sig') || ''
+            sig: parsed.searchParams.get('sig') || '',
+            l: parsed.searchParams.get('l') || ''
         };
     } catch (_err) {
         return null;
@@ -488,7 +530,11 @@ function decodeSourceFromProxyQuery(query = {}) {
     try {
         const decoded = base64UrlDecode(encodedUrl);
         const safety = validateSourceUrlSync(decoded);
-        return safety.ok ? decoded : null;
+        if (!safety.ok) return null;
+        return {
+            sourceUrl: decoded,
+            lobbyCode: normalizeLobbyCode(query.l)
+        };
     } catch (_err) {
         return null;
     }
@@ -505,11 +551,15 @@ function resolveCacheSourceUrl(mediaUrl) {
 
     const safety = validateSourceUrlSync(raw);
     if (!safety.ok) return null;
-    return raw;
+    return {
+        sourceUrl: raw,
+        lobbyCode: null
+    };
 }
 
 async function prewarmProxyUrl(proxyUrl) {
     let sourceUrl = null;
+    let lobbyCode = null;
     const query = parseProxyUrlToQuery(proxyUrl);
     if (query) {
         const parsed = parseAndVerifyProxyRequest(query);
@@ -517,8 +567,11 @@ async function prewarmProxyUrl(proxyUrl) {
             return { ok: false, reason: parsed.error, status: parsed.status };
         }
         sourceUrl = parsed.sourceUrl;
+        lobbyCode = normalizeLobbyCode(parsed.lobbyCode);
     } else {
-        sourceUrl = resolveCacheSourceUrl(proxyUrl);
+        const resolved = resolveCacheSourceUrl(proxyUrl);
+        sourceUrl = resolved?.sourceUrl || null;
+        lobbyCode = normalizeLobbyCode(resolved?.lobbyCode);
     }
 
     if (!sourceUrl) {
@@ -526,7 +579,7 @@ async function prewarmProxyUrl(proxyUrl) {
     }
 
     try {
-        const entry = await getOrCreateCacheEntry(sourceUrl);
+        const entry = await getOrCreateCacheEntry(sourceUrl, { lobbyCode });
         return {
             ok: true,
             cacheStatus: entry.cacheStatus,
@@ -545,16 +598,18 @@ async function prewarmProxyUrl(proxyUrl) {
 }
 
 async function evictCacheForMediaUrl(mediaUrl) {
-    const sourceUrl = resolveCacheSourceUrl(mediaUrl);
-    if (!sourceUrl) {
+    const resolved = resolveCacheSourceUrl(mediaUrl);
+    if (!resolved?.sourceUrl) {
         return {
             removed: false,
             reason: 'unsupported_url'
         };
     }
 
+    const sourceUrl = resolved.sourceUrl;
+    const lobbyCode = normalizeLobbyCode(resolved.lobbyCode);
     const key = cacheKeyForUrl(sourceUrl);
-    const { dataPath, metaPath } = cachePaths(key);
+    const { dataPath, metaPath } = cachePaths(key, lobbyCode);
     let removed = false;
 
     try {
@@ -574,7 +629,8 @@ async function evictCacheForMediaUrl(mediaUrl) {
     return {
         removed,
         key,
-        sourceUrl
+        sourceUrl,
+        lobbyCode: resolveCacheScope(lobbyCode)
     };
 }
 
@@ -597,6 +653,40 @@ async function evictCacheForMediaUrls(mediaUrls = []) {
         attempted: results.length,
         removed,
         skipped
+    };
+}
+
+async function deleteLobbyCache(lobbyCode) {
+    const normalized = normalizeLobbyCode(lobbyCode);
+    if (!normalized) {
+        return {
+            removed: false,
+            lobbyCode: null,
+            reason: 'invalid_lobby_code'
+        };
+    }
+
+    const dir = path.join(getCacheDir(), normalized);
+    try {
+        await fs.promises.rm(dir, { recursive: true, force: true });
+    } catch (_err) {
+        return {
+            removed: false,
+            lobbyCode: normalized,
+            reason: 'delete_failed'
+        };
+    }
+
+    const prefix = `${normalized}:`;
+    for (const key of inflightDownloads.keys()) {
+        if (key.startsWith(prefix)) {
+            inflightDownloads.delete(key);
+        }
+    }
+
+    return {
+        removed: true,
+        lobbyCode: normalized
     };
 }
 
@@ -696,5 +786,6 @@ module.exports = {
     prewarmProxyUrl,
     prewarmManifest,
     evictCacheForMediaUrl,
-    evictCacheForMediaUrls
+    evictCacheForMediaUrls,
+    deleteLobbyCache
 };
