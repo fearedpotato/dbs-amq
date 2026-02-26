@@ -8,8 +8,34 @@ const mediaProxyService = require('../game/mediaProxyService');
 const { SOURCE_MODES, SELECTION_MODES, THEME_MODES } = require('../game/constants');
 const { httpError } = require('../game/errors');
 const { createRateLimit } = require('../middleware/rateLimit');
+const telemetry = require('../lib/telemetry');
 
 const router = express.Router();
+
+function parsePositiveInt(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const proxyRateLimitWindowMs = parsePositiveInt(process.env.MEDIA_PROXY_RATE_LIMIT_WINDOW_MS, 60 * 1000);
+const proxyRateLimitMax = parsePositiveInt(process.env.MEDIA_PROXY_RATE_LIMIT_MAX, 60);
+
+const mediaProxyRateLimit = createRateLimit({
+    keyPrefix: 'game:media_proxy',
+    windowMs: proxyRateLimitWindowMs,
+    max: proxyRateLimitMax,
+    keyGenerator: (req) => String(req.ip || 'unknown'),
+    message: 'Too many media requests. Please try again shortly.',
+    onLimit: ({ req, retryAfterSec, bucket, max, windowMs }) => {
+        telemetry.warn('media.proxy_rate_limited', {
+            ip: req.ip,
+            retryAfterSec,
+            count: bucket?.count || null,
+            max,
+            windowMs
+        });
+    }
+});
 
 const joinLobbyRateLimit = createRateLimit({
     keyPrefix: 'game:lobby_join',
@@ -61,7 +87,7 @@ function canAccessLobby(lobby, userId) {
     return (lobby.players || []).some((player) => player.userId === userId);
 }
 
-router.get('/media/proxy', async (req, res) => {
+router.get('/media/proxy', mediaProxyRateLimit, async (req, res) => {
     try {
         if (!mediaProxyService.isEnabled()) {
             throw httpError(503, 'Media proxy is disabled');

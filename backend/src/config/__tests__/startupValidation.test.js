@@ -22,6 +22,9 @@ function baseEnv() {
         MEDIA_PROXY_ENABLED: 'true',
         MEDIA_PROXY_PATH: '/api/game/media/proxy',
         MEDIA_PROXY_ALLOWED_HOSTS: 'cdn.example.com,*.animethemes.moe',
+        MEDIA_PROXY_URL_TTL_SEC: '900',
+        MEDIA_PROXY_RATE_LIMIT_WINDOW_MS: '60000',
+        MEDIA_PROXY_RATE_LIMIT_MAX: '60',
         MEDIA_PROXY_FETCH_TIMEOUT_MS: '20000'
     };
 }

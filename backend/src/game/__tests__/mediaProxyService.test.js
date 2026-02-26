@@ -48,6 +48,10 @@ describe('mediaProxyService', () => {
         expect(proxied).toContain('/api/game/media/proxy?');
 
         const parsed = new URL(`http://localhost${proxied}`);
+        const exp = Number.parseInt(parsed.searchParams.get('exp'), 10);
+        const nowSec = Math.floor(Date.now() / 1000);
+        expect(exp).toBeGreaterThanOrEqual(nowSec + 14 * 60);
+        expect(exp).toBeLessThanOrEqual(nowSec + 16 * 60);
         const verification = parseAndVerifyProxyRequest({
             u: parsed.searchParams.get('u'),
             exp: parsed.searchParams.get('exp'),
@@ -56,6 +60,17 @@ describe('mediaProxyService', () => {
 
         expect(verification.ok).toBe(true);
         expect(verification.sourceUrl).toBe(sourceUrl);
+    });
+
+    test('uses MEDIA_PROXY_URL_TTL_SEC override when building signed URL', () => {
+        process.env.MEDIA_PROXY_URL_TTL_SEC = '30';
+        const sourceUrl = 'https://cdn.example.com/audio.mp3';
+        const proxied = buildMediaProxyUrl(sourceUrl);
+        const parsed = new URL(`http://localhost${proxied}`);
+        const exp = Number.parseInt(parsed.searchParams.get('exp'), 10);
+        const nowSec = Math.floor(Date.now() / 1000);
+        expect(exp).toBeGreaterThanOrEqual(nowSec + 20);
+        expect(exp).toBeLessThanOrEqual(nowSec + 40);
     });
 
     test('downloads and reuses cached media entry', async () => {

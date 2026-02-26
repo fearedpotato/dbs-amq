@@ -8,7 +8,7 @@ const { pipeline } = require('stream/promises');
 const telemetry = require('../lib/telemetry');
 
 const DEFAULT_PROXY_PATH = '/api/game/media/proxy';
-const DEFAULT_URL_TTL_SEC = 24 * 60 * 60;
+const DEFAULT_URL_TTL_SEC = 15 * 60;
 const DEFAULT_CACHE_DIR = path.resolve(__dirname, '../../.cache/media');
 const DEFAULT_FETCH_TIMEOUT_MS = 20_000;
 const DEFAULT_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB

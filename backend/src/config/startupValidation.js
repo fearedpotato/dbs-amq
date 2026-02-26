@@ -129,6 +129,27 @@ function validateStartupEnv({ env = process.env, skipInTest = true } = {}) {
         if (!mediaProxyFetchTimeout) {
             pushIssue(issues, 'MEDIA_PROXY_FETCH_TIMEOUT_MS', 'MEDIA_PROXY_FETCH_TIMEOUT_MS must be a positive integer');
         }
+
+        const mediaProxyUrlTtlSec = parsePositiveInt(env.MEDIA_PROXY_URL_TTL_SEC || 900);
+        if (!mediaProxyUrlTtlSec) {
+            pushIssue(issues, 'MEDIA_PROXY_URL_TTL_SEC', 'MEDIA_PROXY_URL_TTL_SEC must be a positive integer');
+        } else if (mediaProxyUrlTtlSec > 86_400) {
+            pushIssue(issues, 'MEDIA_PROXY_URL_TTL_SEC', 'MEDIA_PROXY_URL_TTL_SEC must be less than or equal to 86400');
+        }
+
+        const mediaProxyRateLimitWindowMs = parsePositiveInt(env.MEDIA_PROXY_RATE_LIMIT_WINDOW_MS || 60_000);
+        if (!mediaProxyRateLimitWindowMs) {
+            pushIssue(issues, 'MEDIA_PROXY_RATE_LIMIT_WINDOW_MS', 'MEDIA_PROXY_RATE_LIMIT_WINDOW_MS must be a positive integer');
+        } else if (mediaProxyRateLimitWindowMs < 1_000 || mediaProxyRateLimitWindowMs > 3_600_000) {
+            pushIssue(issues, 'MEDIA_PROXY_RATE_LIMIT_WINDOW_MS', 'MEDIA_PROXY_RATE_LIMIT_WINDOW_MS must be between 1000 and 3600000');
+        }
+
+        const mediaProxyRateLimitMax = parsePositiveInt(env.MEDIA_PROXY_RATE_LIMIT_MAX || 60);
+        if (!mediaProxyRateLimitMax) {
+            pushIssue(issues, 'MEDIA_PROXY_RATE_LIMIT_MAX', 'MEDIA_PROXY_RATE_LIMIT_MAX must be a positive integer');
+        } else if (mediaProxyRateLimitMax > 10_000) {
+            pushIssue(issues, 'MEDIA_PROXY_RATE_LIMIT_MAX', 'MEDIA_PROXY_RATE_LIMIT_MAX must be less than or equal to 10000');
+        }
     }
 
     if (issues.length > 0) {
@@ -151,7 +172,10 @@ function validateStartupEnv({ env = process.env, skipInTest = true } = {}) {
             'ANIMETHEMES_BASE_URL',
             'ANIMETHEMES_TIMEOUT_MS',
             'MEDIA_PROXY_ENABLED',
-            'MEDIA_PROXY_ALLOWED_HOSTS'
+            'MEDIA_PROXY_ALLOWED_HOSTS',
+            'MEDIA_PROXY_URL_TTL_SEC',
+            'MEDIA_PROXY_RATE_LIMIT_WINDOW_MS',
+            'MEDIA_PROXY_RATE_LIMIT_MAX'
         ]
     });
 
