@@ -6,6 +6,7 @@ const { httpError } = require('../game/errors');
 const { createRoundEngine } = require('./roundEngine');
 const { consumeRateLimitBucket } = require('../lib/rateLimiterStore');
 const mediaProxyService = require('../game/mediaProxyService');
+const telemetry = require('../lib/telemetry');
 
 function parseSocketToken(socket) {
     const authToken = socket.handshake?.auth?.token;
@@ -61,6 +62,10 @@ function attachRealtime(httpServer, options = {}) {
 
         pendingPreloadByLobby.delete(code);
         await roundEngine.beginSession(code);
+        telemetry.info('session.round1_started', {
+            lobbyCode: code,
+            sessionId: pending.sessionId
+        });
         return true;
     }
 
@@ -69,6 +74,7 @@ function attachRealtime(httpServer, options = {}) {
             roundLimit: 1,
             maxConcurrent: 2
         });
+        telemetry.info('media.prewarm_first_round', summary);
 
         if (summary.attempted <= 0) return;
         if (summary.warmed > 0) return;
@@ -96,6 +102,19 @@ function attachRealtime(httpServer, options = {}) {
 
         const emitSocketError = (err, fallbackCode, ack) => {
             const payload = toErrorPayload(err, fallbackCode);
+            if (Number.isInteger(err?.status) && err.status < 500) {
+                telemetry.warn('socket.event_failed', {
+                    fallbackCode,
+                    payload,
+                    userId
+                });
+            } else {
+                telemetry.error('socket.event_failed', err, {
+                    fallbackCode,
+                    payload,
+                    userId
+                });
+            }
             socket.emit('error', payload);
             if (typeof ack === 'function') {
                 ack({ ok: false, error: payload.message, code: payload.code });
@@ -136,6 +155,12 @@ function attachRealtime(httpServer, options = {}) {
                 socket.join(code);
                 socket.data.lobbies.add(code);
                 await broadcastLobbyState(io, code);
+                telemetry.info('lobby.joined', {
+                    lobbyCode: code,
+                    userId,
+                    playerCount: lobby?.playerCount || null,
+                    removedLobbyCount: affectedPreviousLobbies.length
+                });
 
                 if (typeof ack === 'function') ack({ ok: true, lobby });
             } catch (err) {
@@ -166,6 +191,11 @@ function attachRealtime(httpServer, options = {}) {
                         await beginSessionAfterPreload(code);
                     }
                 }
+                telemetry.info('lobby.left', {
+                    lobbyCode: code,
+                    userId,
+                    remainingPlayers: lobby?.playerCount || null
+                });
 
                 if (typeof ack === 'function') ack({ ok: true, lobby });
             } catch (err) {
@@ -181,6 +211,10 @@ function attachRealtime(httpServer, options = {}) {
 
                 const lobby = await lobbyService.updateLobbyConfig(code, userId, payload.settings || {});
                 io.to(code).emit('lobby:state', { lobby });
+                telemetry.info('lobby.settings_updated', {
+                    lobbyCode: code,
+                    userId
+                });
 
                 if (typeof ack === 'function') ack({ ok: true, lobby });
             } catch (err) {
@@ -199,6 +233,11 @@ function attachRealtime(httpServer, options = {}) {
                 if (!lobby.host || lobby.host.id !== userId) {
                     throw httpError(403, 'Only host can start the game');
                 }
+                telemetry.info('session.start_requested', {
+                    lobbyCode: code,
+                    requestedByUserId: userId,
+                    roundCount: lobby.roundCount
+                });
 
                 const session = await sessionService.startSessionFromLobby(lobby);
                 let updatedLobby;
@@ -237,6 +276,12 @@ function attachRealtime(httpServer, options = {}) {
                     lobby: updatedLobby,
                     preloadManifest
                 });
+                telemetry.info('session.started', {
+                    lobbyCode: code,
+                    sessionId: session.id,
+                    players: (updatedLobby?.players || []).length,
+                    preloadManifestCount: preloadManifest.length
+                });
 
                 await beginSessionAfterPreload(code);
 
@@ -244,7 +289,11 @@ function attachRealtime(httpServer, options = {}) {
                     roundLimit: 3,
                     maxConcurrent: 2
                 }).catch((err) => {
-                    console.warn('media prewarm failed:', err?.message || err);
+                    telemetry.warn('media.prewarm_background_failed', {
+                        lobbyCode: code,
+                        sessionId: session.id,
+                        error: err?.message || String(err)
+                    });
                 });
 
                 if (typeof ack === 'function') ack({ ok: true, session });
@@ -282,6 +331,14 @@ function attachRealtime(httpServer, options = {}) {
                 if (allReady) {
                     await beginSessionAfterPreload(code);
                 }
+                telemetry.debug('session.preload_ready_signal', {
+                    lobbyCode: code,
+                    sessionId: pending.sessionId,
+                    userId,
+                    readyCount,
+                    requiredCount,
+                    allReady
+                });
 
                 if (typeof ack === 'function') {
                     ack({
@@ -368,8 +425,17 @@ function attachRealtime(httpServer, options = {}) {
                     await roundEngine.onPlayerDisconnected(code, userId);
                     await lobbyService.setPlayerConnection(code, userId, false);
                     await broadcastLobbyState(io, code);
+                    telemetry.info('lobby.player_disconnected', {
+                        lobbyCode: code,
+                        userId
+                    });
                 } catch (err) {
                     // Ignore disconnect cleanup errors; state will reconcile on reconnect.
+                    telemetry.warn('lobby.disconnect_cleanup_failed', {
+                        lobbyCode: code,
+                        userId,
+                        error: err?.message || String(err)
+                    });
                 }
             }
         });

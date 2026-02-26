@@ -14,8 +14,17 @@ jest.mock('../../game/roundService', () => ({
     getScoresForSession: jest.fn(),
     finishSession: jest.fn()
 }));
+jest.mock('../../game/mediaProxyService', () => ({
+    buildMediaProxyUrl: jest.fn((url) => url),
+    evictCacheForMediaUrls: jest.fn().mockResolvedValue({
+        attempted: 0,
+        removed: 0,
+        skipped: 0
+    })
+}));
 
 const roundService = require('../../game/roundService');
+const mediaProxyService = require('../../game/mediaProxyService');
 const { createRoundEngine } = require('../roundEngine');
 
 function createIoStub() {
@@ -196,5 +205,6 @@ describe('round engine', () => {
         const finished = io.events.find((event) => event.event === 'game:finished');
         expect(finished).toBeTruthy();
         expect(roundService.finishSession).toHaveBeenCalled();
+        expect(mediaProxyService.evictCacheForMediaUrls).toHaveBeenCalled();
     });
 });

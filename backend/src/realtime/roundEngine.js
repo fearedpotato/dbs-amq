@@ -1,6 +1,10 @@
 const roundService = require('../game/roundService');
 const { httpError } = require('../game/errors');
-const { buildMediaProxyUrl } = require('../game/mediaProxyService');
+const {
+    buildMediaProxyUrl,
+    evictCacheForMediaUrls
+} = require('../game/mediaProxyService');
+const telemetry = require('../lib/telemetry');
 
 const MAX_SUDDEN_DEATH_ROUNDS = 20;
 
@@ -65,10 +69,24 @@ function createRoundEngine(io) {
                 videoUrl: buildMediaProxyUrl(state.currentRound.solutionVideoUrl) || null
             }
         });
+        telemetry.info('round.started', {
+            lobbyCode: state.lobbyCode,
+            sessionId: state.sessionId,
+            roundId: state.currentRound.id,
+            index: state.currentRound.index,
+            totalRounds: state.baseRoundCount,
+            isSuddenDeath: state.currentRound.index > state.baseRoundCount
+        });
 
         state.timers.guess = setTimeout(() => {
             transitionToAnswersReveal(state.lobbyCode, 'timeout').catch((err) => {
-                console.error('round transition error (guess->answers):', err);
+                telemetry.error('round.transition_failed', err, {
+                    from: 'GUESSING',
+                    to: 'ANSWERS_REVEAL',
+                    lobbyCode: state.lobbyCode,
+                    sessionId: state.sessionId,
+                    roundId: state.currentRound?.id || null
+                });
             });
         }, state.config.guessSeconds * 1000);
     }
@@ -104,10 +122,22 @@ function createRoundEngine(io) {
             scores,
             endsAt
         });
+        telemetry.info('round.solution_reveal', {
+            lobbyCode: state.lobbyCode,
+            sessionId: state.sessionId,
+            roundId: state.currentRound.id,
+            index: state.currentRound.index
+        });
 
         state.timers.solution = setTimeout(() => {
             finalizeRound(state.lobbyCode).catch((err) => {
-                console.error('round transition error (solution->finalize):', err);
+                telemetry.error('round.transition_failed', err, {
+                    from: 'SOLUTION_REVEAL',
+                    to: 'ROUND_END',
+                    lobbyCode: state.lobbyCode,
+                    sessionId: state.sessionId,
+                    roundId: state.currentRound?.id || null
+                });
             });
         }, state.config.solutionRevealSeconds * 1000);
     }
@@ -139,10 +169,23 @@ function createRoundEngine(io) {
             reason,
             endsAt
         });
+        telemetry.info('round.answers_reveal', {
+            lobbyCode,
+            sessionId: state.sessionId,
+            roundId: state.currentRound.id,
+            index: state.currentRound.index,
+            reason
+        });
 
         state.timers.answers = setTimeout(() => {
             emitSolution(state).catch((err) => {
-                console.error('round transition error (answers->solution):', err);
+                telemetry.error('round.transition_failed', err, {
+                    from: 'ANSWERS_REVEAL',
+                    to: 'SOLUTION_REVEAL',
+                    lobbyCode,
+                    sessionId: state.sessionId,
+                    roundId: state.currentRound?.id || null
+                });
             });
         }, state.config.answersRevealSeconds * 1000);
     }
@@ -195,6 +238,13 @@ function createRoundEngine(io) {
             winner,
             suddenDeathRounds: state.suddenDeathRounds
         });
+        telemetry.info('session.finished', {
+            lobbyCode,
+            sessionId: state.sessionId,
+            suddenDeathRounds: state.suddenDeathRounds,
+            winnerUserId: winner?.userId || null,
+            winnerScore: winner?.score || null
+        });
 
         stateByLobby.delete(lobbyCode);
     }
@@ -212,6 +262,28 @@ function createRoundEngine(io) {
         );
         if (!transitioned) return;
 
+        const completedRound = state.currentRound;
+        evictCacheForMediaUrls([
+            completedRound?.solutionAudioUrl,
+            completedRound?.solutionVideoUrl
+        ]).then((summary) => {
+            telemetry.info('media.cache_evicted_after_round', {
+                lobbyCode,
+                sessionId: state.sessionId,
+                roundId: completedRound?.id || null,
+                index: completedRound?.index || null,
+                ...summary
+            });
+        }).catch((err) => {
+            telemetry.warn('media.cache_evict_failed', {
+                lobbyCode,
+                sessionId: state.sessionId,
+                roundId: completedRound?.id || null,
+                index: completedRound?.index || null,
+                error: err?.message || String(err)
+            });
+        });
+
         const scores = await roundService.getScoresForSession({
             sessionId: state.sessionId,
             lobbyPlayers: state.players
@@ -219,6 +291,13 @@ function createRoundEngine(io) {
 
         const isPlannedRoundsComplete = state.currentRound.index >= state.baseRoundCount;
         if (!isPlannedRoundsComplete) {
+            telemetry.info('round.completed', {
+                lobbyCode,
+                sessionId: state.sessionId,
+                roundId: state.currentRound.id,
+                index: state.currentRound.index,
+                nextRoundIndex: state.currentRound.index + 1
+            });
             return startRound(lobbyCode, state.currentRound.index + 1);
         }
 
@@ -234,6 +313,12 @@ function createRoundEngine(io) {
         }
 
         state.suddenDeathRounds += 1;
+        telemetry.info('session.sudden_death_started', {
+            lobbyCode,
+            sessionId: state.sessionId,
+            nextRoundIndex: state.currentRound.index + 1,
+            tiedUserIds: tied.map((item) => item.userId)
+        });
         io.to(lobbyCode).emit('game:sudden_death', {
             roundIndex: state.currentRound.index + 1,
             tiedUserIds: tied.map((item) => item.userId)
@@ -250,6 +335,12 @@ function createRoundEngine(io) {
         });
 
         stateByLobby.set(code, buildState(code, session, lobby.players));
+        telemetry.info('session.engine_state_created', {
+            lobbyCode: code,
+            sessionId: session.id,
+            players: (lobby.players || []).length,
+            deferFirstRound
+        });
 
         if (deferFirstRound) {
             return;
@@ -263,6 +354,10 @@ function createRoundEngine(io) {
         const state = stateByLobby.get(code);
         if (!state) return;
         if (state.currentRound) return;
+        telemetry.info('session.begin_requested', {
+            lobbyCode: code,
+            sessionId: state.sessionId
+        });
         await startRound(code, 1);
     }
 
@@ -444,6 +539,15 @@ function createRoundEngine(io) {
         if (allReady) {
             await transitionToAnswersReveal(code, 'all_ready');
         }
+        telemetry.debug('round.ready_state_changed', {
+            lobbyCode: code,
+            sessionId: state.sessionId,
+            roundId: state.currentRound.id,
+            userId,
+            ready: isReady,
+            readyCount: readyUserIds.length,
+            allReady
+        });
 
         return {
             roundId: state.currentRound.id,
@@ -475,7 +579,13 @@ function createRoundEngine(io) {
                 } else if (!state.timers.guess) {
                     state.timers.guess = setTimeout(() => {
                         transitionToAnswersReveal(lobbyCode, 'timeout').catch((err) => {
-                            console.error('round transition error (recovered guess->answers):', err);
+                            telemetry.error('round.recovery_transition_failed', err, {
+                                from: 'GUESSING',
+                                to: 'ANSWERS_REVEAL',
+                                lobbyCode,
+                                sessionId: state.sessionId,
+                                roundId: state.currentRound?.id || null
+                            });
                         });
                     }, ms);
                 }
@@ -488,7 +598,13 @@ function createRoundEngine(io) {
                 } else if (!state.timers.answers) {
                     state.timers.answers = setTimeout(() => {
                         emitSolution(state).catch((err) => {
-                            console.error('round transition error (recovered answers->solution):', err);
+                            telemetry.error('round.recovery_transition_failed', err, {
+                                from: 'ANSWERS_REVEAL',
+                                to: 'SOLUTION_REVEAL',
+                                lobbyCode,
+                                sessionId: state.sessionId,
+                                roundId: state.currentRound?.id || null
+                            });
                         });
                     }, ms);
                 }
@@ -501,7 +617,13 @@ function createRoundEngine(io) {
                 } else if (!state.timers.solution) {
                     state.timers.solution = setTimeout(() => {
                         finalizeRound(lobbyCode).catch((err) => {
-                            console.error('round transition error (recovered solution->finalize):', err);
+                            telemetry.error('round.recovery_transition_failed', err, {
+                                from: 'SOLUTION_REVEAL',
+                                to: 'ROUND_END',
+                                lobbyCode,
+                                sessionId: state.sessionId,
+                                roundId: state.currentRound?.id || null
+                            });
                         });
                     }, ms);
                 }
@@ -536,7 +658,7 @@ function createRoundEngine(io) {
 
     const recoveryInterval = setInterval(() => {
         recoverActiveSessions().catch((err) => {
-            console.error('round recovery sweep failed:', err);
+            telemetry.error('round.recovery_sweep_failed', err);
         });
     }, 1_500);
     if (typeof recoveryInterval.unref === 'function') recoveryInterval.unref();

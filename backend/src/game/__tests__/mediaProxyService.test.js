@@ -12,7 +12,8 @@ const {
     buildMediaProxyUrl,
     parseAndVerifyProxyRequest,
     getOrCreateCacheEntry,
-    prewarmManifest
+    prewarmManifest,
+    evictCacheForMediaUrl
 } = require('../mediaProxyService');
 
 describe('mediaProxyService', () => {
@@ -93,5 +94,23 @@ describe('mediaProxyService', () => {
         expect(summary.warmed).toBe(3);
         expect(summary.failed).toBe(0);
         expect(axios.get).toHaveBeenCalledTimes(3);
+    });
+
+    test('evicts cached media by proxy URL', async () => {
+        const payload = Buffer.from('demo-media-payload');
+        axios.get.mockResolvedValue({
+            headers: { 'content-type': 'audio/mpeg' },
+            data: Readable.from(payload)
+        });
+
+        const sourceUrl = 'https://cdn.example.com/to-evict.mp3';
+        const proxied = buildMediaProxyUrl(sourceUrl);
+        const created = await getOrCreateCacheEntry(sourceUrl);
+        expect(created.cacheStatus).toBe('MISS');
+        expect(fs.existsSync(created.dataPath)).toBe(true);
+
+        const eviction = await evictCacheForMediaUrl(proxied);
+        expect(eviction.removed).toBe(true);
+        expect(fs.existsSync(created.dataPath)).toBe(false);
     });
 });

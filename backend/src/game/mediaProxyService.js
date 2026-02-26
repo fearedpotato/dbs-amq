@@ -145,6 +145,15 @@ function cachePaths(cacheKey) {
     };
 }
 
+function isHttpSourceUrl(value) {
+    try {
+        const parsed = new URL(String(value || '').trim());
+        return ['http:', 'https:'].includes(parsed.protocol);
+    } catch (_err) {
+        return false;
+    }
+}
+
 async function ensureCacheDir() {
     await fs.promises.mkdir(getCacheDir(), { recursive: true });
 }
@@ -336,6 +345,30 @@ function parseProxyUrlToQuery(proxyUrl) {
     }
 }
 
+function decodeSourceFromProxyQuery(query = {}) {
+    const encodedUrl = typeof query.u === 'string' ? query.u.trim() : '';
+    if (!encodedUrl) return null;
+    try {
+        const decoded = base64UrlDecode(encodedUrl);
+        return isHttpSourceUrl(decoded) ? decoded : null;
+    } catch (_err) {
+        return null;
+    }
+}
+
+function resolveCacheSourceUrl(mediaUrl) {
+    const raw = typeof mediaUrl === 'string' ? mediaUrl.trim() : '';
+    if (!raw) return null;
+
+    const proxyQuery = parseProxyUrlToQuery(raw);
+    if (proxyQuery) {
+        return decodeSourceFromProxyQuery(proxyQuery);
+    }
+
+    if (!isHttpSourceUrl(raw)) return null;
+    return raw;
+}
+
 async function prewarmProxyUrl(proxyUrl) {
     let sourceUrl = null;
     const query = parseProxyUrlToQuery(proxyUrl);
@@ -346,15 +379,7 @@ async function prewarmProxyUrl(proxyUrl) {
         }
         sourceUrl = parsed.sourceUrl;
     } else {
-        try {
-            const parsed = new URL(String(proxyUrl || '').trim());
-            if (!['http:', 'https:'].includes(parsed.protocol)) {
-                return { ok: false, reason: 'not_proxy_url' };
-            }
-            sourceUrl = parsed.toString();
-        } catch (_err) {
-            return { ok: false, reason: 'not_proxy_url' };
-        }
+        sourceUrl = resolveCacheSourceUrl(proxyUrl);
     }
 
     if (!sourceUrl) {
@@ -366,6 +391,62 @@ async function prewarmProxyUrl(proxyUrl) {
         ok: true,
         cacheStatus: entry.cacheStatus,
         key: entry.key
+    };
+}
+
+async function evictCacheForMediaUrl(mediaUrl) {
+    const sourceUrl = resolveCacheSourceUrl(mediaUrl);
+    if (!sourceUrl) {
+        return {
+            removed: false,
+            reason: 'unsupported_url'
+        };
+    }
+
+    const key = cacheKeyForUrl(sourceUrl);
+    const { dataPath, metaPath } = cachePaths(key);
+    let removed = false;
+
+    try {
+        await fs.promises.unlink(dataPath);
+        removed = true;
+    } catch (_err) {
+        // Ignore missing files.
+    }
+
+    try {
+        await fs.promises.unlink(metaPath);
+        removed = true;
+    } catch (_err) {
+        // Ignore missing files.
+    }
+
+    return {
+        removed,
+        key,
+        sourceUrl
+    };
+}
+
+async function evictCacheForMediaUrls(mediaUrls = []) {
+    const urls = [...new Set((Array.isArray(mediaUrls) ? mediaUrls : [])
+        .filter((value) => typeof value === 'string' && value.trim().length > 0))];
+    if (urls.length === 0) {
+        return {
+            attempted: 0,
+            removed: 0,
+            skipped: 0
+        };
+    }
+
+    const results = await Promise.all(urls.map((url) => evictCacheForMediaUrl(url)));
+    const removed = results.filter((item) => item.removed).length;
+    const skipped = results.filter((item) => !item.removed).length;
+
+    return {
+        attempted: results.length,
+        removed,
+        skipped
     };
 }
 
@@ -463,5 +544,7 @@ module.exports = {
     getOrCreateCacheEntry,
     streamCachedMedia,
     prewarmProxyUrl,
-    prewarmManifest
+    prewarmManifest,
+    evictCacheForMediaUrl,
+    evictCacheForMediaUrls
 };
