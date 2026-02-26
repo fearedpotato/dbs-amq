@@ -356,6 +356,16 @@ jest.mock('../../game/roundService', () => {
                 .sort((a, b) => b.index - a.index)[0];
             return active ? clone(active) : null;
         }),
+        listRoundMediaForSession: jest.fn(async (sessionId) => {
+            const store = (roundsBySessionId.get(sessionId) || []).slice().sort((a, b) => a.index - b.index);
+            return store.map((round) => ({
+                index: round.index,
+                sampleStartSec: round.sampleStartSec,
+                sampleDurationSec: round.sampleDurationSec,
+                audioUrl: round.solutionAudioUrl || null,
+                videoUrl: round.solutionVideoUrl || null
+            }));
+        }),
         listActiveRounds: jest.fn(async () => {
             const rows = [];
             for (const [sessionId, rounds] of roundsBySessionId) {
@@ -476,6 +486,26 @@ jest.mock('../../game/roundService', () => {
         getGuessesForRound: jest.fn(async (roundId) => listGuesses(roundId).map(clone))
     };
 });
+jest.mock('../../game/mediaProxyService', () => ({
+    buildMediaProxyUrl: jest.fn((url) => url),
+    prewarmManifest: jest.fn(async (_manifest, options = {}) => {
+        const roundLimit = Number.parseInt(options?.roundLimit, 10) || 3;
+        if (roundLimit <= 1) {
+            return {
+                attempted: 1,
+                warmed: 1,
+                failed: 0,
+                skipped: 0
+            };
+        }
+        return {
+            attempted: 2,
+            warmed: 2,
+            failed: 0,
+            skipped: 0
+        };
+    })
+}));
 
 const lobbyService = require('../../game/lobbyService');
 const sessionService = require('../../game/sessionService');
@@ -571,6 +601,7 @@ describe('socket integration', () => {
         expect((await emitWithAck(host, 'lobby:join', { lobbyCode: 'MATCH1' })).ok).toBe(true);
         expect((await emitWithAck(guest, 'lobby:join', { lobbyCode: 'MATCH1' })).ok).toBe(true);
 
+        const gameStartedPromise = waitForEvent(host, 'game:started');
         const startedPromise = waitForEvent(host, 'round:started');
         const answersPromise = waitForEvent(host, 'round:answers_reveal');
         const solutionPromise = waitForEvent(host, 'round:solution');
@@ -578,6 +609,13 @@ describe('socket integration', () => {
 
         const startAck = await emitWithAck(host, 'game:start', { lobbyCode: 'MATCH1' });
         expect(startAck.ok).toBe(true);
+
+        const gameStarted = await gameStartedPromise;
+        expect(Array.isArray(gameStarted.preloadManifest)).toBe(true);
+        expect(gameStarted.preloadManifest.length).toBe(1);
+        expect(gameStarted.preloadManifest[0]).toMatchObject({
+            index: 1
+        });
 
         const started = await startedPromise;
         expect(started.roundId).toBeTruthy();
@@ -736,7 +774,8 @@ describe('socket integration', () => {
         expect((await emitWithAck(host, 'lobby:join', { lobbyCode: 'RECON1' })).ok).toBe(true);
 
         const startedPromise = waitForEvent(host, 'round:started');
-        expect((await emitWithAck(host, 'game:start', { lobbyCode: 'RECON1' })).ok).toBe(true);
+        const startAck = await emitWithAck(host, 'game:start', { lobbyCode: 'RECON1' });
+        expect(startAck.ok).toBe(true);
         const started = await startedPromise;
 
         host.disconnect();
@@ -755,5 +794,39 @@ describe('socket integration', () => {
         const readyAck = await emitWithAck(reconnect, 'round:set_ready', { lobbyCode: 'RECON1', ready: true });
         expect(readyAck.ok).toBe(true);
         await finishedPromise;
+    });
+
+    test('starts first round without waiting for preload ready ack', async () => {
+        lobbyService.__seedLobby({
+            code: 'PRELOAD1',
+            hostUserId: 1,
+            players: [
+                { userId: 1, displayName: 'Host' },
+                { userId: 2, displayName: 'Guest' }
+            ],
+            roundCount: 1,
+            guessSeconds: 1,
+            answersRevealSeconds: 0.1,
+            solutionRevealSeconds: 0.1
+        });
+
+        const host = await connectClient({ userId: 1, username: 'host' });
+        const guest = await connectClient({ userId: 2, username: 'guest' });
+        expect((await emitWithAck(host, 'lobby:join', { lobbyCode: 'PRELOAD1' })).ok).toBe(true);
+        expect((await emitWithAck(guest, 'lobby:join', { lobbyCode: 'PRELOAD1' })).ok).toBe(true);
+
+        const startedPromise = waitForEvent(host, 'round:started');
+        expect((await emitWithAck(host, 'game:start', { lobbyCode: 'PRELOAD1' })).ok).toBe(true);
+
+        const started = await startedPromise;
+        expect(started.roundId).toBeTruthy();
+
+        const syncAck = await emitWithAck(host, 'round:sync', { lobbyCode: 'PRELOAD1' });
+        expect(syncAck.ok).toBe(true);
+        expect(['GUESSING', 'ANSWERS_REVEAL', 'SOLUTION_REVEAL']).toContain(syncAck.state.phase);
+
+        const preloadAck = await emitWithAck(host, 'game:preload_ready', { lobbyCode: 'PRELOAD1' });
+        expect(preloadAck.ok).toBe(true);
+        expect(preloadAck.started).toBe(true);
     });
 });

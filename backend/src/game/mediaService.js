@@ -6,9 +6,15 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_CACHE_MAX_ENTRIES = 400;
 const DEFAULT_BLACKLIST_TTL_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_PROVIDER_STATUS_CACHE_MS = 15_000;
+const PROVIDER_PROBE_TIMEOUT_CAP_MS = 5_000;
 
 const animeCache = new Map();
 const unplayableBlacklist = new Map();
+const providerStatusCache = {
+    value: null,
+    expiresAt: 0
+};
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
@@ -33,6 +39,14 @@ function getCacheMaxEntries() {
 
 function getBlacklistTtlMs() {
     return parsePositiveInt(process.env.ANIMETHEMES_BLACKLIST_TTL_MS, DEFAULT_BLACKLIST_TTL_MS);
+}
+
+function getProviderStatusCacheMs() {
+    return parsePositiveInt(process.env.ANIMETHEMES_STATUS_CACHE_MS, DEFAULT_PROVIDER_STATUS_CACHE_MS);
+}
+
+function getProbeTimeoutMs() {
+    return Math.max(500, Math.min(getTimeoutMs(), PROVIDER_PROBE_TIMEOUT_CAP_MS));
 }
 
 function sanitizeTitle(value, fallback = null) {
@@ -336,9 +350,88 @@ async function resolveRoundMedia({ animeId, animeTitle, themeMode = 'MIXED', sam
 function __clearMediaCache() {
     animeCache.clear();
     unplayableBlacklist.clear();
+    providerStatusCache.value = null;
+    providerStatusCache.expiresAt = 0;
+}
+
+async function probeMediaProvider() {
+    const startedAt = Date.now();
+    const baseUrl = getBaseUrl();
+    const timeoutMs = getProbeTimeoutMs();
+
+    try {
+        const response = await axios.get(`${baseUrl}/anime`, {
+            timeout: timeoutMs,
+            params: {
+                'page[size]': 1
+            }
+        });
+
+        return {
+            provider: 'AnimeThemes',
+            baseUrl,
+            timeoutMs,
+            ok: true,
+            statusCode: Number.isInteger(response?.status) ? response.status : 200,
+            latencyMs: Math.max(0, Date.now() - startedAt),
+            error: null,
+            checkedAt: new Date().toISOString(),
+            cache: {
+                animeEntries: animeCache.size,
+                blacklistEntries: unplayableBlacklist.size
+            }
+        };
+    } catch (err) {
+        const statusCode = Number.parseInt(err?.response?.status, 10);
+        const timedOut = err?.code === 'ECONNABORTED';
+        const message = timedOut
+            ? `Timed out after ${timeoutMs}ms`
+            : sanitizeTitle(err?.response?.statusText, sanitizeTitle(err?.message, 'Request failed'));
+
+        return {
+            provider: 'AnimeThemes',
+            baseUrl,
+            timeoutMs,
+            ok: false,
+            statusCode: Number.isInteger(statusCode) ? statusCode : null,
+            latencyMs: Math.max(0, Date.now() - startedAt),
+            error: message,
+            checkedAt: new Date().toISOString(),
+            cache: {
+                animeEntries: animeCache.size,
+                blacklistEntries: unplayableBlacklist.size
+            }
+        };
+    }
+}
+
+async function getMediaProviderStatus({ forceRefresh = false } = {}) {
+    const now = Date.now();
+    const ttlMs = getProviderStatusCacheMs();
+
+    if (!forceRefresh && providerStatusCache.value && now < providerStatusCache.expiresAt) {
+        return {
+            ...providerStatusCache.value,
+            cached: true,
+            cache: {
+                animeEntries: animeCache.size,
+                blacklistEntries: unplayableBlacklist.size
+            }
+        };
+    }
+
+    const status = await probeMediaProvider();
+    providerStatusCache.value = status;
+    providerStatusCache.expiresAt = now + ttlMs;
+
+    return {
+        ...status,
+        cached: false
+    };
 }
 
 module.exports = {
     resolveRoundMedia,
+    getMediaProviderStatus,
     __clearMediaCache
 };

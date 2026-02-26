@@ -3,6 +3,8 @@ const authMiddleware = require('../middleware/auth');
 const prisma = require('../lib/prisma');
 const lobbyService = require('../game/lobbyService');
 const searchService = require('../game/searchService');
+const mediaService = require('../game/mediaService');
+const mediaProxyService = require('../game/mediaProxyService');
 const { SOURCE_MODES, SELECTION_MODES, THEME_MODES } = require('../game/constants');
 const { httpError } = require('../game/errors');
 const { createRateLimit } = require('../middleware/rateLimit');
@@ -58,6 +60,30 @@ function canAccessLobby(lobby, userId) {
     if (lobby.host?.id === userId) return true;
     return (lobby.players || []).some((player) => player.userId === userId);
 }
+
+router.get('/media/proxy', async (req, res) => {
+    try {
+        if (!mediaProxyService.isEnabled()) {
+            throw httpError(503, 'Media proxy is disabled');
+        }
+
+        const parsed = mediaProxyService.parseAndVerifyProxyRequest(req.query);
+        if (!parsed.ok) {
+            throw httpError(parsed.status, parsed.error);
+        }
+
+        let entry;
+        try {
+            entry = await mediaProxyService.getOrCreateCacheEntry(parsed.sourceUrl);
+        } catch (_err) {
+            throw httpError(502, 'Could not fetch media from upstream provider');
+        }
+        await mediaProxyService.streamCachedMedia(req, res, entry);
+    } catch (err) {
+        if (res.headersSent) return;
+        return handleError(res, err);
+    }
+});
 
 router.post('/lobbies', authMiddleware, async (req, res) => {
     try {
@@ -173,6 +199,18 @@ router.post('/search', authMiddleware, searchRateLimit, async (req, res) => {
 
         const data = await searchService.searchAnime(query, { limit: Math.max(1, Math.min(limit, 20)) });
         return res.json(data);
+    } catch (err) {
+        return handleError(res, err);
+    }
+});
+
+router.get('/media-source-status', authMiddleware, async (req, res) => {
+    try {
+        await getCurrentUserFromToken(req);
+        const refreshRaw = String(req.query?.refresh || '').toLowerCase();
+        const forceRefresh = refreshRaw === '1' || refreshRaw === 'true';
+        const status = await mediaService.getMediaProviderStatus({ forceRefresh });
+        return res.json({ status });
     } catch (err) {
         return handleError(res, err);
     }

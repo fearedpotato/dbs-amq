@@ -3,7 +3,7 @@ jest.mock('axios', () => ({
 }));
 
 const axios = require('axios');
-const { resolveRoundMedia, __clearMediaCache } = require('../mediaService');
+const { resolveRoundMedia, getMediaProviderStatus, __clearMediaCache } = require('../mediaService');
 
 function buildAnimePayload() {
     return {
@@ -205,5 +205,40 @@ describe('mediaService.resolveRoundMedia', () => {
 
         expect(media.sampleDurationSec).toBe(15);
         expect(media.sampleStartSec).toBe(0);
+    });
+
+    test('returns provider status and reuses cached probe result', async () => {
+        axios.get.mockResolvedValue({
+            status: 200,
+            data: {
+                anime: []
+            }
+        });
+
+        const first = await getMediaProviderStatus();
+        const second = await getMediaProviderStatus();
+
+        expect(first).toMatchObject({
+            provider: 'AnimeThemes',
+            ok: true,
+            statusCode: 200,
+            cached: false
+        });
+        expect(second.cached).toBe(true);
+        expect(axios.get).toHaveBeenCalledTimes(1);
+    });
+
+    test('marks provider status as down on timeout', async () => {
+        axios.get.mockRejectedValue({
+            code: 'ECONNABORTED',
+            message: 'timeout exceeded'
+        });
+
+        const status = await getMediaProviderStatus({ forceRefresh: true });
+
+        expect(status.ok).toBe(false);
+        expect(status.error).toContain('Timed out');
+        expect(status.cached).toBe(false);
+        expect(status.statusCode).toBeNull();
     });
 });

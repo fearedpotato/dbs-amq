@@ -5,6 +5,9 @@ import { closeGameSocket, getGameSocket } from './socketClient';
 const SOURCE_MODES = ['POPULAR', 'MAL_ONLY', 'HYBRID'];
 const SELECTION_MODES = ['STANDARD', 'BALANCED_STRICT', 'BALANCED_RELAXED'];
 const THEME_MODES = ['OP_ONLY', 'ED_ONLY', 'MIXED'];
+const INITIAL_REQUIRED_ROUNDS = 2;
+const PRELOAD_WINDOW_ROUNDS = 3; // current round + next 2
+const MAX_CONCURRENT_PRELOADS = 2;
 
 const CREATE_DEFAULTS = {
     name: '',
@@ -60,6 +63,20 @@ function formatCountdown(ms) {
 
 function byScoreDesc(a, b) {
     return (b.score || 0) - (a.score || 0);
+}
+
+function normalizePreloadManifest(rawManifest) {
+    if (!Array.isArray(rawManifest)) return [];
+    return rawManifest
+        .map((row) => ({
+            index: Number.parseInt(row?.index, 10),
+            audioUrl: typeof row?.audioUrl === 'string' ? row.audioUrl : null,
+            videoUrl: typeof row?.videoUrl === 'string' ? row.videoUrl : null,
+            sampleStartSec: Number.isFinite(row?.sampleStartSec) ? row.sampleStartSec : 0,
+            sampleDurationSec: Number.isFinite(row?.sampleDurationSec) ? row.sampleDurationSec : 0
+        }))
+        .filter((row) => Number.isInteger(row.index) && row.index > 0)
+        .sort((a, b) => a.index - b.index);
 }
 
 function normalizeErrorMessage(message) {
@@ -143,6 +160,20 @@ export default function App() {
     const sampleStopTimerRef = useRef(null);
     const sampleVolumeRef = useRef(0.8);
     const sampleResolvedStartSecRef = useRef(null);
+    const preloadManifestByIndexRef = useRef(new Map());
+    const preloadRoundStatusRef = useRef(new Map());
+    const preloadRoundPromiseRef = useRef(new Map());
+    const preloadRoundUrlsRef = useRef(new Map());
+    const preloadUrlStatusRef = useRef(new Map());
+    const preloadUrlPromiseRef = useRef(new Map());
+    const preloadElementsByUrlRef = useRef(new Map());
+    const preloadQueueRef = useRef([]);
+    const preloadQueuedSetRef = useRef(new Set());
+    const preloadInFlightRef = useRef(0);
+    const preloadRequiredRoundIndexesRef = useRef([]);
+    const preloadDestroyedRef = useRef(false);
+    const preloadSessionIdRef = useRef(null);
+    const preloadReadySentRef = useRef(false);
 
     const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState('');
@@ -181,6 +212,13 @@ export default function App() {
     const [searchError, setSearchError] = useState('');
     const [mediaError, setMediaError] = useState('');
     const [solutionMediaError, setSolutionMediaError] = useState('');
+    const [preloadBlocking, setPreloadBlocking] = useState(false);
+    const [preloadProgress, setPreloadProgress] = useState({ ready: 0, failed: 0, total: 0 });
+    const [preloadGateError, setPreloadGateError] = useState('');
+    const [preloadRetrying, setPreloadRetrying] = useState(false);
+    const [mediaSourceStatus, setMediaSourceStatus] = useState(null);
+    const [mediaSourceLoading, setMediaSourceLoading] = useState(false);
+    const [mediaSourceError, setMediaSourceError] = useState('');
 
     useEffect(() => {
         lobbyRef.current = lobby;
@@ -228,6 +266,397 @@ export default function App() {
             // Ignore seek failures for not-yet-ready media.
         }
     }, []);
+
+    const updatePreloadProgress = useCallback(() => {
+        const required = preloadRequiredRoundIndexesRef.current;
+        if (!Array.isArray(required) || required.length === 0) {
+            setPreloadProgress({ ready: 0, failed: 0, total: 0 });
+            return;
+        }
+
+        let ready = 0;
+        let failed = 0;
+        for (const index of required) {
+            const status = preloadRoundStatusRef.current.get(index);
+            if (status === 'ready') ready += 1;
+            else if (status === 'failed') failed += 1;
+        }
+        setPreloadProgress({ ready, failed, total: required.length });
+    }, []);
+
+    const cleanupPreloadedElements = useCallback((keepUrls = null) => {
+        const keepSet = keepUrls instanceof Set ? keepUrls : null;
+        const toRemove = [];
+        for (const [url] of preloadElementsByUrlRef.current) {
+            if (keepSet && keepSet.has(url)) continue;
+            toRemove.push(url);
+        }
+
+        for (const url of toRemove) {
+            const element = preloadElementsByUrlRef.current.get(url);
+            if (element) {
+                try {
+                    element.pause?.();
+                    element.removeAttribute('src');
+                    element.load?.();
+                } catch (_err) {
+                    // Ignore cleanup errors from detached media.
+                }
+                if (element.parentNode) {
+                    element.parentNode.removeChild(element);
+                }
+            }
+            preloadElementsByUrlRef.current.delete(url);
+            preloadUrlPromiseRef.current.delete(url);
+            preloadUrlStatusRef.current.delete(url);
+        }
+    }, []);
+
+    const resetPreloadManager = useCallback(() => {
+        preloadDestroyedRef.current = true;
+        preloadManifestByIndexRef.current.clear();
+        preloadRoundStatusRef.current.clear();
+        preloadRoundPromiseRef.current.clear();
+        preloadRoundUrlsRef.current.clear();
+        preloadQueueRef.current = [];
+        preloadQueuedSetRef.current.clear();
+        preloadInFlightRef.current = 0;
+        preloadRequiredRoundIndexesRef.current = [];
+        preloadSessionIdRef.current = null;
+        preloadReadySentRef.current = false;
+        cleanupPreloadedElements();
+        setPreloadBlocking(false);
+        setPreloadProgress({ ready: 0, failed: 0, total: 0 });
+        setPreloadGateError('');
+        setPreloadRetrying(false);
+    }, [cleanupPreloadedElements]);
+
+    const preloadSingleUrl = useCallback((url, mediaKind = 'video') => {
+        const source = typeof url === 'string' ? url.trim() : '';
+        if (!source) {
+            return Promise.reject(new Error('Missing media url'));
+        }
+
+        const cachedStatus = preloadUrlStatusRef.current.get(source);
+        if (cachedStatus === 'ready') {
+            return Promise.resolve(true);
+        }
+
+        const inFlightPromise = preloadUrlPromiseRef.current.get(source);
+        if (cachedStatus === 'loading' && inFlightPromise) {
+            return inFlightPromise;
+        }
+
+        preloadUrlStatusRef.current.set(source, 'loading');
+        const promise = new Promise((resolve, reject) => {
+            if (preloadDestroyedRef.current) {
+                preloadUrlStatusRef.current.set(source, 'failed');
+                reject(new Error('Preload manager was reset'));
+                return;
+            }
+
+            const mediaEl = document.createElement(mediaKind === 'audio' ? 'audio' : 'video');
+            mediaEl.preload = 'auto';
+            mediaEl.muted = true;
+            mediaEl.playsInline = true;
+            mediaEl.style.position = 'absolute';
+            mediaEl.style.left = '-10000px';
+            mediaEl.style.width = '1px';
+            mediaEl.style.height = '1px';
+            mediaEl.style.opacity = '0';
+
+            const finish = (ok) => {
+                cleanup();
+                if (ok) {
+                    preloadUrlStatusRef.current.set(source, 'ready');
+                    preloadElementsByUrlRef.current.set(source, mediaEl);
+                    resolve(true);
+                    return;
+                }
+
+                preloadUrlStatusRef.current.set(source, 'failed');
+                preloadElementsByUrlRef.current.delete(source);
+                if (mediaEl.parentNode) {
+                    mediaEl.parentNode.removeChild(mediaEl);
+                }
+                reject(new Error('Media preload failed'));
+            };
+
+            const cleanup = () => {
+                window.clearTimeout(timeoutId);
+                mediaEl.removeEventListener('loadeddata', onLoaded);
+                mediaEl.removeEventListener('canplaythrough', onLoaded);
+                mediaEl.removeEventListener('error', onError);
+            };
+
+            const onLoaded = () => finish(true);
+            const onError = () => finish(false);
+
+            const timeoutId = window.setTimeout(() => finish(false), 12_000);
+            mediaEl.addEventListener('loadeddata', onLoaded, { once: true });
+            mediaEl.addEventListener('canplaythrough', onLoaded, { once: true });
+            mediaEl.addEventListener('error', onError, { once: true });
+
+            document.body.appendChild(mediaEl);
+            mediaEl.src = source;
+            mediaEl.load();
+        }).finally(() => {
+            if (preloadUrlStatusRef.current.get(source) !== 'loading') {
+                preloadUrlPromiseRef.current.delete(source);
+            }
+        });
+
+        preloadUrlPromiseRef.current.set(source, promise);
+        return promise;
+    }, []);
+
+    const preloadRoundMedia = useCallback(async (roundIndex) => {
+        const index = Number.parseInt(roundIndex, 10);
+        if (!Number.isInteger(index) || index <= 0) return false;
+        if (preloadDestroyedRef.current) return false;
+
+        const existingPromise = preloadRoundPromiseRef.current.get(index);
+        if (existingPromise) return existingPromise;
+
+        const currentStatus = preloadRoundStatusRef.current.get(index);
+        if (currentStatus === 'ready') return true;
+
+        const entry = preloadManifestByIndexRef.current.get(index);
+        if (!entry) {
+            preloadRoundStatusRef.current.set(index, 'failed');
+            updatePreloadProgress();
+            return false;
+        }
+
+        const urls = [entry.audioUrl, entry.videoUrl].filter((value, pos, arr) => value && arr.indexOf(value) === pos);
+        preloadRoundUrlsRef.current.set(index, new Set(urls));
+        preloadRoundStatusRef.current.set(index, 'loading');
+        updatePreloadProgress();
+
+        const promise = (async () => {
+            if (urls.length === 0) {
+                preloadRoundStatusRef.current.set(index, 'failed');
+                return false;
+            }
+
+            const results = await Promise.allSettled(urls.map((url) => {
+                const mediaKind = entry.audioUrl && url === entry.audioUrl ? 'audio' : 'video';
+                return preloadSingleUrl(url, mediaKind);
+            }));
+            const ok = results.some((result) => result.status === 'fulfilled');
+            preloadRoundStatusRef.current.set(index, ok ? 'ready' : 'failed');
+            return ok;
+        })().finally(() => {
+            preloadRoundPromiseRef.current.delete(index);
+            updatePreloadProgress();
+        });
+
+        preloadRoundPromiseRef.current.set(index, promise);
+        return promise;
+    }, [preloadSingleUrl, updatePreloadProgress]);
+
+    const pumpPreloadQueue = useCallback(() => {
+        if (preloadDestroyedRef.current) return;
+
+        while (preloadInFlightRef.current < MAX_CONCURRENT_PRELOADS && preloadQueueRef.current.length > 0) {
+            const nextIndex = preloadQueueRef.current.shift();
+            preloadQueuedSetRef.current.delete(nextIndex);
+            const status = preloadRoundStatusRef.current.get(nextIndex);
+            if (status === 'ready' || status === 'loading') continue;
+
+            preloadInFlightRef.current += 1;
+            preloadRoundMedia(nextIndex).catch(() => false).finally(() => {
+                preloadInFlightRef.current = Math.max(0, preloadInFlightRef.current - 1);
+                pumpPreloadQueue();
+            });
+        }
+    }, [preloadRoundMedia]);
+
+    const enqueueRoundsForPreload = useCallback((roundIndexes = []) => {
+        for (const value of roundIndexes) {
+            const index = Number.parseInt(value, 10);
+            if (!Number.isInteger(index) || index <= 0) continue;
+            if (!preloadManifestByIndexRef.current.has(index)) continue;
+
+            const status = preloadRoundStatusRef.current.get(index);
+            if (status === 'ready' || status === 'loading') continue;
+            if (preloadQueuedSetRef.current.has(index)) continue;
+
+            preloadRoundStatusRef.current.set(index, 'pending');
+            preloadQueueRef.current.push(index);
+            preloadQueuedSetRef.current.add(index);
+        }
+        updatePreloadProgress();
+        pumpPreloadQueue();
+    }, [pumpPreloadQueue, updatePreloadProgress]);
+
+    const waitForRoundsReady = useCallback(async (roundIndexes, timeoutMs = 20_000) => {
+        const indexes = (Array.isArray(roundIndexes) ? roundIndexes : [])
+            .map((value) => Number.parseInt(value, 10))
+            .filter((value) => Number.isInteger(value) && value > 0);
+
+        if (indexes.length === 0) return { ok: true };
+        const startedAt = Date.now();
+
+        while (!preloadDestroyedRef.current) {
+            const failedIndexes = indexes.filter((index) => preloadRoundStatusRef.current.get(index) === 'failed');
+            if (failedIndexes.length > 0) {
+                return { ok: false, reason: 'failed', failedIndexes };
+            }
+
+            const allReady = indexes.every((index) => {
+                const status = preloadRoundStatusRef.current.get(index);
+                return status === 'ready';
+            });
+            if (allReady) return { ok: true };
+
+            if (Date.now() - startedAt >= timeoutMs) {
+                return { ok: false, reason: 'timeout' };
+            }
+            await new Promise((resolve) => window.setTimeout(resolve, 120));
+        }
+        return { ok: false, reason: 'cancelled' };
+    }, []);
+
+    const describePreloadGateError = useCallback((result) => {
+        if (!result || result.ok) return '';
+        if (result.reason === 'failed') {
+            return 'Failed to preload required round media. Retry to continue.';
+        }
+        if (result.reason === 'timeout') {
+            return 'Preloading required media timed out. Retry to continue.';
+        }
+        return 'Preloading was interrupted. Retry to continue.';
+    }, []);
+
+    const trimPreloadedWindow = useCallback((targetRoundIndexes = []) => {
+        const keepRoundSet = new Set(
+            (Array.isArray(targetRoundIndexes) ? targetRoundIndexes : [])
+                .map((value) => Number.parseInt(value, 10))
+                .filter((value) => Number.isInteger(value) && value > 0)
+        );
+
+        const keepUrls = new Set();
+        for (const [index, urls] of preloadRoundUrlsRef.current) {
+            if (!keepRoundSet.has(index)) continue;
+            for (const url of urls || []) keepUrls.add(url);
+        }
+
+        for (const index of [...preloadRoundUrlsRef.current.keys()]) {
+            if (keepRoundSet.has(index)) continue;
+            preloadRoundUrlsRef.current.delete(index);
+            preloadRoundStatusRef.current.delete(index);
+            preloadRoundPromiseRef.current.delete(index);
+        }
+
+        preloadQueueRef.current = preloadQueueRef.current.filter((index) => keepRoundSet.has(index));
+        preloadQueuedSetRef.current = new Set(preloadQueueRef.current);
+        cleanupPreloadedElements(keepUrls);
+    }, [cleanupPreloadedElements]);
+
+    const signalPreloadReady = useCallback(async (lobbyCode, sessionId) => {
+        const code = toCode(lobbyCode);
+        const session = Number.parseInt(sessionId, 10);
+        if (!code || !Number.isInteger(session)) return;
+        if (preloadReadySentRef.current) return;
+
+        const socket = socketRef.current;
+        if (!socket?.connected) return;
+
+        preloadReadySentRef.current = true;
+        try {
+            await emitWithAck(socket, 'game:preload_ready', {
+                lobbyCode: code,
+                sessionId: session
+            });
+        } catch (err) {
+            preloadReadySentRef.current = false;
+            setError(err.message);
+        }
+    }, []);
+
+    const beginSessionPreload = useCallback(async ({ sessionId, lobbyCode, manifest }) => {
+        resetPreloadManager();
+        preloadDestroyedRef.current = false;
+
+        const normalized = normalizePreloadManifest(manifest);
+        preloadManifestByIndexRef.current = new Map(normalized.map((row) => [row.index, row]));
+        preloadSessionIdRef.current = Number.parseInt(sessionId, 10) || null;
+        preloadReadySentRef.current = false;
+        setPreloadGateError('');
+        setPreloadRetrying(false);
+
+        const initialRoundIndexes = normalized.slice(0, INITIAL_REQUIRED_ROUNDS).map((row) => row.index);
+        preloadRequiredRoundIndexesRef.current = initialRoundIndexes;
+        updatePreloadProgress();
+
+        if (initialRoundIndexes.length === 0) {
+            await signalPreloadReady(lobbyCode, preloadSessionIdRef.current);
+            return;
+        }
+
+        setPreloadBlocking(true);
+        enqueueRoundsForPreload(initialRoundIndexes);
+        const gateResult = await waitForRoundsReady(initialRoundIndexes);
+        if (preloadDestroyedRef.current) return;
+        if (!gateResult.ok) {
+            setPreloadGateError(describePreloadGateError(gateResult));
+            setPreloadBlocking(true);
+            return;
+        }
+
+        setPreloadBlocking(false);
+        await signalPreloadReady(lobbyCode, preloadSessionIdRef.current);
+    }, [
+        describePreloadGateError,
+        enqueueRoundsForPreload,
+        resetPreloadManager,
+        signalPreloadReady,
+        updatePreloadProgress,
+        waitForRoundsReady
+    ]);
+
+    const retryInitialPreloadGate = useCallback(async () => {
+        if (preloadDestroyedRef.current) return;
+        if (preloadReadySentRef.current) return;
+
+        const lobbyCode = lobbyRef.current?.code;
+        const sessionId = preloadSessionIdRef.current;
+        const requiredIndexes = preloadRequiredRoundIndexesRef.current;
+        if (!lobbyCode || !Number.isInteger(sessionId) || !Array.isArray(requiredIndexes) || requiredIndexes.length === 0) {
+            return;
+        }
+
+        setPreloadRetrying(true);
+        setPreloadGateError('');
+        setPreloadBlocking(true);
+        enqueueRoundsForPreload(requiredIndexes);
+        const gateResult = await waitForRoundsReady(requiredIndexes);
+        if (preloadDestroyedRef.current) return;
+
+        if (!gateResult.ok) {
+            setPreloadGateError(describePreloadGateError(gateResult));
+            setPreloadRetrying(false);
+            return;
+        }
+
+        setPreloadRetrying(false);
+        setPreloadBlocking(false);
+        await signalPreloadReady(lobbyCode, sessionId);
+    }, [describePreloadGateError, enqueueRoundsForPreload, signalPreloadReady, waitForRoundsReady]);
+
+    const preloadRollingWindow = useCallback((roundIndex) => {
+        const currentIndex = Number.parseInt(roundIndex, 10);
+        if (!Number.isInteger(currentIndex) || currentIndex <= 0) return;
+
+        const target = [];
+        for (let i = 0; i < PRELOAD_WINDOW_ROUNDS; i += 1) {
+            target.push(currentIndex + i);
+        }
+
+        enqueueRoundsForPreload(target);
+        trimPreloadedWindow(target);
+    }, [enqueueRoundsForPreload, trimPreloadedWindow]);
 
     const seededUnitInterval = useCallback((seedInput) => {
         const seed = String(seedInput || '0');
@@ -403,6 +832,7 @@ export default function App() {
     }, [clearSampleStopTimer, phase, resolveSampleStartSec, round, stopSamplePlayback]);
 
     const clearRoundState = useCallback(() => {
+        resetPreloadManager();
         stopSamplePlayback();
         stopSolutionVideoPlayback();
         setSessionInfo(null);
@@ -422,7 +852,7 @@ export default function App() {
         setSampleAutoplayBlocked(false);
         setSamplePlaybackSource(null);
         setSolutionVideoAutoplayBlocked(false);
-    }, [stopSamplePlayback, stopSolutionVideoPlayback]);
+    }, [resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback]);
 
     const applySyncState = useCallback((syncState) => {
         const state = syncState || {};
@@ -667,17 +1097,24 @@ export default function App() {
             setError(message || 'Realtime error');
         };
         const onLobbyState = ({ lobby: nextLobby }) => nextLobby && setLobby(nextLobby);
-        const onGameStarted = ({ sessionId, config }) => {
+        const onGameStarted = ({ sessionId, config, preloadManifest }) => {
             setSessionInfo({ sessionId, ...(config || {}) });
             setFinalResult(null);
             setPhase('PENDING');
             if (lobbyRef.current?.code) {
-                requestRoundSync(lobbyRef.current.code).catch(() => {});
+                beginSessionPreload({
+                    sessionId,
+                    lobbyCode: lobbyRef.current.code,
+                    manifest: preloadManifest
+                }).catch(() => {});
             }
         };
         const onRoundStarted = (payload) => {
             stopSamplePlayback();
             stopSolutionVideoPlayback();
+            setPreloadBlocking(false);
+            setPreloadGateError('');
+            setPreloadRetrying(false);
             setPhase('GUESSING');
             setPhaseEndsAt(payload?.endsAt || null);
             setRound(payload || null);
@@ -695,6 +1132,7 @@ export default function App() {
             setSamplePlaybackSource(null);
             setSolutionVideoAutoplayBlocked(false);
             sampleResolvedStartSecRef.current = null;
+            preloadRollingWindow(payload?.index);
         };
         const onAnswersReveal = (payload) => {
             setPhase('ANSWERS_REVEAL');
@@ -711,6 +1149,7 @@ export default function App() {
             setSolutionVideoAutoplayBlocked(false);
         };
         const onFinished = (payload) => {
+            resetPreloadManager();
             stopSamplePlayback();
             stopSolutionVideoPlayback();
             setPhase('FINISHED');
@@ -748,7 +1187,21 @@ export default function App() {
             socket.off('round:ready_state', onReadyState);
             closeGameSocket();
         };
-    }, [requestRoundSync, stopSamplePlayback, stopSolutionVideoPlayback, token]);
+    }, [beginSessionPreload, preloadRollingWindow, requestRoundSync, resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback, token]);
+
+    const refreshMediaSourceStatus = useCallback(async ({ forceRefresh = false, silent = false } = {}) => {
+        if (!silent) setMediaSourceLoading(true);
+        try {
+            const path = forceRefresh ? '/game/media-source-status?refresh=1' : '/game/media-source-status';
+            const data = await apiFetch(path);
+            setMediaSourceStatus(data?.status || null);
+            setMediaSourceError('');
+        } catch (err) {
+            setMediaSourceError(normalizeErrorMessage(err?.message) || 'Could not fetch media source status');
+        } finally {
+            if (!silent) setMediaSourceLoading(false);
+        }
+    }, []);
 
     useEffect(() => {
         if (!token) return;
@@ -770,6 +1223,22 @@ export default function App() {
             active = false;
         };
     }, [fetchLobbies, token]);
+
+    useEffect(() => {
+        if (!token) return;
+        let active = true;
+
+        refreshMediaSourceStatus({ forceRefresh: true }).catch(() => {});
+        const timer = window.setInterval(() => {
+            if (!active) return;
+            refreshMediaSourceStatus({ silent: true }).catch(() => {});
+        }, 15_000);
+
+        return () => {
+            active = false;
+            window.clearInterval(timer);
+        };
+    }, [refreshMediaSourceStatus, token]);
 
     useEffect(() => {
         if (loading || !user || autoJoinDoneRef.current) return;
@@ -922,6 +1391,61 @@ export default function App() {
         return `${seconds}s preview`;
     }, [round]);
     const sampleVolumePercent = useMemo(() => `${Math.round(sampleVolume * 100)}%`, [sampleVolume]);
+    const mediaSourceHealth = useMemo(() => {
+        if (!mediaSourceStatus) {
+            return { label: mediaSourceLoading ? 'Checking' : 'Unknown', tone: 'neutral' };
+        }
+        if (!mediaSourceStatus.ok) {
+            return { label: 'Down', tone: 'down' };
+        }
+        const latencyMs = Number(mediaSourceStatus.latencyMs);
+        if (Number.isFinite(latencyMs) && latencyMs >= 2500) {
+            return { label: 'Slow', tone: 'warn' };
+        }
+        return { label: 'Healthy', tone: 'ok' };
+    }, [mediaSourceLoading, mediaSourceStatus]);
+    const mediaSourceLatencyLabel = useMemo(() => {
+        const latencyMs = Number(mediaSourceStatus?.latencyMs);
+        return Number.isFinite(latencyMs) ? `${Math.round(latencyMs)} ms` : 'n/a';
+    }, [mediaSourceStatus]);
+    const mediaSourceCheckedLabel = useMemo(() => {
+        if (!mediaSourceStatus?.checkedAt) return 'n/a';
+        const parsed = new Date(mediaSourceStatus.checkedAt);
+        if (Number.isNaN(parsed.getTime())) return 'n/a';
+        return parsed.toLocaleTimeString();
+    }, [mediaSourceStatus]);
+    const localMediaHealth = useMemo(() => {
+        if (preloadBlocking) {
+            const detail = preloadProgress.total > 0
+                ? `Preloading required rounds (${preloadProgress.ready}/${preloadProgress.total})`
+                : 'Preloading required rounds';
+            return { label: 'Busy', tone: 'warn', detail };
+        }
+        if (preloadProgress.failed > 0) {
+            return { label: 'Degraded', tone: 'warn', detail: `Preload failures detected (${preloadProgress.failed})` };
+        }
+        if (mediaError || solutionMediaError) {
+            return { label: 'Degraded', tone: 'warn', detail: 'Client playback errors detected in this session' };
+        }
+        if (sampleAutoplayBlocked || solutionVideoAutoplayBlocked) {
+            return { label: 'Blocked', tone: 'warn', detail: 'Browser autoplay restrictions require user interaction' };
+        }
+        if (samplePlaying) {
+            return { label: 'Active', tone: 'ok', detail: 'Sample playback is running' };
+        }
+        return { label: 'Idle', tone: 'neutral', detail: `Phase ${phase}` };
+    }, [
+        mediaError,
+        phase,
+        preloadBlocking,
+        preloadProgress.failed,
+        preloadProgress.ready,
+        preloadProgress.total,
+        sampleAutoplayBlocked,
+        samplePlaying,
+        solutionMediaError,
+        solutionVideoAutoplayBlocked
+    ]);
 
     const onSampleVolumeChange = useCallback((event) => {
         const next = Math.max(0, Math.min(1, Number.parseFloat(event.target.value)));
@@ -1028,8 +1552,62 @@ export default function App() {
                     </article>
 
                     <article className="gmq-card">
+                        <h2>Media Status</h2>
+                        <div className="gmq-status-row">
+                            <span className={`gmq-status-dot gmq-status-dot-${mediaSourceHealth.tone}`} />
+                            <div className="gmq-stack">
+                                <strong>Source API: {mediaSourceHealth.label}</strong>
+                                <p className="gmq-muted">{mediaSourceStatus?.provider || 'AnimeThemes'} | Latency {mediaSourceLatencyLabel}</p>
+                                <p className="gmq-muted">
+                                    Last check: {mediaSourceCheckedLabel}
+                                    {mediaSourceStatus?.cached ? ' (cached)' : ''}
+                                </p>
+                                {mediaSourceStatus?.ok === false && mediaSourceStatus?.error ? (
+                                    <p className="gmq-muted gmq-muted-warning">{mediaSourceStatus.error}</p>
+                                ) : null}
+                                {mediaSourceError ? <p className="gmq-muted gmq-muted-warning">{mediaSourceError}</p> : null}
+                            </div>
+                        </div>
+                        <div className="gmq-status-row">
+                            <span className={`gmq-status-dot gmq-status-dot-${localMediaHealth.tone}`} />
+                            <div className="gmq-stack">
+                                <strong>Local Client: {localMediaHealth.label}</strong>
+                                <p className="gmq-muted">{localMediaHealth.detail}</p>
+                            </div>
+                        </div>
+                        <button
+                            type="button"
+                            className="gmq-btn gmq-btn-secondary"
+                            onClick={() => refreshMediaSourceStatus({ forceRefresh: true }).catch(() => {})}
+                            disabled={mediaSourceLoading}
+                        >
+                            {mediaSourceLoading ? 'Checking...' : 'Refresh Source Status'}
+                        </button>
+                    </article>
+
+                    <article className="gmq-card">
                         <h2>Round</h2>
                         <p className="gmq-round-phase">{phase} | {countdown}</p>
+                        {phase === 'PENDING' && preloadBlocking ? (
+                            <div className="gmq-stack">
+                                <p>Preparing media cache before round 1...</p>
+                                <p className="gmq-muted">
+                                    Ready {preloadProgress.ready}/{preloadProgress.total}
+                                    {preloadProgress.failed > 0 ? ` | Failed ${preloadProgress.failed}` : ''}
+                                </p>
+                                {preloadGateError ? <p className="gmq-muted gmq-muted-warning">{preloadGateError}</p> : null}
+                                {preloadGateError ? (
+                                    <button
+                                        type="button"
+                                        className="gmq-btn gmq-btn-secondary"
+                                        onClick={() => retryInitialPreloadGate().catch(() => {})}
+                                        disabled={preloadRetrying}
+                                    >
+                                        {preloadRetrying ? 'Retrying...' : 'Retry preload'}
+                                    </button>
+                                ) : null}
+                            </div>
+                        ) : null}
 
                         {showSamplePlayer ? (
                             <div className="gmq-sample-player">

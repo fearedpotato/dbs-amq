@@ -5,6 +5,7 @@ const sessionService = require('../game/sessionService');
 const { httpError } = require('../game/errors');
 const { createRoundEngine } = require('./roundEngine');
 const { consumeRateLimitBucket } = require('../lib/rateLimiterStore');
+const mediaProxyService = require('../game/mediaProxyService');
 
 function parseSocketToken(socket) {
     const authToken = socket.handshake?.auth?.token;
@@ -43,6 +44,7 @@ function attachRealtime(httpServer, options = {}) {
     });
 
     const roundEngine = createRoundEngine(io);
+    const pendingPreloadByLobby = new Map();
 
     async function assertEventRateLimit(userId, eventName, { windowMs, max }) {
         const key = `${userId}:${eventName}`;
@@ -50,6 +52,27 @@ function attachRealtime(httpServer, options = {}) {
         if (bucket.count > max) {
             throw httpError(429, 'Too many realtime actions, slow down');
         }
+    }
+
+    async function beginSessionAfterPreload(lobbyCode) {
+        const code = String(lobbyCode || '').toUpperCase();
+        const pending = pendingPreloadByLobby.get(code);
+        if (!pending) return false;
+
+        pendingPreloadByLobby.delete(code);
+        await roundEngine.beginSession(code);
+        return true;
+    }
+
+    async function prewarmFirstRoundOrThrow(preloadManifest) {
+        const summary = await mediaProxyService.prewarmManifest(preloadManifest, {
+            roundLimit: 1,
+            maxConcurrent: 2
+        });
+
+        if (summary.attempted <= 0) return;
+        if (summary.warmed > 0) return;
+        throw httpError(503, 'Could not cache first round media');
     }
 
     io.use((socket, next) => {
@@ -134,6 +157,16 @@ function attachRealtime(httpServer, options = {}) {
                     io.to(code).emit('lobby:state', { lobby });
                 }
 
+                const pending = pendingPreloadByLobby.get(code);
+                if (pending) {
+                    pending.requiredReadyUserIds.delete(userId);
+                    pending.readyUserIds.delete(userId);
+                    const allReady = [...pending.requiredReadyUserIds].every((id) => pending.readyUserIds.has(id));
+                    if (allReady) {
+                        await beginSessionAfterPreload(code);
+                    }
+                }
+
                 if (typeof ack === 'function') ack({ ok: true, lobby });
             } catch (err) {
                 emitSocketError(err, 'lobby_leave_failed', ack);
@@ -169,27 +202,98 @@ function attachRealtime(httpServer, options = {}) {
 
                 const session = await sessionService.startSessionFromLobby(lobby);
                 let updatedLobby;
+                let preloadManifest = [];
                 try {
                     updatedLobby = await lobbyService.getLobbyByCode(code);
                     await roundEngine.startSession({
                         lobbyCode: code,
                         session,
-                        lobby: updatedLobby
+                        lobby: updatedLobby,
+                        deferFirstRound: true
                     });
+                    preloadManifest = await roundEngine.getSessionMediaManifest(session.id);
+                    await prewarmFirstRoundOrThrow(preloadManifest);
                 } catch (engineErr) {
                     await sessionService.rollbackSessionStart(session.id);
                     throw engineErr;
                 }
 
+                const requiredReadyUserIds = (updatedLobby?.players || [])
+                    .filter((player) => player?.isConnected !== false)
+                    .map((player) => player.userId);
+                const resolvedRequired = requiredReadyUserIds.length > 0
+                    ? requiredReadyUserIds
+                    : (updatedLobby?.players || []).map((player) => player.userId);
+
+                pendingPreloadByLobby.set(code, {
+                    sessionId: session.id,
+                    requiredReadyUserIds: new Set(resolvedRequired),
+                    readyUserIds: new Set()
+                });
+
                 io.to(code).emit('game:started', {
                     sessionId: session.id,
                     config: session,
-                    lobby: updatedLobby
+                    lobby: updatedLobby,
+                    preloadManifest
+                });
+
+                await beginSessionAfterPreload(code);
+
+                mediaProxyService.prewarmManifest(preloadManifest, {
+                    roundLimit: 3,
+                    maxConcurrent: 2
+                }).catch((err) => {
+                    console.warn('media prewarm failed:', err?.message || err);
                 });
 
                 if (typeof ack === 'function') ack({ ok: true, session });
             } catch (err) {
                 emitSocketError(err, 'game_start_failed', ack);
+            }
+        });
+
+        socket.on('game:preload_ready', async (payload = {}, ack) => {
+            try {
+                await assertEventRateLimit(userId, 'game:preload_ready', { windowMs: 10_000, max: 30 });
+                const code = String(payload.lobbyCode || '').toUpperCase();
+                if (!code) throw httpError(400, 'Lobby code is required');
+                if (!socket.data.lobbies.has(code)) {
+                    throw httpError(400, 'Join lobby before signaling preload readiness');
+                }
+
+                const pending = pendingPreloadByLobby.get(code);
+                if (!pending) {
+                    if (typeof ack === 'function') ack({ ok: true, started: true, allReady: true });
+                    return;
+                }
+
+                if (Number.isInteger(payload.sessionId) && payload.sessionId !== pending.sessionId) {
+                    throw httpError(400, 'Preload signal does not match current session');
+                }
+
+                if (pending.requiredReadyUserIds.has(userId)) {
+                    pending.readyUserIds.add(userId);
+                }
+
+                const requiredCount = pending.requiredReadyUserIds.size;
+                const readyCount = [...pending.requiredReadyUserIds].filter((id) => pending.readyUserIds.has(id)).length;
+                const allReady = readyCount >= requiredCount;
+                if (allReady) {
+                    await beginSessionAfterPreload(code);
+                }
+
+                if (typeof ack === 'function') {
+                    ack({
+                        ok: true,
+                        readyCount,
+                        requiredCount,
+                        allReady,
+                        started: allReady
+                    });
+                }
+            } catch (err) {
+                emitSocketError(err, 'preload_ready_failed', ack);
             }
         });
 
@@ -251,6 +355,16 @@ function attachRealtime(httpServer, options = {}) {
         socket.on('disconnect', async () => {
             for (const code of socket.data.lobbies) {
                 try {
+                    const pending = pendingPreloadByLobby.get(code);
+                    if (pending) {
+                        pending.requiredReadyUserIds.delete(userId);
+                        pending.readyUserIds.delete(userId);
+                        const allReady = [...pending.requiredReadyUserIds].every((id) => pending.readyUserIds.has(id));
+                        if (allReady) {
+                            await beginSessionAfterPreload(code);
+                        }
+                    }
+
                     await roundEngine.onPlayerDisconnected(code, userId);
                     await lobbyService.setPlayerConnection(code, userId, false);
                     await broadcastLobbyState(io, code);

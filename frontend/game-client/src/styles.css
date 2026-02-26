@@ -46,6 +46,36 @@
     gap: 8px;
 }
 
+.gmq-status-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+}
+
+.gmq-status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+    margin-top: 6px;
+    flex: 0 0 auto;
+}
+
+.gmq-status-dot-ok {
+    background: #41cc8e;
+}
+
+.gmq-status-dot-warn {
+    background: #e4b35c;
+}
+
+.gmq-status-dot-down {
+    background: #e77474;
+}
+
+.gmq-status-dot-neutral {
+    background: #6f7f97;
+}
+
 .gmq-sample-player {
     display: grid;
     gap: 8px;

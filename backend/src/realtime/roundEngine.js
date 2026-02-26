@@ -1,5 +1,6 @@
 const roundService = require('../game/roundService');
 const { httpError } = require('../game/errors');
+const { buildMediaProxyUrl } = require('../game/mediaProxyService');
 
 const MAX_SUDDEN_DEATH_ROUNDS = 20;
 
@@ -60,8 +61,8 @@ function createRoundEngine(io) {
                 sampleStartSec: state.currentRound.sampleStartSec,
                 sampleDurationSec: state.currentRound.sampleDurationSec,
                 themeType: state.currentRound.themeType,
-                audioUrl: state.currentRound.solutionAudioUrl || null,
-                videoUrl: state.currentRound.solutionVideoUrl || null
+                audioUrl: buildMediaProxyUrl(state.currentRound.solutionAudioUrl) || null,
+                videoUrl: buildMediaProxyUrl(state.currentRound.solutionVideoUrl) || null
             }
         });
 
@@ -98,8 +99,8 @@ function createRoundEngine(io) {
                 themeType: state.currentRound.themeType,
                 themeTitle: state.currentRound.themeTitle
             },
-            video: state.currentRound.solutionVideoUrl,
-            audio: state.currentRound.solutionAudioUrl,
+            video: buildMediaProxyUrl(state.currentRound.solutionVideoUrl) || null,
+            audio: buildMediaProxyUrl(state.currentRound.solutionAudioUrl) || null,
             scores,
             endsAt
         });
@@ -241,7 +242,7 @@ function createRoundEngine(io) {
         return startRound(lobbyCode, state.currentRound.index + 1);
     }
 
-    async function startSession({ lobbyCode, session, lobby }) {
+    async function startSession({ lobbyCode, session, lobby, deferFirstRound = false }) {
         const code = sanitizeLobbyCode(lobbyCode);
         await roundService.generateInitialRoundsForSession({
             session,
@@ -250,6 +251,18 @@ function createRoundEngine(io) {
 
         stateByLobby.set(code, buildState(code, session, lobby.players));
 
+        if (deferFirstRound) {
+            return;
+        }
+
+        await startRound(code, 1);
+    }
+
+    async function beginSession(lobbyCode) {
+        const code = sanitizeLobbyCode(lobbyCode);
+        const state = stateByLobby.get(code);
+        if (!state) return;
+        if (state.currentRound) return;
         await startRound(code, 1);
     }
 
@@ -313,8 +326,8 @@ function createRoundEngine(io) {
                 sampleStartSec: context.sampleStartSec,
                 sampleDurationSec: context.sampleDurationSec,
                 themeType: context.themeType,
-                audioUrl: context.solutionAudioUrl || null,
-                videoUrl: context.solutionVideoUrl || null
+                audioUrl: buildMediaProxyUrl(context.solutionAudioUrl) || null,
+                videoUrl: buildMediaProxyUrl(context.solutionVideoUrl) || null
             }
         };
 
@@ -359,8 +372,8 @@ function createRoundEngine(io) {
                     themeType: context.themeType,
                     themeTitle: context.themeTitle
                 },
-                video: context.solutionVideoUrl,
-                audio: context.solutionAudioUrl,
+                video: buildMediaProxyUrl(context.solutionVideoUrl) || null,
+                audio: buildMediaProxyUrl(context.solutionAudioUrl) || null,
                 scores,
                 endsAt: context.solutionRevealEndsAt
             };
@@ -516,6 +529,11 @@ function createRoundEngine(io) {
         return stateByLobby.has(sanitizeLobbyCode(lobbyCode));
     }
 
+    async function getSessionMediaManifest(sessionId) {
+        const media = await roundService.listRoundMediaForSession(sessionId);
+        return Array.isArray(media) ? media : [];
+    }
+
     const recoveryInterval = setInterval(() => {
         recoverActiveSessions().catch((err) => {
             console.error('round recovery sweep failed:', err);
@@ -525,11 +543,13 @@ function createRoundEngine(io) {
 
     return {
         startSession,
+        beginSession,
         submitGuess,
         setReady,
         getSyncState,
         onPlayerDisconnected,
         hasActiveSession,
+        getSessionMediaManifest,
         recoverActiveSessions
     };
 }

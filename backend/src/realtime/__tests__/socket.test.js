@@ -13,15 +13,25 @@ jest.mock('../../game/lobbyService', () => ({
 }));
 
 jest.mock('../../game/sessionService', () => ({
-    startSessionFromLobby: jest.fn()
+    startSessionFromLobby: jest.fn(),
+    rollbackSessionStart: jest.fn()
 }));
 
 jest.mock('../roundEngine', () => ({
     createRoundEngine: jest.fn()
 }));
+jest.mock('../../game/mediaProxyService', () => ({
+    prewarmManifest: jest.fn().mockResolvedValue({
+        attempted: 0,
+        warmed: 0,
+        failed: 0,
+        skipped: 0
+    })
+}));
 
 const lobbyService = require('../../game/lobbyService');
 const sessionService = require('../../game/sessionService');
+const mediaProxyService = require('../../game/mediaProxyService');
 const { createRoundEngine } = require('../roundEngine');
 const { attachRealtime } = require('../socket');
 
@@ -69,11 +79,13 @@ describe('socket gateway', () => {
 
         roundEngineMock = {
             startSession: jest.fn(),
+            beginSession: jest.fn(),
             submitGuess: jest.fn(),
             setReady: jest.fn(),
             onPlayerDisconnected: jest.fn(),
             hasActiveSession: jest.fn(),
-            getSyncState: jest.fn()
+            getSyncState: jest.fn(),
+            getSessionMediaManifest: jest.fn().mockResolvedValue([])
         };
         createRoundEngine.mockReturnValue(roundEngineMock);
 
@@ -235,5 +247,56 @@ describe('socket gateway', () => {
         await new Promise((resolve) => setTimeout(resolve, 30));
 
         expect(lobbyService.setPlayerConnection).toHaveBeenCalledWith('ABC123', 1, false);
+    });
+
+    test('triggers media prewarm when game starts', async () => {
+        const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1, 2] });
+        const session = { id: 44, roundCount: 1 };
+        lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+        sessionService.startSessionFromLobby.mockResolvedValue(session);
+        roundEngineMock.startSession.mockResolvedValue();
+        roundEngineMock.getSessionMediaManifest.mockResolvedValue([
+            { index: 1, audioUrl: '/api/game/media/proxy?u=a&exp=1&sig=1', videoUrl: null }
+        ]);
+
+        const host = await connectClient({ userId: 1, username: 'u1' });
+        await emitWithAck(host, 'lobby:join', { lobbyCode: 'ABC123' });
+
+        const ack = await emitWithAck(host, 'game:start', { lobbyCode: 'ABC123' });
+        expect(ack.ok).toBe(true);
+        expect(mediaProxyService.prewarmManifest).toHaveBeenCalledWith(
+            expect.any(Array),
+            expect.objectContaining({ roundLimit: 1, maxConcurrent: 2 })
+        );
+        expect(mediaProxyService.prewarmManifest).toHaveBeenCalledWith(
+            expect.any(Array),
+            expect.objectContaining({ roundLimit: 3, maxConcurrent: 2 })
+        );
+    });
+
+    test('fails game start when first media warmup cannot cache any media', async () => {
+        const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1, 2] });
+        const session = { id: 51, roundCount: 1 };
+        lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+        sessionService.startSessionFromLobby.mockResolvedValue(session);
+        roundEngineMock.startSession.mockResolvedValue();
+        roundEngineMock.getSessionMediaManifest.mockResolvedValue([
+            { index: 1, audioUrl: 'https://media.local/audio-1.mp3', videoUrl: null }
+        ]);
+        mediaProxyService.prewarmManifest.mockResolvedValueOnce({
+            attempted: 1,
+            warmed: 0,
+            failed: 1,
+            skipped: 0
+        });
+
+        const host = await connectClient({ userId: 1, username: 'u1' });
+        await emitWithAck(host, 'lobby:join', { lobbyCode: 'ABC123' });
+
+        const ack = await emitWithAck(host, 'game:start', { lobbyCode: 'ABC123' });
+        expect(ack.ok).toBe(false);
+        expect(ack.code).toBe('game_start_failed');
+        expect(ack.error).toBe('Could not cache first round media');
+        expect(sessionService.rollbackSessionStart).toHaveBeenCalledWith(51);
     });
 });

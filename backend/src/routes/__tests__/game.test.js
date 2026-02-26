@@ -17,8 +17,19 @@ jest.mock('../../lib/prisma', () => ({
     },
     $transaction: jest.fn()
 }));
+jest.mock('../../game/mediaService', () => ({
+    getMediaProviderStatus: jest.fn()
+}));
+jest.mock('../../game/mediaProxyService', () => ({
+    isEnabled: jest.fn(),
+    parseAndVerifyProxyRequest: jest.fn(),
+    getOrCreateCacheEntry: jest.fn(),
+    streamCachedMedia: jest.fn()
+}));
 
 const prisma = require('../../lib/prisma');
+const mediaService = require('../../game/mediaService');
+const mediaProxyService = require('../../game/mediaProxyService');
 const { createLobbyInviteToken } = require('../../lib/inviteToken');
 const gameRoutes = require('../game');
 
@@ -87,6 +98,27 @@ describe('game routes', () => {
             lobby: prisma.lobby,
             lobbyPlayer: prisma.lobbyPlayer
         }));
+        mediaService.getMediaProviderStatus.mockResolvedValue({
+            provider: 'AnimeThemes',
+            ok: true,
+            latencyMs: 120,
+            checkedAt: new Date().toISOString()
+        });
+        mediaProxyService.isEnabled.mockReturnValue(true);
+        mediaProxyService.parseAndVerifyProxyRequest.mockReturnValue({
+            ok: true,
+            sourceUrl: 'https://cdn.example.com/media.mp3'
+        });
+        mediaProxyService.getOrCreateCacheEntry.mockResolvedValue({
+            key: 'abc',
+            dataPath: '/tmp/demo',
+            contentType: 'audio/mpeg',
+            size: 10,
+            cacheStatus: 'HIT'
+        });
+        mediaProxyService.streamCachedMedia.mockImplementation(async (_req, res) => {
+            res.status(200).send('proxied');
+        });
     });
 
     test('POST /api/game/lobbies requires auth', async () => {
@@ -257,5 +289,34 @@ describe('game routes', () => {
 
         expect(res.status).toBe(400);
         expect(res.body.error).toBe('query must have at least 2 characters');
+    });
+
+    test('GET /api/game/media/proxy serves proxied media without auth middleware', async () => {
+        const res = await request(createApp())
+            .get('/api/game/media/proxy?u=signed&exp=9999999999&sig=abc');
+
+        expect(res.status).toBe(200);
+        expect(res.text).toBe('proxied');
+        expect(mediaProxyService.parseAndVerifyProxyRequest).toHaveBeenCalledTimes(1);
+        expect(mediaProxyService.getOrCreateCacheEntry).toHaveBeenCalledTimes(1);
+    });
+
+    test('GET /api/game/media-source-status returns provider status payload', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+            id: 1,
+            username: 'demo',
+            nickname: 'Demo'
+        });
+
+        const res = await request(createApp())
+            .get('/api/game/media-source-status')
+            .set(authHeader());
+
+        expect(res.status).toBe(200);
+        expect(res.body.status).toMatchObject({
+            provider: 'AnimeThemes',
+            ok: true
+        });
+        expect(mediaService.getMediaProviderStatus).toHaveBeenCalledTimes(1);
     });
 });

@@ -2,6 +2,7 @@ const prisma = require('../lib/prisma');
 const { isGuessCorrect } = require('./scoringService');
 const { httpError } = require('./errors');
 const { resolveRoundMedia } = require('./mediaService');
+const { buildMediaProxyUrl } = require('./mediaProxyService');
 const { POPULAR_CATALOG } = require('./catalog');
 const { buildRoundSeedPlan } = require('./malSelectionService');
 
@@ -94,8 +95,8 @@ function buildRoundRow({ sessionId, roundIndex, media, sourcePlayerId }) {
         themeTitle: media.themeTitle,
         sampleStartSec: media.sampleStartSec,
         sampleDurationSec: media.sampleDurationSec,
-        solutionVideoUrl: media.solutionVideoUrl,
-        solutionAudioUrl: media.solutionAudioUrl,
+        solutionVideoUrl: buildMediaProxyUrl(media.solutionVideoUrl),
+        solutionAudioUrl: buildMediaProxyUrl(media.solutionAudioUrl),
         sourcePlayerId: sourcePlayerId ?? null
     };
 }
@@ -405,6 +406,28 @@ async function getCurrentActiveRound(sessionId) {
     });
 }
 
+async function listRoundMediaForSession(sessionId) {
+    const rows = await prisma.gameRound.findMany({
+        where: { sessionId },
+        select: {
+            index: true,
+            sampleStartSec: true,
+            sampleDurationSec: true,
+            solutionAudioUrl: true,
+            solutionVideoUrl: true
+        },
+        orderBy: { index: 'asc' }
+    });
+
+    return rows.map((row) => ({
+        index: row.index,
+        sampleStartSec: row.sampleStartSec,
+        sampleDurationSec: row.sampleDurationSec,
+        audioUrl: buildMediaProxyUrl(row.solutionAudioUrl) || null,
+        videoUrl: buildMediaProxyUrl(row.solutionVideoUrl) || null
+    }));
+}
+
 async function updateSessionCurrentRound(sessionId, currentRound) {
     await prisma.gameSession.update({
         where: { id: sessionId },
@@ -473,6 +496,7 @@ module.exports = {
     getRoundContext,
     listActiveRounds,
     getCurrentActiveRound,
+    listRoundMediaForSession,
     updateSessionCurrentRound,
     getScoresForSession,
     finishSession
