@@ -1,5 +1,4 @@
 const { Server } = require('socket.io');
-const jwt = require('jsonwebtoken');
 const lobbyService = require('../game/lobbyService');
 const sessionService = require('../game/sessionService');
 const { httpError } = require('../game/errors');
@@ -7,6 +6,7 @@ const { createRoundEngine } = require('./roundEngine');
 const { consumeRateLimitBucket } = require('../lib/rateLimiterStore');
 const mediaProxyService = require('../game/mediaProxyService');
 const telemetry = require('../lib/telemetry');
+const { verifyAuthToken } = require('../lib/authToken');
 
 function parseSocketToken(socket) {
     const authToken = socket.handshake?.auth?.token;
@@ -87,7 +87,7 @@ function attachRealtime(httpServer, options = {}) {
             if (!token) {
                 return next(new Error('Unauthorized'));
             }
-            const decoded = jwt.verify(token, process.env.JWT_SECRET);
+            const decoded = verifyAuthToken(token);
             socket.data.user = { userId: decoded.userId, username: decoded.username };
             socket.data.lobbies = new Set();
             return next();

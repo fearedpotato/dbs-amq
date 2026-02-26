@@ -109,7 +109,7 @@ describe('socket gateway', () => {
     });
 
     async function connectClient({ userId = 1, username = 'demo', token } = {}) {
-        const authToken = token || jwt.sign({ userId, username }, process.env.JWT_SECRET);
+        const authToken = token || jwt.sign({ type: 'auth_access', userId, username }, process.env.JWT_SECRET);
         const client = Client(baseUrl, {
             transports: ['websocket'],
             reconnection: false,

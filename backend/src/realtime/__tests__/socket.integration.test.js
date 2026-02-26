@@ -574,7 +574,7 @@ describe('socket integration', () => {
     });
 
     async function connectClient({ userId, username }) {
-        const token = jwt.sign({ userId, username }, process.env.JWT_SECRET);
+        const token = jwt.sign({ type: 'auth_access', userId, username }, process.env.JWT_SECRET);
         const client = Client(baseUrl, {
             transports: ['websocket'],
             reconnection: false,

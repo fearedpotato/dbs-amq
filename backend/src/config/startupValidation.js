@@ -52,6 +52,13 @@ function validateStartupEnv({ env = process.env, skipInTest = true } = {}) {
         pushIssue(issues, 'SESSION_SECRET', 'SESSION_SECRET must be at least 16 characters');
     }
 
+    const lobbyInviteSecret = String(env.LOBBY_INVITE_SECRET || '').trim();
+    if (!lobbyInviteSecret) {
+        pushIssue(issues, 'LOBBY_INVITE_SECRET', 'LOBBY_INVITE_SECRET is required');
+    } else if (lobbyInviteSecret.length < 16) {
+        pushIssue(issues, 'LOBBY_INVITE_SECRET', 'LOBBY_INVITE_SECRET must be at least 16 characters');
+    }
+
     const malClientId = String(env.MAL_CLIENT_ID || '').trim();
     if (!malClientId) {
         pushIssue(issues, 'MAL_CLIENT_ID', 'MAL_CLIENT_ID is required');
@@ -107,6 +114,7 @@ function validateStartupEnv({ env = process.env, skipInTest = true } = {}) {
         validatedKeys: [
             'JWT_SECRET',
             'SESSION_SECRET',
+            'LOBBY_INVITE_SECRET',
             'MAL_CLIENT_ID',
             'MAL_CLIENT_SECRET',
             'MAL_REDIRECT_URI',

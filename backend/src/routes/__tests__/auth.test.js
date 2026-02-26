@@ -74,6 +74,7 @@ describe('auth routes', () => {
         expect(typeof res.body.token).toBe('string');
 
         const decoded = jwt.verify(res.body.token, process.env.JWT_SECRET);
+        expect(decoded.type).toBe('auth_access');
         expect(decoded.userId).toBe(7);
         expect(decoded.username).toBe('verified_user');
     });

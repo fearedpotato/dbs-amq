@@ -1,7 +1,8 @@
 const jwt = require('jsonwebtoken');
 
 function getInviteSecret() {
-    return process.env.LOBBY_INVITE_SECRET || process.env.JWT_SECRET || process.env.SESSION_SECRET || null;
+    const secret = String(process.env.LOBBY_INVITE_SECRET || '').trim();
+    return secret || null;
 }
 
 function createLobbyInviteToken(lobbyCode, { expiresIn } = {}) {

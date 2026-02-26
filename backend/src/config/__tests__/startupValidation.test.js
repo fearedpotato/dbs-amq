@@ -13,6 +13,7 @@ function baseEnv() {
         NODE_ENV: 'development',
         JWT_SECRET: 'jwt-secret-123456',
         SESSION_SECRET: 'session-secret-123456',
+        LOBBY_INVITE_SECRET: 'lobby-invite-secret-123456',
         MAL_CLIENT_ID: 'mal-client-id',
         MAL_CLIENT_SECRET: 'mal-client-secret',
         MAL_REDIRECT_URI: 'https://example.com/api/mal/callback',

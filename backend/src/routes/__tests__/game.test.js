@@ -41,7 +41,7 @@ function createApp() {
 }
 
 function authHeader(userId = 1, username = 'demo') {
-    const token = jwt.sign({ userId, username }, process.env.JWT_SECRET);
+    const token = jwt.sign({ type: 'auth_access', userId, username }, process.env.JWT_SECRET);
     return { Authorization: `Bearer ${token}` };
 }
 
@@ -88,6 +88,7 @@ function buildLobby({
 describe('game routes', () => {
     beforeAll(() => {
         process.env.JWT_SECRET = 'test-jwt-secret';
+        process.env.LOBBY_INVITE_SECRET = 'test-lobby-invite-secret';
         process.env.BASE_URL = 'http://localhost:3000';
     });
 

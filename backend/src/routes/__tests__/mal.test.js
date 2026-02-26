@@ -39,7 +39,7 @@ describe('mal routes', () => {
     });
 
     test('POST /api/mal/login returns authorize URL for authenticated user', async () => {
-        const token = jwt.sign({ userId: 15, username: 'demo' }, process.env.JWT_SECRET);
+        const token = jwt.sign({ type: 'auth_access', userId: 15, username: 'demo' }, process.env.JWT_SECRET);
 
         const res = await request(createApp())
             .post('/api/mal/login')
@@ -57,5 +57,6 @@ describe('mal routes', () => {
         expect(url.searchParams.get('redirect_uri')).toBe(process.env.MAL_REDIRECT_URI);
         expect(url.searchParams.get('code_challenge_method')).toBe('plain');
         expect(url.searchParams.get('code_challenge')).toBeTruthy();
+        expect(url.searchParams.get('state')).toBeTruthy();
     });
 });

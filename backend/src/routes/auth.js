@@ -1,12 +1,12 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
 const router = express.Router();
 const prisma = require('../lib/prisma');
 const authMiddleware = require('../middleware/auth');
 const crypto = require('crypto');
 const mailer = require('../lib/mailer');
 const { createRateLimit } = require('../middleware/rateLimit');
+const { signAuthToken } = require('../lib/authToken');
 
 const registerRateLimit = createRateLimit({
     keyPrefix: 'auth:register',
@@ -269,11 +269,10 @@ router.post('/login', loginRateLimit, async (req, res) => {
             return res.status(403).json({ error: 'Please verify your email before signing in' });
         }
 
-        const token = jwt.sign(
-            { userId: user.id, username: user.username },
-            process.env.JWT_SECRET,
-            { expiresIn: '7d' }
-        );
+        const token = signAuthToken({
+            userId: user.id,
+            username: user.username
+        });
 
         res.json({ token, username: user.username });
     } catch (err) {
