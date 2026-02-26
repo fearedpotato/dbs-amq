@@ -1,6 +1,14 @@
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
+const { validateStartupEnv } = require('./config/startupValidation');
 const { createServer } = require('./server');
 const { startMaintenanceCleanupJob } = require('./jobs/maintenanceCleanupJob');
+
+try {
+    validateStartupEnv();
+} catch (err) {
+    console.error(`Startup validation failed: ${err.message}`);
+    process.exit(1);
+}
 
 const PORT = process.env.PORT || 3000;
 const { httpServer } = createServer();
