@@ -1,344 +1,268 @@
-# Anime Music Quiz Game Design
+# Anime Music Quiz Design (Current Implementation)
+
+Last updated: 2026-02-26
 
 ## 1. Purpose
 
-This document defines how the anime music quiz should work end-to-end in this project.
-The game supports both single-player and multiplayer sessions.
-It is written as an implementation spec for the current stack:
+This document describes the currently implemented Anime Music Quiz behavior in this repository.
+It reflects what is already shipped in code (backend + realtime + React client), not future design proposals.
 
-- Backend: Express + Prisma
-- Auth: JWT + existing user accounts
-- MAL integration: existing linked account flow
-- Frontend: keep existing HTML pages, build game UI separately on React
+## 2. Runtime Architecture
 
-## 2. Core Game Loop
+- Backend HTTP/API: Express 5 + Prisma + PostgreSQL (`backend/src/app.js`, `backend/src/routes/*`)
+- Realtime: Socket.IO server with JWT socket auth (`backend/src/realtime/socket.js`)
+- Round orchestration: server-authoritative round engine (`backend/src/realtime/roundEngine.js`)
+- Frontend shell: static HTML/CSS/JS in `frontend/`
+- Game UI: React client built by Vite into `frontend/game-app/` and mounted by `frontend/game.html`
+- Auth: JWT bearer tokens for API/socket auth
+- MAL integration: OAuth bind flow (`/api/mal/login`, `/api/mal/callback`, `/api/mal/disconnect`)
 
-1. A user creates a lobby and can play solo or wait for additional players.
-2. Host sets game options:
-   - Number of rounds (`roundCount`)
-   - Guess timer per round (`guessSeconds`)
-   - Audio preview length (`sampleSeconds`)
-   - Source mode (`POPULAR`, `MAL_ONLY`, `HYBRID`, etc.)
-   - Selection mode (`STANDARD`, `BALANCED_STRICT`, `BALANCED_RELAXED`)
-   - Theme mode (`OP_ONLY`, `ED_ONLY`, `MIXED`)
-3. Server builds round pool (`roundCount` anime openings).
-4. For each round:
-   - Server starts timer and broadcasts round start.
-   - Audio sample plays for all players.
-   - Players submit exactly one guess.
-   - Timer ends.
-   - Server reveals submitted answers for 3 seconds.
-   - Server reveals correct answer and plays synced opening video segment.
-   - Server awards 1 point for correct guesses.
-5. After last round, server shows final scoreboard and winner.
+## 3. Lobby and Session Model
 
-## 3. Product Rules
+### 3.1 Lobby constraints and defaults
 
-- A player gets 1 point for a correct answer in a round.
-- Guess accepted only while round is in `GUESSING` phase.
-- Authenticated users only (no guest players).
-- Players can change their guess until they explicitly lock/skip.
-- If no guess submitted before timeout, answer is blank.
-- All round transitions are server-authoritative (clients cannot advance state).
-- Solo mode is valid: host can start a match alone.
+Backend lobby config currently supports:
 
-### 3.1 Guess lock / skip behavior
+- `name` (optional)
+- `isPrivate` (default `false`)
+- `minPlayers` (default `1`, range `1..8`)
+- `maxPlayers` (default `8`, range `1..8`)
+- `roundCount` (default `10`, range `1..50`)
+- `guessSeconds` (default `20`, range `5..120`)
+- `sampleSeconds` (default `10`, range `3..60`)
+- `answersRevealSeconds` (default `3`, range `1..30`)
+- `solutionRevealSeconds` (default `8`, range `1..60`)
+- `sourceMode` (`POPULAR`, `MAL_ONLY`, `HYBRID`)
+- `selectionMode` (`STANDARD`, `BALANCED_STRICT`, `BALANCED_RELAXED`)
+- `themeMode` (`OP_ONLY`, `ED_ONLY`, `MIXED`)
 
-- Each player has a `Skip` button during `GUESSING`.
-- Pressing `Skip` means:
-  - lock current guess (or lock blank answer if no guess typed),
-  - mark the player as ready to advance.
-- If every player in the lobby is marked ready, server ends `GUESSING` early and moves to reveal phase.
-- A player who pressed `Skip` can press it again to cancel readiness before round advance:
-  - readiness is removed,
-  - guess becomes editable again.
+Current React create-lobby UI exposes a subset of those fields:
 
-## 4. Round Timeline (Authoritative)
+- `name`, `isPrivate`, `roundCount`, `guessSeconds`, `sampleSeconds`, `sourceMode`, `selectionMode`, `themeMode`
 
-Recommended defaults:
+### 3.2 Membership and access
 
-- `sampleSeconds`: 10
-- `guessSeconds`: 20
-- `answersRevealSeconds`: 5
-- `solutionRevealSeconds`: 5 to 10
+- A user can only belong to one active lobby (`WAITING` or `IN_GAME`) at a time.
+- Joining/creating another lobby forces removal from previous active lobbies.
+- Private lobbies require a valid invite token unless the user is host.
+- Lobby size hard cap is 8.
+- Solo games are supported (`minPlayers` default is 1).
 
-State machine per round:
+### 3.3 Lifecycle
 
-1. `PENDING` (short preload)
-2. `GUESSING` (audio sample + input enabled)
-3. `ANSWERS_REVEAL` (show all submitted answers)
-4. `SOLUTION_REVEAL` (show correct anime + play matching OP segment)
-5. `ROUND_END` (score update, then next round)
+- Lobby statuses: `WAITING`, `IN_GAME`, `CLOSED`
+- Session statuses: `WAITING`, `IN_PROGRESS`, `FINISHED`, `CANCELLED`
+- Starting a session sets lobby to `IN_GAME`.
+- Finishing/cancelling returns lobby to `WAITING`.
 
-Only backend controls state transitions and timestamps.
+## 4. Game Start and Preload Flow (Implemented)
 
-## 5. Content Sources and Strategy
+1. Host emits `game:start`.
+2. Backend validates host/requirements and creates `GameSession`.
+3. Backend generates initial round seeds/media (`roundService.generateInitialRoundsForSession`).
+4. Round engine state is created with `deferFirstRound = true`.
+5. Backend builds preload manifest and must prewarm first round media (server-side).
+6. If first-round prewarm fails, backend rolls back start (`sessionService.rollbackSessionStart`).
+7. Backend emits `game:started` with `sessionId`, config, lobby snapshot, and `preloadManifest`.
+8. Backend tracks pending preload readiness for connected players (fallback: all players if none connected).
+9. React client blocks round start on an initial preload gate (first 2 rounds).
+10. Clients signal `game:preload_ready` when gate passes.
+11. When required players are ready, backend starts round 1 (`roundEngine.beginSession`).
 
-### 5.1 Anime pool selection
+Additional prewarm behavior:
 
-Source options:
+- Backend also runs one background prewarm pass over first 3 rounds from manifest.
 
-- `POPULAR`: use top/popular list
-- `MAL_ONLY`: weighted from linked players MAL lists
-- `HYBRID`: merge MAL-based picks with popular fallback
+## 5. Client Preload Behavior (React Game Client)
 
-Selection constraints:
+- Initial gate: first 2 rounds must preload before gameplay (`INITIAL_REQUIRED_ROUNDS = 2`).
+- Rolling window during match: current round + next 2 (`PRELOAD_WINDOW_ROUNDS = 3`).
+- Max concurrent preload tasks: 2.
+- Gate failure/timeout surfaces retry UI (`Retry preload`).
+- On success, client emits `game:preload_ready` exactly once per session.
 
-- Avoid duplicate anime in same game.
-- Require playable OP media before finalizing a pick.
-- If insufficient MAL content, fallback to `POPULAR`.
+## 6. Round State Machine (Server Authoritative)
 
-### 5.2 Search suggestions (Jikan)
+Per round status progression:
 
-Use Jikan only through backend proxy endpoint, never direct from clients per keystroke.
+1. `PENDING`
+2. `GUESSING`
+3. `ANSWERS_REVEAL`
+4. `SOLUTION_REVEAL`
+5. `ROUND_END`
 
-Server controls:
+Notes:
 
-- Debounce at client (250-400 ms)
-- Min chars (2 or 3)
-- Rate limit per user/IP
-- Cache suggestions (in-memory + optional Redis)
+- Transitions use DB compare-and-set guards.
+- `endsAt` timestamps are emitted for client countdown sync.
+- Recovery sweep runs periodically (1.5s interval) to restore timers after transient failures/restarts.
 
-Reason: protects against external API rate limits and 429 bursts in multiplayer rooms.
+## 7. Guessing, Ready/Skip, and Scoring
 
-### 5.3 Opening media (AnimeThemes)
+- Guesses only accepted in `GUESSING`.
+- `round:set_ready` implements skip/ready lock:
+  - `ready: true` locks guess (or blank guess)
+  - `ready: false` unlocks while still in `GUESSING`
+- All-ready immediately ends guessing (`reason: all_ready`).
+- Scoring is server-side only.
 
-Use AnimeThemes metadata for OP audio/video URLs and timestamps.
+Correctness check order:
 
-Server responsibilities:
+1. `guessAnimeId` must match any `acceptedAnimeIds` for the round (includes canonical anime ID), else
+2. normalized text comparison with expected anime title.
 
-- Resolve candidate openings before game starts
-- Validate media URLs
-- Store preselected media data in round payload
-- Prefer cached results to reduce repeated upstream calls
+## 8. Source, Selection, MAL, and Theme Modes
 
-### 5.4 Balanced player quotas
+### 8.1 Source modes
 
-When `selectionMode` is enabled for MAL-based games, round picks are distributed fairly between players.
+- `POPULAR`: popular catalog only
+- `MAL_ONLY`: MAL-derived only (fails if insufficient)
+- `HYBRID`: MAL first with popular fallback
 
-Example:
+### 8.2 Selection modes
 
-- 2 players
-- `roundCount = 10`
-- `selectionMode = BALANCED_STRICT`
+- `STANDARD`: rotating source attribution
+- `BALANCED_STRICT`: strict per-player quota, fails on quota gaps
+- `BALANCED_RELAXED`: per-player target with relaxed fallback
 
-Expected distribution:
+Rules:
 
-- 5 anime sourced from Player A watched list
-- 5 anime sourced from Player B watched list
+- Balanced modes require at least 2 players.
+- `MAL_ONLY` requires enough MAL pool.
+- `BALANCED_STRICT` requires MAL linked and fetchable for all players.
 
-Server algorithm:
+### 8.3 MAL watched-list filter
 
-1. Build watched-anime candidate pools per player.
-2. Filter to entries with playable OP media.
-3. Deduplicate globally by anime ID.
-4. Compute quotas:
-   - `quota = floor(roundCount / playerCount)`
-   - distribute any remainder deterministically (host-first or seeded order).
-5. Fill rounds while preserving quotas, and persist `sourcePlayerId` on each round.
+Included statuses:
 
-Failure policy:
+- `watching`
+- `completed`
 
-- `BALANCED_STRICT`:
-  - if any player cannot satisfy quota after filtering, game start fails with clear error.
-- `BALANCED_RELAXED`:
-  - try quotas first, then fill missing slots from other player pools (or fallback source) and emit warning.
-- Default policy for this project: `BALANCED_STRICT`.
-- Note: expected to be rare when candidate pools are large and media filtering is healthy.
-- Balanced selection modes are multiplayer-only. In single-player games, use `STANDARD`.
+Excluded statuses:
 
-## 6. Architecture
+- `dropped`
+- `plan_to_watch`
+- `on_hold`
 
-## 6.1 Backend modules
+### 8.4 Theme modes
 
-- `src/game/lobbyService.js`: lobby create/join/leave/start
-- `src/game/sessionService.js`: round generation and timers
-- `src/game/mediaService.js`: AnimeThemes fetch/map/cache
-- `src/game/searchService.js`: Jikan proxy + cache + throttling
-- `src/game/scoringService.js`: answer normalization and scoring
-- `src/realtime/socket.js`: Socket.IO setup and event routing
+- `OP_ONLY`: opening themes only
+- `ED_ONLY`: ending themes only
+- `MIXED`: currently allows `OP`, `ED`, and `IN`
 
-## 6.2 Frontend split
+## 9. Media Resolution, Playback, and Proxy
 
-- Keep existing auth/dashboard HTML pages.
-- Build game client in React (separate app mount for `/game` route).
+### 9.1 Round media resolution
 
-Why React only for this game?
+- Media provider: AnimeThemes
+- Candidate pick is deterministic by round index over filtered candidates.
+- Sample start is generated server-side when possible (`sampleStartSec`).
+- Accepted equivalent anime IDs for reused songs are resolved and stored in `GameRound.acceptedAnimeIds`.
 
-- Multiplayer state is complex (timer, players, guesses, reveals, reconnects).
-- React reduces UI/state bugs without requiring a full site migration.
+### 9.2 Sample playback behavior (client)
 
-## 6.3 Real-time transport
+- Sample player shown in `GUESSING` and `ANSWERS_REVEAL`.
+- Client tries audio first, falls back to video audio.
+- Autoplay failures show fallback controls (`Play sample`).
+- Default volume is 25%.
+- On `SOLUTION_REVEAL`, sample playback is stopped.
 
-Use Socket.IO for:
+### 9.3 Solution playback behavior
 
-- Lobby presence
-- Round state changes
-- Timer sync
-- Guess submissions
-- Scoreboard updates
+- On `SOLUTION_REVEAL`, solution video attempts autoplay.
+- Browser-blocked autoplay surfaces manual play fallback.
 
-Keep REST for:
+### 9.4 Proxy and cache
 
-- Initial lobby creation
-- Game configuration
-- Search endpoint
-- Historical stats
+- Client-facing media links are signed proxy URLs (`/api/game/media/proxy`).
+- Proxy validates signatures/TTL and enforces SSRF protections.
+- Host allowlist is enforced (`MEDIA_PROXY_ALLOWED_HOSTS`).
+- Disk cache is scoped by lobby (`.cache/media/<LOBBY_CODE>`).
+- Completed round media is evicted after round finalize.
+- Entire lobby cache directory is removed when match finishes.
 
-## 6.4 Lobby system
+## 10. Search and Catalog
 
-- A user can create a lobby and become host.
-- Host waits in pre-game lobby until players join.
-- Single-player is allowed: host may start immediately without waiting for others.
-- Maximum lobby size: 8 players.
-- Players can join via:
-  - invite link,
-  - lobby search menu.
-- Lobby search should return only joinable lobbies (for example: `status=WAITING`, not full, not private if privacy rules exist).
-- Host can start match when minimum player count is met (`minPlayers=1` by default).
+### 10.1 Anime search (`POST /api/game/search`)
 
-## 7. Data Model (Prisma proposal)
+Pipeline:
 
-Current `Game` and `Round` models are not enough for multiplayer sessions/lobbies.
-Add the following models (or equivalent):
+1. local catalog (`AnimeCatalogEntry`)
+2. Jikan fallback
+3. async upsert of fallback results into local catalog
 
-- `Lobby`
-  - `id`, `code`, `hostUserId`, `status`, `createdAt`
-- `LobbyPlayer`
-  - `id`, `lobbyId`, `userId`, `displayName`, `joinedAt`, `isConnected`
-- `GameSession`
-  - `id`, `lobbyId`, `status`, `currentRound`, `roundCount`, `startedAt`, `endedAt`
-- `GameRound`
-  - `id`, `sessionId`, `index`, `animeId`, `animeTitle`, `opTitle`, `sampleStartSec`, `sampleDurationSec`, `solutionVideoUrl`, `sourcePlayerId`
-- `RoundGuess`
-  - `id`, `roundId`, `userId`, `guessText`, `guessAnimeId`, `isCorrect`, `submittedAt`
+Behavior:
 
-This supports live sessions plus replay/history.
+- unreleased/upcoming entries are filtered out
+- title fields include English/Japanese when available
+- in-memory query cache with TTL
+- route-level rate limit
 
-## 8. Event Contract (Socket.IO)
+### 10.2 Catalog sync jobs
+
+- startup incremental sweep (default startup pages = 8)
+- interval incremental sweep (default 24h)
+- optional full backfill script (`npm run catalog:backfill`)
+- retry/backoff for 429/5xx/network transient errors
+
+## 11. Realtime Contract
 
 Client -> server:
 
-- `lobby:join` `{ lobbyCode }`
+- `lobby:join`
 - `lobby:leave`
-- `game:start` `{ roundCount, guessSeconds, sampleSeconds, sourceMode, selectionMode }` (host only)
-- `round:submit_guess` `{ roundId, guessText, guessAnimeId }`
-- `round:set_ready` `{ roundId, ready: true|false }`  // tied to Skip toggle
-- `presence:ping`
+- `lobby:update_settings`
+- `game:start`
+- `game:preload_ready`
+- `round:submit_guess`
+- `round:set_ready`
+- `round:sync` (ack-based state snapshot)
 
 Server -> client:
 
-- `lobby:state` `{ players, hostUserId, status }`
-- `game:started` `{ sessionId, config }` (includes resolved quotas when balanced mode is used)
-- `round:started` `{ roundId, index, totalRounds, endsAt, sample }`
-- `round:answers_reveal` `{ roundId, answers }`
-- `round:solution` `{ roundId, correctAnime, video, scores }`
-- `game:finished` `{ finalScores, winner }`
-- `error` `{ code, message }`
+- `lobby:state`
+- `game:started`
+- `round:started`
+- `round:ready_state`
+- `round:answers_reveal`
+- `round:solution`
+- `game:sudden_death`
+- `game:finished`
+- `error`
 
-## 9. REST API Contract (minimum)
+## 12. REST Surface (Game)
 
 - `POST /api/game/lobbies`
-  - create lobby
 - `POST /api/game/lobbies/:code/join`
-  - join lobby
 - `GET /api/game/lobbies/:code`
-  - lobby snapshot
 - `GET /api/game/lobbies`
-  - lobby search/list (filter joinable lobbies)
 - `GET /api/game/lobbies/:code/invite`
-  - returns invite link metadata
 - `POST /api/game/search`
-  - backend Jikan search proxy
-- `GET /api/game/history`
-  - recent sessions for current user
+- `GET /api/game/media-source-status`
+- `GET /api/game/media/proxy`
 
-All protected routes require JWT auth.
+## 13. Sudden Death
 
-## 10. Answer Matching
+If planned rounds end with a top-score tie:
 
-Implement deterministic normalization before scoring:
+- backend emits `game:sudden_death`
+- extra rounds continue until tie breaks or hard cap reached
+- hard cap: `MAX_SUDDEN_DEATH_ROUNDS = 20`
 
-- Lowercase
-- Trim spaces
-- Remove punctuation
-- Collapse repeated spaces
-- Optionally normalize romanization aliases
+## 14. Cleanup, Validation, and Telemetry
 
-Preferred correctness check order:
+- Idle lobby cleanup defaults:
+  - timeout: 10 minutes (`LOBBY_IDLE_TIMEOUT_MS`)
+  - sweep: 60 seconds (`LOBBY_CLEANUP_INTERVAL_MS`)
+- Maintenance sweep also:
+  - cancels stale `IN_PROGRESS` sessions
+  - prunes old `FINISHED`/`CANCELLED` sessions
+  - prunes expired rate-limit rows
+- Startup env validation is strict and fails fast.
+- Structured JSON telemetry spans startup, rounds, media, search, and cleanup.
 
-1. `guessAnimeId` exact match (if selected from search list)
-2. fallback normalized title string compare
+## 15. Known Gaps / Follow-ups
 
-Use server-side scoring only.
-
-## 11. Security and Abuse Controls
-
-- Server-authoritative timers and scoring
-- Ignore late guesses after deadline
-- Per-user and per-IP rate limits on search and guess events
-- Input length limits and sanitization on guess text
-- JWT auth required for lobby/game actions
-- Do not expose MAL refresh tokens to frontend
-
-## 12. Reliability
-
-- Handle disconnect/reconnect:
-  - keep seat for N seconds
-  - restore current round state on reconnect
-- Idempotent guess updates (same user+round replaces previous guess if allowed)
-- Guard against host disconnect:
-  - assign new host or end lobby by policy
-
-## 13. Performance
-
-- Cache Jikan search results (`q`, page) for short TTL (e.g., 5-30 min)
-- Cache AnimeThemes metadata for longer TTL (e.g., 1-24 h)
-- Pre-resolve all round media before `game:start` broadcast
-- Send lightweight events; avoid large payloads every tick
-- Use a single authoritative timer and broadcast `endsAt` instead of per-second spam
-
-## 14. MVP Scope (recommended)
-
-Phase 1:
-
-- Private lobby by code
-- 1 to 8 players
-- Popular-only source
-- Fixed config: 10 rounds, 20s guess, 10s sample
-- Jikan live search proxy
-- Basic score table
-
-### 14.1 Tiebreaker policy
-
-- If top score is tied after final round, run sudden-death rounds:
-  - each extra round can break the tie,
-  - continue until one player (or team, if added later) leads after a sudden-death round.
-
-Phase 2:
-
-- MAL-based pool (`MAL_ONLY` and `HYBRID`)
-- Better answer aliases
-- Round replay improvements
-- Public lobby search
-
-Phase 3:
-
-- Ranked mode
-- Anti-cheat hardening
-- Matchmaking
-
-## 15. Build Order in This Repo
-
-1. Add multiplayer Prisma models and migrate.
-2. Implement `/api/game` REST endpoints and Socket.IO server.
-3. Implement server round engine and scoring.
-4. Implement balanced selection quota engine (`BALANCED_STRICT` and `BALANCED_RELAXED`).
-5. Add Jikan proxy endpoint with cache and rate limit.
-6. Add AnimeThemes media integration and prefetch pipeline.
-7. Build React game client mounted at `/game`.
-8. Add integration tests for lobby lifecycle, balanced selection, and round scoring.
-
-## 16. Open Decisions
-
-No open decision blockers at this stage.
+- `sampleSeconds` is stored in lobby/session config, but current round media resolution uses `guessSeconds` for `sampleDurationSec`.
+- React UI currently does not expose host lobby setting updates (`lobby:update_settings`) after lobby creation.
+- MAL OAuth success depends on correct redirect URI registration and MAL browser session/cookie state.
