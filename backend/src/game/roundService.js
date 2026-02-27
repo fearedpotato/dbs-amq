@@ -44,13 +44,54 @@ function isProviderFailure(err) {
     return Number.isInteger(err?.status) && err.status >= 500;
 }
 
+function resolveRequestedSampleSeconds(session) {
+    const guessSeconds = Number.parseInt(session?.guessSeconds, 10);
+    const answersRevealSeconds = Number.parseInt(session?.answersRevealSeconds, 10);
+    const fallbackSampleSeconds = Number.parseInt(session?.sampleSeconds, 10);
+
+    const guess = Number.isInteger(guessSeconds) && guessSeconds > 0
+        ? guessSeconds
+        : (Number.isInteger(fallbackSampleSeconds) && fallbackSampleSeconds > 0 ? fallbackSampleSeconds : 10);
+    const answers = Number.isInteger(answersRevealSeconds) && answersRevealSeconds > 0
+        ? answersRevealSeconds
+        : 0;
+
+    // Keep sample audible throughout GUESSING and ANSWERS_REVEAL.
+    return guess + answers;
+}
+
+function buildRoundMediaSignature(media) {
+    if (!media || typeof media !== 'object') return null;
+
+    const animeId = Number.parseInt(media.animeId, 10);
+    if (!Number.isInteger(animeId) || animeId <= 0) return null;
+
+    const themeType = String(media.themeType || '').trim().toUpperCase();
+    const themeTitle = String(media.themeTitle || '').trim().toLowerCase();
+    const songId = Number.parseInt(media.themeSongId, 10);
+    const videoUrl = String(media.solutionVideoUrl || '').trim();
+
+    if (Number.isInteger(songId) && songId > 0) {
+        return `${animeId}|song:${songId}|${themeType}`;
+    }
+    if (themeType || themeTitle || videoUrl) {
+        return `${animeId}|${themeType}|${themeTitle}|${videoUrl}`;
+    }
+    return null;
+}
+
 async function selectRoundMedia({
     session,
     roundIndex,
     usedAnimeIds,
-    allowReuse = false
+    usedMediaSignatures = null,
+    allowReuse = false,
+    catalogSeeds = null
 }) {
-    const catalog = rotateCatalogForSession(session.id);
+    const sampleSeconds = resolveRequestedSampleSeconds(session);
+    const catalog = Array.isArray(catalogSeeds) && catalogSeeds.length > 0
+        ? catalogSeeds
+        : rotateCatalogForSession(session.id);
     if (catalog.length === 0) return null;
 
     const start = (roundIndex - 1) % catalog.length;
@@ -66,7 +107,7 @@ async function selectRoundMedia({
                 animeId: seed.animeId,
                 animeTitle: seed.animeTitle,
                 themeMode: session.themeMode,
-                sampleSeconds: session.guessSeconds,
+                sampleSeconds,
                 roundIndex
             });
         } catch (err) {
@@ -76,6 +117,8 @@ async function selectRoundMedia({
 
         if (!media?.solutionVideoUrl) continue;
         if (!allowReuse && usedAnimeIds.has(media.animeId)) continue;
+        const signature = buildRoundMediaSignature(media);
+        if (signature && usedMediaSignatures instanceof Set && usedMediaSignatures.has(signature)) continue;
 
         if (media.animeId === seed.animeId) return media;
         if (!bestFallback) bestFallback = media;
@@ -113,6 +156,7 @@ function buildRoundRow({ sessionId, roundIndex, media, sourcePlayerId, lobbyCode
 }
 
 async function generateInitialRoundsForSession({ session, lobby }) {
+    const sampleSeconds = resolveRequestedSampleSeconds(session);
     const existingCount = await prisma.gameRound.count({
         where: { sessionId: session.id }
     });
@@ -128,8 +172,26 @@ async function generateInitialRoundsForSession({ session, lobby }) {
     if (!Array.isArray(plannedSeeds) || plannedSeeds.length < session.roundCount) {
         throw httpError(503, 'Could not prepare enough round seeds for this match');
     }
+    const isMalOnly = session.sourceMode === 'MAL_ONLY'
+        && plannedSeeds.some((seed) => Number.isInteger(Number.parseInt(seed?.sourcePlayerId, 10)));
+    const plannedCatalogSeeds = [];
+    const sourcePlayerByAnimeId = new Map();
+    for (const seed of plannedSeeds) {
+        const animeId = Number.parseInt(seed?.animeId, 10);
+        if (!Number.isInteger(animeId) || animeId <= 0) continue;
+        if (sourcePlayerByAnimeId.has(animeId)) continue;
+
+        sourcePlayerByAnimeId.set(animeId, Object.prototype.hasOwnProperty.call(seed, 'sourcePlayerId')
+            ? seed.sourcePlayerId
+            : null);
+        plannedCatalogSeeds.push({
+            animeId,
+            animeTitle: seed?.animeTitle || `Anime ${animeId}`
+        });
+    }
 
     const usedAnimeIds = new Set();
+    const usedMediaSignatures = new Set();
     const rows = [];
     for (let i = 1; i <= session.roundCount; i += 1) {
         const seed = plannedSeeds[i - 1];
@@ -140,26 +202,49 @@ async function generateInitialRoundsForSession({ session, lobby }) {
             animeId: seed.animeId,
             animeTitle: seed.animeTitle,
             themeMode: session.themeMode,
-            sampleSeconds: session.guessSeconds,
+            sampleSeconds,
             roundIndex: i
         });
 
-        const mediaUnavailable = !media?.solutionVideoUrl || usedAnimeIds.has(media.animeId);
+        const initialSignature = buildRoundMediaSignature(media);
+        const mediaUnavailable = !media?.solutionVideoUrl
+            || usedAnimeIds.has(media.animeId)
+            || (initialSignature && usedMediaSignatures.has(initialSignature));
         if (mediaUnavailable) {
-            media = await selectRoundMedia({
-                session,
-                roundIndex: i,
-                usedAnimeIds,
-                allowReuse: false
-            });
-            resolvedSourcePlayerId = null;
+            if (isMalOnly) {
+                media = await selectRoundMedia({
+                    session,
+                    roundIndex: i,
+                    usedAnimeIds,
+                    usedMediaSignatures,
+                    allowReuse: false,
+                    catalogSeeds: plannedCatalogSeeds
+                });
+                if (media && sourcePlayerByAnimeId.has(media.animeId)) {
+                    resolvedSourcePlayerId = sourcePlayerByAnimeId.get(media.animeId);
+                }
+            } else {
+                media = await selectRoundMedia({
+                    session,
+                    roundIndex: i,
+                    usedAnimeIds,
+                    usedMediaSignatures,
+                    allowReuse: false
+                });
+                resolvedSourcePlayerId = null;
+            }
         }
 
         if (!media) {
+            if (isMalOnly) {
+                throw httpError(503, `MAL_ONLY mode could not resolve enough playable round media (${rows.length}/${session.roundCount})`);
+            }
+
             media = await selectRoundMedia({
                 session,
                 roundIndex: i,
                 usedAnimeIds,
+                usedMediaSignatures,
                 allowReuse: true
             });
             resolvedSourcePlayerId = null;
@@ -169,7 +254,13 @@ async function generateInitialRoundsForSession({ session, lobby }) {
             throw httpError(503, `Could not resolve enough playable round media (${rows.length}/${session.roundCount})`);
         }
 
+        const finalizedSignature = buildRoundMediaSignature(media);
+        if (finalizedSignature && usedMediaSignatures.has(finalizedSignature)) {
+            throw httpError(503, `Could not resolve enough unique round media (${rows.length}/${session.roundCount})`);
+        }
+
         usedAnimeIds.add(media.animeId);
+        if (finalizedSignature) usedMediaSignatures.add(finalizedSignature);
         rows.push(buildRoundRow({
             sessionId: session.id,
             roundIndex: i,
@@ -196,15 +287,36 @@ async function ensureRoundForIndex({ session, index, lobbyPlayers }) {
 
     const existingRounds = await prisma.gameRound.findMany({
         where: { sessionId: session.id },
-        select: { animeId: true }
+        select: {
+            animeId: true,
+            animeTitle: true,
+            themeType: true,
+            themeTitle: true,
+            solutionVideoUrl: true
+        }
     });
     const usedAnimeIds = new Set(existingRounds.map((row) => row.animeId));
+    const usedMediaSignatures = new Set(
+        existingRounds
+            .map((row) => buildRoundMediaSignature(row))
+            .filter((value) => typeof value === 'string' && value.length > 0)
+    );
+    const malOnlyCatalogSeeds = session.sourceMode === 'MAL_ONLY'
+        ? existingRounds
+            .map((row) => ({
+                animeId: Number.parseInt(row.animeId, 10),
+                animeTitle: row.animeTitle
+            }))
+            .filter((row) => Number.isInteger(row.animeId) && row.animeId > 0)
+        : null;
 
     let media = await selectRoundMedia({
         session,
         roundIndex: index,
         usedAnimeIds,
-        allowReuse: false
+        usedMediaSignatures,
+        allowReuse: false,
+        catalogSeeds: malOnlyCatalogSeeds
     });
 
     if (!media) {
@@ -212,12 +324,19 @@ async function ensureRoundForIndex({ session, index, lobbyPlayers }) {
             session,
             roundIndex: index,
             usedAnimeIds,
-            allowReuse: true
+            usedMediaSignatures,
+            allowReuse: true,
+            catalogSeeds: malOnlyCatalogSeeds
         });
     }
 
     if (!media) {
         throw httpError(503, 'Could not resolve playable media for this round');
+    }
+
+    const mediaSignature = buildRoundMediaSignature(media);
+    if (mediaSignature && usedMediaSignatures.has(mediaSignature)) {
+        throw httpError(503, 'Could not resolve unique playable media for this round');
     }
 
     return prisma.gameRound.create({

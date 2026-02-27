@@ -5,6 +5,48 @@ import { closeGameSocket, getGameSocket } from './socketClient';
 const SOURCE_MODES = ['POPULAR', 'MAL_ONLY', 'HYBRID'];
 const SELECTION_MODES = ['STANDARD', 'BALANCED_STRICT', 'BALANCED_RELAXED'];
 const THEME_MODES = ['OP_ONLY', 'ED_ONLY', 'MIXED'];
+const SOURCE_MODE_COPY = {
+    POPULAR: {
+        label: 'Popular Catalog',
+        help: 'Use only the global popular anime catalog.'
+    },
+    MAL_ONLY: {
+        label: 'MAL Only',
+        help: 'Use only anime from linked MyAnimeList accounts.'
+    },
+    HYBRID: {
+        label: 'Hybrid',
+        help: 'Prefer MAL picks, fill remaining rounds with popular catalog.'
+    }
+};
+const SELECTION_MODE_COPY = {
+    STANDARD: {
+        label: 'Standard',
+        help: 'Simple rotation; no strict player balancing.'
+    },
+    BALANCED_STRICT: {
+        label: 'Balanced Strict',
+        help: 'Equal per-player distribution; can fail if MAL pools are too small.'
+    },
+    BALANCED_RELAXED: {
+        label: 'Balanced Relaxed',
+        help: 'Try to balance players, then relax constraints when needed.'
+    }
+};
+const THEME_MODE_COPY = {
+    OP_ONLY: {
+        label: 'Openings Only',
+        help: 'Only OP songs.'
+    },
+    ED_ONLY: {
+        label: 'Endings Only',
+        help: 'Only ED songs.'
+    },
+    MIXED: {
+        label: 'Mixed',
+        help: 'Mix OP, ED, and insert songs when available.'
+    }
+};
 const INITIAL_REQUIRED_ROUNDS = 2;
 const PRELOAD_WINDOW_ROUNDS = 3; // current round + next 2
 const MAX_CONCURRENT_PRELOADS = 2;
@@ -12,13 +54,27 @@ const MAX_CONCURRENT_PRELOADS = 2;
 const CREATE_DEFAULTS = {
     name: '',
     isPrivate: false,
+    maxPlayers: 8,
     roundCount: 10,
     guessSeconds: 20,
-    sampleSeconds: 10,
     sourceMode: 'HYBRID',
     selectionMode: 'STANDARD',
     themeMode: 'MIXED'
 };
+
+function toLobbyConfig(lobby) {
+    if (!lobby) return { ...CREATE_DEFAULTS };
+    return {
+        name: typeof lobby.name === 'string' ? lobby.name : '',
+        isPrivate: Boolean(lobby.isPrivate),
+        maxPlayers: Number.isInteger(lobby.maxPlayers) ? lobby.maxPlayers : CREATE_DEFAULTS.maxPlayers,
+        roundCount: Number.isInteger(lobby.roundCount) ? lobby.roundCount : CREATE_DEFAULTS.roundCount,
+        guessSeconds: Number.isInteger(lobby.guessSeconds) ? lobby.guessSeconds : CREATE_DEFAULTS.guessSeconds,
+        sourceMode: SOURCE_MODES.includes(lobby.sourceMode) ? lobby.sourceMode : CREATE_DEFAULTS.sourceMode,
+        selectionMode: SELECTION_MODES.includes(lobby.selectionMode) ? lobby.selectionMode : CREATE_DEFAULTS.selectionMode,
+        themeMode: THEME_MODES.includes(lobby.themeMode) ? lobby.themeMode : CREATE_DEFAULTS.themeMode
+    };
+}
 
 function emitWithAck(socket, eventName, payload, { timeoutMs = 10_000 } = {}) {
     return new Promise((resolve, reject) => {
@@ -43,14 +99,42 @@ function toCode(value) {
     return String(value || '').trim().toUpperCase();
 }
 
+function lobbyCodeFromInvitePath(pathname) {
+    const rawPath = String(pathname || '').trim();
+    const match = rawPath.match(/^\/(?:amq\/lobby|amq\/invite|invite)\/([^/?#]+)/i);
+    if (!match) return '';
+    try {
+        return toCode(decodeURIComponent(match[1]));
+    } catch (_err) {
+        return '';
+    }
+}
+
 function updateUrl(lobbyCode, inviteToken) {
+    const code = toCode(lobbyCode);
+    const nextPath = code ? `/amq/lobby/${encodeURIComponent(code)}` : '/amq';
     const params = new URLSearchParams(window.location.search);
-    if (lobbyCode) params.set('lobby', lobbyCode);
-    else params.delete('lobby');
-    if (inviteToken) params.set('inviteToken', inviteToken);
-    else params.delete('inviteToken');
+    if (inviteToken) {
+        params.set('i', inviteToken);
+        params.delete('inviteToken');
+        params.delete('lobby');
+    } else {
+        params.delete('lobby');
+        params.delete('i');
+        params.delete('inviteToken');
+    }
     const query = params.toString();
-    window.history.replaceState({}, '', query ? `${window.location.pathname}?${query}` : window.location.pathname);
+    window.history.replaceState({}, '', query ? `${nextPath}?${query}` : nextPath);
+}
+
+function lobbyCodeFromInviteToken(token) {
+    const value = String(token || '').trim();
+    if (!value) return '';
+    const parts = value.split('.');
+    if (parts.length !== 3) return '';
+    const code = String(parts[0] || '').toUpperCase();
+    if (!/^[A-Z0-9]{4,12}$/.test(code)) return '';
+    return code;
 }
 
 function formatCountdown(ms) {
@@ -59,6 +143,18 @@ function formatCountdown(ms) {
     const min = Math.floor(total / 60);
     const sec = total % 60;
     return `${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+}
+
+function clampInteger(value, min, max) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed)) return min;
+    return Math.max(min, Math.min(max, parsed));
+}
+
+function normalizeMaxPlayersInput(rawValue) {
+    const digits = String(rawValue || '').replace(/\D+/g, '');
+    if (!digits) return '';
+    return digits.slice(0, 2);
 }
 
 function byScoreDesc(a, b) {
@@ -87,6 +183,7 @@ function toStartErrorMessage(message) {
     const raw = normalizeErrorMessage(message).toLowerCase();
     if (!raw) return 'Could not start the game right now. Please try again.';
     if (raw.includes('only host')) return 'Only the host can start the game.';
+    if (raw.includes('all players must be ready')) return 'All players must click Ready before the host can start.';
     if (raw.includes('not enough players')) return 'Not enough players to start. Invite more players or lower the minimum players setting.';
     if (raw.includes('balanced strict')) return 'Balanced strict could not build fair rounds from MAL lists. Try BALANCED_RELAXED or HYBRID.';
     if (raw.includes('mal_only')) return 'MAL_ONLY could not build enough rounds from linked MAL lists. Try HYBRID or POPULAR.';
@@ -114,6 +211,26 @@ function toMediaErrorMessage(reason) {
         return 'This sample source failed to load for your browser.';
     }
     return 'Could not play sample audio for this round.';
+}
+
+function shouldRefreshLobbyDirectoryOnJoinError(message) {
+    const raw = normalizeErrorMessage(message).toLowerCase();
+    if (!raw) return false;
+    return raw.includes('lobby not found')
+        || raw.includes('not accepting new players')
+        || raw.includes('lobby is full');
+}
+
+function toJoinErrorMessage(message) {
+    const raw = normalizeErrorMessage(message).toLowerCase();
+    if (!raw) return 'Could not join this lobby right now.';
+    if (raw.includes('kicked from this lobby')) {
+        return normalizeErrorMessage(message);
+    }
+    if (raw.includes('valid invite token is required')) {
+        return 'This lobby is private. Ask the host for the invite link.';
+    }
+    return normalizeErrorMessage(message);
 }
 
 function classifyPlaybackError(err) {
@@ -153,6 +270,12 @@ export default function App() {
     const inviteTokenRef = useRef('');
     const pendingJoinRef = useRef(null);
     const autoJoinDoneRef = useRef(false);
+    const lobbyDirectoryRefreshTimerRef = useRef(null);
+    const fetchLobbiesInFlightRef = useRef(false);
+    const joinInFlightRef = useRef(false);
+    const joinCooldownUntilRef = useRef(0);
+    const kickInFlightRef = useRef(false);
+    const promoteInFlightRef = useRef(false);
     const sampleAudioRef = useRef(null);
     const sampleVideoRef = useRef(null);
     const solutionVideoRef = useRef(null);
@@ -186,11 +309,18 @@ export default function App() {
     const [user, setUser] = useState(null);
     const [lobbies, setLobbies] = useState([]);
     const [lobbyQuery, setLobbyQuery] = useState('');
+    const [hostModalOpen, setHostModalOpen] = useState(false);
+    const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+    const [promoteConfirmTarget, setPromoteConfirmTarget] = useState(null);
+    const [kickConfirmTarget, setKickConfirmTarget] = useState(null);
+    const [lobbiesRefreshing, setLobbiesRefreshing] = useState(false);
 
     const [createConfig, setCreateConfig] = useState(CREATE_DEFAULTS);
+    const [editConfig, setEditConfig] = useState(CREATE_DEFAULTS);
+    const [createMaxPlayersInput, setCreateMaxPlayersInput] = useState(String(CREATE_DEFAULTS.maxPlayers));
+    const [editMaxPlayersInput, setEditMaxPlayersInput] = useState(String(CREATE_DEFAULTS.maxPlayers));
     const [joinCode, setJoinCode] = useState('');
     const [inviteToken, setInviteToken] = useState('');
-    const [displayName, setDisplayName] = useState('');
 
     const [lobby, setLobby] = useState(null);
     const [sessionInfo, setSessionInfo] = useState(null);
@@ -202,6 +332,8 @@ export default function App() {
     const [solution, setSolution] = useState(null);
     const [finalResult, setFinalResult] = useState(null);
     const [readyUserIds, setReadyUserIds] = useState([]);
+    const [lobbyReadyUserIds, setLobbyReadyUserIds] = useState([]);
+    const [lobbyReadyRequiredUserIds, setLobbyReadyRequiredUserIds] = useState([]);
 
     const [guessText, setGuessText] = useState('');
     const [guessAnimeId, setGuessAnimeId] = useState(null);
@@ -221,8 +353,47 @@ export default function App() {
     const [preloadRetrying, setPreloadRetrying] = useState(false);
     const [suddenDeathState, setSuddenDeathState] = useState(null);
     const [mediaSourceStatus, setMediaSourceStatus] = useState(null);
-    const [mediaSourceLoading, setMediaSourceLoading] = useState(false);
     const [mediaSourceError, setMediaSourceError] = useState('');
+
+    const handleCreateMaxPlayersChange = useCallback((rawValue) => {
+        const nextInput = normalizeMaxPlayersInput(rawValue);
+        setCreateMaxPlayersInput(nextInput);
+        if (!nextInput) return;
+        setCreateConfig((previous) => ({
+            ...previous,
+            maxPlayers: clampInteger(nextInput, 1, 8)
+        }));
+    }, []);
+
+    const handleEditMaxPlayersChange = useCallback((rawValue) => {
+        const nextInput = normalizeMaxPlayersInput(rawValue);
+        setEditMaxPlayersInput(nextInput);
+        if (!nextInput) return;
+        setEditConfig((previous) => ({
+            ...previous,
+            maxPlayers: clampInteger(nextInput, 1, 8)
+        }));
+    }, []);
+
+    const commitCreateMaxPlayersInput = useCallback(() => {
+        const fallback = clampInteger(createConfig.maxPlayers, 1, 8);
+        const committed = createMaxPlayersInput
+            ? clampInteger(createMaxPlayersInput, 1, 8)
+            : fallback;
+        setCreateConfig((previous) => ({ ...previous, maxPlayers: committed }));
+        setCreateMaxPlayersInput(String(committed));
+        return committed;
+    }, [createConfig.maxPlayers, createMaxPlayersInput]);
+
+    const commitEditMaxPlayersInput = useCallback(() => {
+        const fallback = clampInteger(editConfig.maxPlayers, 1, 8);
+        const committed = editMaxPlayersInput
+            ? clampInteger(editMaxPlayersInput, 1, 8)
+            : fallback;
+        setEditConfig((previous) => ({ ...previous, maxPlayers: committed }));
+        setEditMaxPlayersInput(String(committed));
+        return committed;
+    }, [editConfig.maxPlayers, editMaxPlayersInput]);
 
     useEffect(() => {
         lobbyRef.current = lobby;
@@ -235,6 +406,67 @@ export default function App() {
     useEffect(() => {
         sampleVolumeRef.current = sampleVolume;
     }, [sampleVolume]);
+
+    useEffect(() => {
+        if (!hostModalOpen && !settingsModalOpen && !promoteConfirmTarget && !kickConfirmTarget) return undefined;
+        const onKeyDown = (event) => {
+            if (event.key !== 'Escape') return;
+            if (kickConfirmTarget) {
+                setKickConfirmTarget(null);
+                return;
+            }
+            if (promoteConfirmTarget) {
+                setPromoteConfirmTarget(null);
+                return;
+            }
+            if (settingsModalOpen) {
+                setSettingsModalOpen(false);
+                return;
+            }
+            setHostModalOpen(false);
+        };
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+    }, [hostModalOpen, kickConfirmTarget, promoteConfirmTarget, settingsModalOpen]);
+
+    useEffect(() => {
+        if (!kickConfirmTarget) return;
+        const stillInLobby = (lobby?.players || []).some((player) => player.userId === kickConfirmTarget.userId);
+        if (!stillInLobby) {
+            setKickConfirmTarget(null);
+        }
+    }, [kickConfirmTarget, lobby]);
+
+    useEffect(() => {
+        if (!promoteConfirmTarget) return;
+        const stillInLobby = (lobby?.players || []).some((player) => player.userId === promoteConfirmTarget.userId);
+        if (!stillInLobby) {
+            setPromoteConfirmTarget(null);
+        }
+    }, [promoteConfirmTarget, lobby]);
+
+    useEffect(() => {
+        if (!lobby || lobby.status !== 'WAITING') {
+            setSettingsModalOpen(false);
+            return;
+        }
+        if (settingsModalOpen) return;
+        const nextConfig = toLobbyConfig(lobby);
+        setEditConfig(nextConfig);
+        setEditMaxPlayersInput(String(nextConfig.maxPlayers));
+    }, [lobby, settingsModalOpen]);
+
+    useEffect(() => {
+        if (!error) return undefined;
+        const timer = window.setTimeout(() => setError(''), 7000);
+        return () => window.clearTimeout(timer);
+    }, [error]);
+
+    useEffect(() => {
+        if (!info) return undefined;
+        const timer = window.setTimeout(() => setInfo(''), 4500);
+        return () => window.clearTimeout(timer);
+    }, [info]);
 
     useEffect(() => {
         if (!searchMenuOpen || phase !== 'GUESSING') return undefined;
@@ -868,6 +1100,8 @@ export default function App() {
         setSolution(null);
         setFinalResult(null);
         setReadyUserIds([]);
+        setLobbyReadyUserIds([]);
+        setLobbyReadyRequiredUserIds([]);
         setGuessText('');
         setGuessAnimeId(null);
         setSearchResults([]);
@@ -925,22 +1159,26 @@ export default function App() {
         }
     }, [applySyncState]);
 
-    const fetchLobbies = useCallback(async (query = '') => {
-        const q = String(query || '').trim();
-        const params = new URLSearchParams();
-        if (q) params.set('q', q);
-        const data = await apiFetch(`/game/lobbies${params.toString() ? `?${params}` : ''}`);
-        setLobbies(Array.isArray(data.lobbies) ? data.lobbies : []);
+    const fetchLobbies = useCallback(async () => {
+        if (fetchLobbiesInFlightRef.current) return;
+        fetchLobbiesInFlightRef.current = true;
+        setLobbiesRefreshing(true);
+        try {
+            const data = await apiFetch('/game/lobbies');
+            setLobbies(Array.isArray(data.lobbies) ? data.lobbies : []);
+        } finally {
+            fetchLobbiesInFlightRef.current = false;
+            setLobbiesRefreshing(false);
+        }
     }, []);
 
-    const joinSocketLobby = useCallback(async (code, invite, name) => {
+    const joinSocketLobby = useCallback(async (code, invite) => {
         const socket = socketRef.current;
         if (!socket) return;
 
         const payload = {
             lobbyCode: code,
-            ...(invite ? { inviteToken: invite } : {}),
-            ...(name ? { displayName: name } : {})
+            ...(invite ? { inviteToken: invite } : {})
         };
 
         if (!socket.connected) {
@@ -953,17 +1191,21 @@ export default function App() {
         await requestRoundSync(code);
     }, [requestRoundSync]);
 
-    const joinLobby = useCallback(async (codeInput, inviteInput = '') => {
+    const joinLobby = useCallback(async (codeInput, inviteInput = '', options = {}) => {
         const code = toCode(codeInput);
         if (!code) return setError('Lobby code is required');
+        const fromDirectory = Boolean(options?.fromDirectory);
+        const now = Date.now();
+        if (joinInFlightRef.current) return;
+        if (joinCooldownUntilRef.current > now) return;
 
+        joinInFlightRef.current = true;
         setBusy('join');
         setError('');
         setInfo('');
 
         try {
             const body = {};
-            if (displayName.trim()) body.displayName = displayName.trim();
             if (inviteInput) body.inviteToken = inviteInput;
 
             const data = await apiFetch(`/game/lobbies/${code}/join`, {
@@ -975,35 +1217,78 @@ export default function App() {
             setInviteToken(inviteInput || '');
             clearRoundState();
             updateUrl(code, inviteInput || '');
-            await joinSocketLobby(code, inviteInput || '', displayName.trim());
+            await joinSocketLobby(code, inviteInput || '');
             setInfo(`Joined lobby ${code}`);
         } catch (err) {
-            setError(err.message);
+            joinCooldownUntilRef.current = Date.now() + 800;
+            setError(toJoinErrorMessage(err?.message));
+            if (fromDirectory || shouldRefreshLobbyDirectoryOnJoinError(err?.message)) {
+                setLobbies((current) => current.filter((item) => item?.code !== code));
+                fetchLobbies().catch(() => {});
+            }
         } finally {
+            joinInFlightRef.current = false;
             setBusy('');
         }
-    }, [clearRoundState, displayName, joinSocketLobby]);
+    }, [clearRoundState, fetchLobbies, joinSocketLobby]);
 
     const createLobby = useCallback(async () => {
         setBusy('create');
         setError('');
         setInfo('');
         try {
+            const committedMaxPlayers = commitCreateMaxPlayersInput();
+            const payload = {
+                ...createConfig,
+                maxPlayers: committedMaxPlayers
+            };
             const data = await apiFetch('/game/lobbies', {
                 method: 'POST',
-                body: JSON.stringify(createConfig)
+                body: JSON.stringify(payload)
             });
             setLobby(data.lobby);
+            setHostModalOpen(false);
             clearRoundState();
             updateUrl(data.lobby.code, '');
-            await joinSocketLobby(data.lobby.code, '', displayName.trim());
+            await joinSocketLobby(data.lobby.code, '');
             setInfo(`Created lobby ${data.lobby.code}`);
         } catch (err) {
             setError(err.message);
         } finally {
             setBusy('');
         }
-    }, [clearRoundState, createConfig, displayName, joinSocketLobby]);
+    }, [clearRoundState, commitCreateMaxPlayersInput, createConfig, joinSocketLobby]);
+
+    const openSettingsModal = useCallback(() => {
+        if (!lobby || lobby.status !== 'WAITING') return;
+        const nextConfig = toLobbyConfig(lobby);
+        setEditConfig(nextConfig);
+        setEditMaxPlayersInput(String(nextConfig.maxPlayers));
+        setSettingsModalOpen(true);
+    }, [lobby]);
+
+    const saveLobbySettings = useCallback(async () => {
+        if (!lobby?.code || !socketRef.current) return;
+        setBusy('settings');
+        setError('');
+        try {
+            const committedMaxPlayers = commitEditMaxPlayersInput();
+            const payload = {
+                ...editConfig,
+                maxPlayers: committedMaxPlayers
+            };
+            await emitWithAck(socketRef.current, 'lobby:update_settings', {
+                lobbyCode: lobby.code,
+                settings: payload
+            });
+            setSettingsModalOpen(false);
+            setInfo('Lobby settings updated.');
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setBusy('');
+        }
+    }, [commitEditMaxPlayersInput, editConfig, lobby]);
 
     const leaveLobby = useCallback(async () => {
         if (!lobby?.code) return;
@@ -1018,12 +1303,15 @@ export default function App() {
         } finally {
             setLobby(null);
             setInviteToken('');
+            setSettingsModalOpen(false);
+            setPromoteConfirmTarget(null);
+            setKickConfirmTarget(null);
             updateUrl('', '');
             clearRoundState();
             setBusy('');
-            fetchLobbies(lobbyQuery).catch(() => {});
+            fetchLobbies().catch(() => {});
         }
-    }, [clearRoundState, fetchLobbies, lobby, lobbyQuery]);
+    }, [clearRoundState, fetchLobbies, lobby]);
 
     const startGame = useCallback(async () => {
         if (!lobby?.code || !socketRef.current) return;
@@ -1071,6 +1359,93 @@ export default function App() {
         }
     }, [lobby, readyUserIds, user]);
 
+    const toggleLobbyReady = useCallback(async () => {
+        if (!lobby?.code || !socketRef.current || !user) return;
+        setBusy('lobby-ready');
+        setError('');
+        try {
+            const mine = lobbyReadyUserIds.includes(user.id);
+            await emitWithAck(socketRef.current, 'lobby:set_ready', {
+                lobbyCode: lobby.code,
+                ready: !mine
+            });
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setBusy('');
+        }
+    }, [lobby, lobbyReadyUserIds, user]);
+
+    const kickPlayer = useCallback((player) => {
+        if (!lobby?.code) return;
+        if (!user || lobby.host?.id !== user.id) return;
+        const targetUserId = Number.parseInt(player?.userId, 10);
+        if (!Number.isInteger(targetUserId)) return;
+        if (targetUserId === user?.id) return;
+        const displayName = player?.displayName || `User ${targetUserId}`;
+        setPromoteConfirmTarget(null);
+        setKickConfirmTarget({
+            userId: targetUserId,
+            displayName
+        });
+    }, [lobby, user]);
+
+    const promotePlayer = useCallback((player) => {
+        if (!lobby?.code) return;
+        if (!user || lobby.host?.id !== user.id) return;
+        const targetUserId = Number.parseInt(player?.userId, 10);
+        if (!Number.isInteger(targetUserId)) return;
+        if (targetUserId === user?.id) return;
+        const displayName = player?.displayName || `User ${targetUserId}`;
+        setKickConfirmTarget(null);
+        setPromoteConfirmTarget({
+            userId: targetUserId,
+            displayName
+        });
+    }, [lobby, user]);
+
+    const confirmPromotePlayer = useCallback(async () => {
+        if (!lobby?.code || !socketRef.current || !promoteConfirmTarget) return;
+        if (promoteInFlightRef.current) return;
+        promoteInFlightRef.current = true;
+        setBusy('promote');
+        setError('');
+        try {
+            await emitWithAck(socketRef.current, 'lobby:promote', {
+                lobbyCode: lobby.code,
+                userId: promoteConfirmTarget.userId
+            });
+            setInfo(`${promoteConfirmTarget.displayName} is now the host.`);
+            setPromoteConfirmTarget(null);
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            promoteInFlightRef.current = false;
+            setBusy('');
+        }
+    }, [lobby, promoteConfirmTarget]);
+
+    const confirmKickPlayer = useCallback(async () => {
+        if (!lobby?.code || !socketRef.current || !kickConfirmTarget) return;
+        if (kickInFlightRef.current) return;
+        kickInFlightRef.current = true;
+        setBusy('kick');
+        setError('');
+        try {
+            await emitWithAck(socketRef.current, 'lobby:kick', {
+                lobbyCode: lobby.code,
+                userId: kickConfirmTarget.userId
+            });
+            setInfo(`${kickConfirmTarget.displayName} was kicked from the lobby.`);
+            setKickConfirmTarget(null);
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            kickInFlightRef.current = false;
+            setBusy('');
+        }
+    }, [kickConfirmTarget, lobby]);
+
     const copyInvite = useCallback(async () => {
         if (!lobby?.code) return;
         setBusy('invite');
@@ -1081,6 +1456,9 @@ export default function App() {
             if (data.inviteToken) {
                 setInviteToken(data.inviteToken);
                 updateUrl(lobby.code, data.inviteToken);
+            } else {
+                setInviteToken('');
+                updateUrl(lobby.code, '');
             }
             if (navigator.clipboard?.writeText) {
                 await navigator.clipboard.writeText(data.inviteUrl);
@@ -1114,6 +1492,8 @@ export default function App() {
                         ...(inviteTokenRef.current ? { inviteToken: inviteTokenRef.current } : {})
                     });
                     await requestRoundSync(lobbyRef.current.code);
+                } else {
+                    fetchLobbies().catch(() => {});
                 }
             } catch (err) {
                 setError(err.message);
@@ -1130,12 +1510,21 @@ export default function App() {
             }
             setError(message || 'Realtime error');
         };
-        const onLobbyState = ({ lobby: nextLobby }) => nextLobby && setLobby(nextLobby);
+        const onLobbyState = ({ lobby: nextLobby }) => {
+            if (!nextLobby) return;
+            setLobby(nextLobby);
+            if (nextLobby.status !== 'WAITING') {
+                setLobbyReadyUserIds([]);
+                setLobbyReadyRequiredUserIds([]);
+            }
+        };
         const onGameStarted = ({ sessionId, config, preloadManifest }) => {
             setSessionInfo({ sessionId, ...(config || {}) });
             setFinalResult(null);
             setPhase('PENDING');
             setSuddenDeathState(null);
+            setLobbyReadyUserIds([]);
+            setLobbyReadyRequiredUserIds([]);
             if (lobbyRef.current?.code) {
                 beginSessionPreload({
                     sessionId,
@@ -1201,6 +1590,8 @@ export default function App() {
             setSolutionMediaError('');
             setFinalResult(payload || null);
             setSuddenDeathState(null);
+            setLobbyReadyUserIds([]);
+            setLobbyReadyRequiredUserIds([]);
         };
         const onSuddenDeath = (payload) => {
             const tiedUserIds = Array.isArray(payload?.tiedUserIds)
@@ -1226,11 +1617,56 @@ export default function App() {
         const onReadyState = (payload) => {
             setReadyUserIds(Array.isArray(payload?.readyUserIds) ? payload.readyUserIds : []);
         };
+        const onLobbyReadyState = (payload) => {
+            setLobbyReadyUserIds(Array.isArray(payload?.readyUserIds) ? payload.readyUserIds : []);
+            setLobbyReadyRequiredUserIds(Array.isArray(payload?.requiredUserIds) ? payload.requiredUserIds : []);
+        };
+        const onLobbyKicked = (payload) => {
+            const code = toCode(payload?.lobbyCode);
+            const currentCode = toCode(lobbyRef.current?.code);
+            if (currentCode && code && code !== currentCode) return;
+
+            const cooldownUntil = Number.parseInt(payload?.cooldownUntil, 10);
+            let message = 'You were kicked from the lobby.';
+            if (Number.isFinite(cooldownUntil)) {
+                const remainingMs = cooldownUntil - Date.now();
+                if (remainingMs > 0) {
+                    const remainingSec = Math.max(1, Math.ceil(remainingMs / 1000));
+                    message = `You were kicked from the lobby. Rejoin available in about ${remainingSec}s.`;
+                }
+            }
+            setError(message);
+            setLobby(null);
+            setInviteToken('');
+            setSettingsModalOpen(false);
+            setPromoteConfirmTarget(null);
+            setKickConfirmTarget(null);
+            updateUrl('', '');
+            clearRoundState();
+            fetchLobbies().catch(() => {});
+        };
+        const onLobbyDirectoryChanged = () => {
+            if (lobbyRef.current?.code) return;
+            if (lobbyDirectoryRefreshTimerRef.current) {
+                window.clearTimeout(lobbyDirectoryRefreshTimerRef.current);
+            }
+            lobbyDirectoryRefreshTimerRef.current = window.setTimeout(() => {
+                lobbyDirectoryRefreshTimerRef.current = null;
+                fetchLobbies().catch(() => {});
+            }, 150);
+        };
+        const onMediaSourceStatus = (payload) => {
+            const status = payload?.status || null;
+            if (!status || typeof status !== 'object') return;
+            setMediaSourceStatus(status);
+            setMediaSourceError('');
+        };
 
         socket.on('connect', onConnect);
         socket.on('disconnect', onDisconnect);
         socket.on('error', onSocketError);
         socket.on('lobby:state', onLobbyState);
+        socket.on('lobby:directory_changed', onLobbyDirectoryChanged);
         socket.on('game:started', onGameStarted);
         socket.on('round:started', onRoundStarted);
         socket.on('round:answers_reveal', onAnswersReveal);
@@ -1238,6 +1674,9 @@ export default function App() {
         socket.on('game:finished', onFinished);
         socket.on('game:sudden_death', onSuddenDeath);
         socket.on('round:ready_state', onReadyState);
+        socket.on('lobby:ready_state', onLobbyReadyState);
+        socket.on('lobby:kicked', onLobbyKicked);
+        socket.on('media:source_status', onMediaSourceStatus);
         socket.connect();
 
         return () => {
@@ -1245,6 +1684,7 @@ export default function App() {
             socket.off('disconnect', onDisconnect);
             socket.off('error', onSocketError);
             socket.off('lobby:state', onLobbyState);
+            socket.off('lobby:directory_changed', onLobbyDirectoryChanged);
             socket.off('game:started', onGameStarted);
             socket.off('round:started', onRoundStarted);
             socket.off('round:answers_reveal', onAnswersReveal);
@@ -1252,23 +1692,16 @@ export default function App() {
             socket.off('game:finished', onFinished);
             socket.off('game:sudden_death', onSuddenDeath);
             socket.off('round:ready_state', onReadyState);
+            socket.off('lobby:ready_state', onLobbyReadyState);
+            socket.off('lobby:kicked', onLobbyKicked);
+            socket.off('media:source_status', onMediaSourceStatus);
+            if (lobbyDirectoryRefreshTimerRef.current) {
+                window.clearTimeout(lobbyDirectoryRefreshTimerRef.current);
+                lobbyDirectoryRefreshTimerRef.current = null;
+            }
             closeGameSocket();
         };
-    }, [beginSessionPreload, preloadRollingWindow, requestRoundSync, resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback, token]);
-
-    const refreshMediaSourceStatus = useCallback(async ({ forceRefresh = false, silent = false } = {}) => {
-        if (!silent) setMediaSourceLoading(true);
-        try {
-            const path = forceRefresh ? '/game/media-source-status?refresh=1' : '/game/media-source-status';
-            const data = await apiFetch(path);
-            setMediaSourceStatus(data?.status || null);
-            setMediaSourceError('');
-        } catch (err) {
-            setMediaSourceError(normalizeErrorMessage(err?.message) || 'Could not fetch media source status');
-        } finally {
-            if (!silent) setMediaSourceLoading(false);
-        }
-    }, []);
+    }, [beginSessionPreload, clearRoundState, fetchLobbies, preloadRollingWindow, requestRoundSync, resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback, token]);
 
     useEffect(() => {
         if (!token) return;
@@ -1278,7 +1711,7 @@ export default function App() {
                 const me = await apiFetch('/auth/me');
                 if (!active) return;
                 setUser(me);
-                await fetchLobbies('');
+                await fetchLobbies();
             } catch (_err) {
                 redirectToLogin();
                 return;
@@ -1292,27 +1725,13 @@ export default function App() {
     }, [fetchLobbies, token]);
 
     useEffect(() => {
-        if (!token) return;
-        let active = true;
-
-        refreshMediaSourceStatus({ forceRefresh: true }).catch(() => {});
-        const timer = window.setInterval(() => {
-            if (!active) return;
-            refreshMediaSourceStatus({ silent: true }).catch(() => {});
-        }, 15_000);
-
-        return () => {
-            active = false;
-            window.clearInterval(timer);
-        };
-    }, [refreshMediaSourceStatus, token]);
-
-    useEffect(() => {
         if (loading || !user || autoJoinDoneRef.current) return;
         autoJoinDoneRef.current = true;
         const params = new URLSearchParams(window.location.search);
-        const code = toCode(params.get('lobby'));
-        const tokenFromUrl = params.get('inviteToken') || '';
+        const tokenFromUrl = params.get('i') || params.get('inviteToken') || '';
+        const code = lobbyCodeFromInvitePath(window.location.pathname)
+            || toCode(params.get('lobby'))
+            || lobbyCodeFromInviteToken(tokenFromUrl);
         if (code) {
             setJoinCode(code);
             setInviteToken(tokenFromUrl);
@@ -1455,6 +1874,23 @@ export default function App() {
 
     const isHost = useMemo(() => Boolean(lobby && user && lobby.host?.id === user.id), [lobby, user]);
     const myReady = useMemo(() => Boolean(user && readyUserIds.includes(user.id)), [readyUserIds, user]);
+    const waitingLobbyRequiredUserIds = useMemo(() => {
+        const required = Array.isArray(lobbyReadyRequiredUserIds)
+            ? lobbyReadyRequiredUserIds.filter((value) => Number.isInteger(value))
+            : [];
+        if (required.length > 0) return required;
+        return (lobby?.players || []).map((player) => player.userId).filter((value) => Number.isInteger(value));
+    }, [lobby, lobbyReadyRequiredUserIds]);
+    const waitingLobbyReadyUserIds = useMemo(() => {
+        const readySet = new Set(Array.isArray(lobbyReadyUserIds) ? lobbyReadyUserIds : []);
+        return waitingLobbyRequiredUserIds.filter((memberUserId) => readySet.has(memberUserId));
+    }, [lobbyReadyUserIds, waitingLobbyRequiredUserIds]);
+    const myLobbyReady = useMemo(() => Boolean(user && waitingLobbyReadyUserIds.includes(user.id)), [user, waitingLobbyReadyUserIds]);
+    const allWaitingPlayersReady = useMemo(() => {
+        if (!lobby || lobby.status !== 'WAITING') return false;
+        return waitingLobbyRequiredUserIds.length > 0
+            && waitingLobbyReadyUserIds.length === waitingLobbyRequiredUserIds.length;
+    }, [lobby, waitingLobbyReadyUserIds.length, waitingLobbyRequiredUserIds.length]);
     const hasSampleMedia = useMemo(() => Boolean(round?.sample?.audioUrl || round?.sample?.videoUrl), [round]);
     const showSamplePlayer = useMemo(() => Boolean(round && hasSampleMedia && (phase === 'GUESSING' || phase === 'ANSWERS_REVEAL')), [hasSampleMedia, phase, round]);
     const sampleDurationLabel = useMemo(() => {
@@ -1464,18 +1900,21 @@ export default function App() {
     }, [round]);
     const sampleVolumePercent = useMemo(() => `${Math.round(sampleVolume * 100)}%`, [sampleVolume]);
     const mediaSourceHealth = useMemo(() => {
+        if (!socketConnected) {
+            return { label: 'Disconnected', tone: 'down' };
+        }
         if (!mediaSourceStatus) {
-            return { label: mediaSourceLoading ? 'Checking' : 'Unknown', tone: 'neutral' };
+            return { label: 'Checking', tone: 'neutral' };
         }
         if (!mediaSourceStatus.ok) {
             return { label: 'Down', tone: 'down' };
         }
         const latencyMs = Number(mediaSourceStatus.latencyMs);
-        if (Number.isFinite(latencyMs) && latencyMs >= 2500) {
+        if (Number.isFinite(latencyMs) && latencyMs >= 1200) {
             return { label: 'Slow', tone: 'warn' };
         }
         return { label: 'Healthy', tone: 'ok' };
-    }, [mediaSourceLoading, mediaSourceStatus]);
+    }, [mediaSourceStatus, socketConnected]);
     const mediaSourceLatencyLabel = useMemo(() => {
         const latencyMs = Number(mediaSourceStatus?.latencyMs);
         return Number.isFinite(latencyMs) ? `${Math.round(latencyMs)} ms` : 'n/a';
@@ -1486,38 +1925,23 @@ export default function App() {
         if (Number.isNaN(parsed.getTime())) return 'n/a';
         return parsed.toLocaleTimeString();
     }, [mediaSourceStatus]);
-    const localMediaHealth = useMemo(() => {
-        if (preloadBlocking) {
-            const detail = preloadProgress.total > 0
-                ? `Preloading required rounds (${preloadProgress.ready}/${preloadProgress.total})`
-                : 'Preloading required rounds';
-            return { label: 'Busy', tone: 'warn', detail };
+    const mediaConnectionDetails = useMemo(() => {
+        const details = [
+            `Provider: ${mediaSourceStatus?.provider || 'AnimeThemes'}`,
+            `State: ${mediaSourceHealth.label}`,
+            `Latency: ${mediaSourceLatencyLabel}`,
+            `Last check: ${mediaSourceCheckedLabel}${mediaSourceStatus?.cached ? ' (cached)' : ''}`
+        ];
+        if (mediaSourceStatus?.ok === false && mediaSourceStatus?.error) {
+            details.push(`Error: ${mediaSourceStatus.error}`);
         }
-        if (preloadProgress.failed > 0) {
-            return { label: 'Degraded', tone: 'warn', detail: `Preload failures detected (${preloadProgress.failed})` };
+        if (mediaSourceError) {
+            details.push(`Client: ${mediaSourceError}`);
         }
-        if (mediaError || solutionMediaError) {
-            return { label: 'Degraded', tone: 'warn', detail: 'Client playback errors detected in this session' };
-        }
-        if (sampleAutoplayBlocked || solutionVideoAutoplayBlocked) {
-            return { label: 'Blocked', tone: 'warn', detail: 'Browser autoplay restrictions require user interaction' };
-        }
-        if (samplePlaying) {
-            return { label: 'Active', tone: 'ok', detail: 'Sample playback is running' };
-        }
-        return { label: 'Idle', tone: 'neutral', detail: `Phase ${phase}` };
-    }, [
-        mediaError,
-        phase,
-        preloadBlocking,
-        preloadProgress.failed,
-        preloadProgress.ready,
-        preloadProgress.total,
-        sampleAutoplayBlocked,
-        samplePlaying,
-        solutionMediaError,
-        solutionVideoAutoplayBlocked
-    ]);
+        return details;
+    }, [mediaSourceCheckedLabel, mediaSourceError, mediaSourceHealth.label, mediaSourceLatencyLabel, mediaSourceStatus]);
+    const showRoundCard = useMemo(() => Boolean(lobby) && phase !== 'WAITING' && phase !== 'FINISHED', [lobby, phase]);
+    const showLobbyCard = useMemo(() => Boolean(lobby) && (phase === 'WAITING' || phase === 'FINISHED'), [lobby, phase]);
 
     const onSampleVolumeChange = useCallback((event) => {
         const next = Math.max(0, Math.min(1, Number.parseFloat(event.target.value)));
@@ -1537,6 +1961,26 @@ export default function App() {
         }
         return 'Sudden Death: tie for first place. Extra rounds continue until the tie is broken.';
     }, [phase, resolvePlayerName, round?.isSuddenDeath, suddenDeathState?.tiedUserIds]);
+    const filteredLobbies = useMemo(() => {
+        const q = String(lobbyQuery || '').trim().toLowerCase();
+        if (!q) return lobbies;
+        return lobbies.filter((item) => {
+            const code = String(item?.code || '').toLowerCase();
+            const name = String(item?.name || '').toLowerCase();
+            return code.includes(q) || name.includes(q);
+        });
+    }, [lobbies, lobbyQuery]);
+    const lobbySettingsSummary = useMemo(() => {
+        if (!lobby) return [];
+        return [
+            `Max ${lobby.maxPlayers} players`,
+            `${lobby.roundCount} rounds`,
+            `${lobby.guessSeconds}s guess`,
+            SOURCE_MODE_COPY[lobby.sourceMode]?.label || lobby.sourceMode,
+            SELECTION_MODE_COPY[lobby.selectionMode]?.label || lobby.selectionMode,
+            THEME_MODE_COPY[lobby.themeMode]?.label || lobby.themeMode
+        ];
+    }, [lobby]);
 
     if (loading) return <section className="gmq-shell">Loading game...</section>;
 
@@ -1551,122 +1995,439 @@ export default function App() {
                         {sessionInfo?.sessionId ? ` | Session ${sessionInfo.sessionId}` : ''}
                     </p>
                 </div>
-                {lobby ? (
-                    <div className="gmq-actions">
-                        <button type="button" className="gmq-btn gmq-btn-secondary" onClick={copyInvite} disabled={busy === 'invite'}>Copy Invite</button>
-                        <button type="button" className="gmq-btn gmq-btn-danger" onClick={leaveLobby} disabled={busy === 'leave'}>Leave</button>
+                <div className="gmq-header-right">
+                    <div className="gmq-connection-indicator" role="status" aria-label={`Media source ${mediaSourceHealth.label}`}>
+                        <span className={`gmq-connection-dot gmq-status-dot-${mediaSourceHealth.tone}`} />
+                        <div className="gmq-connection-tooltip">
+                            {mediaConnectionDetails.map((line) => (
+                                <p key={line}>{line}</p>
+                            ))}
+                        </div>
                     </div>
-                ) : null}
+                    {lobby ? (
+                        <div className="gmq-actions">
+                            <button type="button" className="gmq-btn gmq-btn-secondary" onClick={copyInvite} disabled={busy === 'invite'}>Copy Invite</button>
+                            <button type="button" className="gmq-btn gmq-btn-danger" onClick={leaveLobby} disabled={busy === 'leave'}>Leave</button>
+                        </div>
+                    ) : null}
+                </div>
             </header>
 
-            {error ? <div className="gmq-alert gmq-alert-error">{error}</div> : null}
-            {info ? <div className="gmq-alert gmq-alert-info">{info}</div> : null}
+            <div className="gmq-toast-viewport" aria-live="polite" aria-atomic="false">
+                {error ? (
+                    <div className="gmq-alert gmq-alert-error gmq-toast" role="alert">
+                        <p>{error}</p>
+                        <button type="button" className="gmq-toast-close" onClick={() => setError('')} aria-label="Dismiss error">x</button>
+                    </div>
+                ) : null}
+                {info ? (
+                    <div className="gmq-alert gmq-alert-info gmq-toast" role="status">
+                        <p>{info}</p>
+                        <button type="button" className="gmq-toast-close" onClick={() => setInfo('')} aria-label="Dismiss message">x</button>
+                    </div>
+                ) : null}
+            </div>
 
-            {!lobby ? (
-                <div className="gmq-grid">
-                    <article className="gmq-card">
-                        <h2>Create Lobby</h2>
-                        <label>Name</label>
-                        <input value={createConfig.name} onChange={(e) => setCreateConfig((p) => ({ ...p, name: e.target.value }))} placeholder="Optional lobby name"/>
-                        <label className="gmq-checkbox"><input type="checkbox" checked={createConfig.isPrivate} onChange={(e) => setCreateConfig((p) => ({ ...p, isPrivate: e.target.checked }))}/> Private lobby</label>
-                        <div className="gmq-inline">
-                            <input type="number" min="1" max="50" value={createConfig.roundCount} onChange={(e) => setCreateConfig((p) => ({ ...p, roundCount: Number(e.target.value || 10) }))}/>
-                            <input type="number" min="5" max="120" value={createConfig.guessSeconds} onChange={(e) => setCreateConfig((p) => ({ ...p, guessSeconds: Number(e.target.value || 20) }))}/>
-                            <input type="number" min="3" max="60" value={createConfig.sampleSeconds} onChange={(e) => setCreateConfig((p) => ({ ...p, sampleSeconds: Number(e.target.value || 10) }))}/>
+            {promoteConfirmTarget ? (
+                <div className="gmq-modal-backdrop" onClick={() => setPromoteConfirmTarget(null)}>
+                    <article className="gmq-card gmq-modal-card gmq-modal-confirm-card" onClick={(event) => event.stopPropagation()}>
+                        <div className="gmq-modal-header">
+                            <h2>Promote Player</h2>
                         </div>
-                        <div className="gmq-inline">
-                            <select value={createConfig.sourceMode} onChange={(e) => setCreateConfig((p) => ({ ...p, sourceMode: e.target.value }))}>{SOURCE_MODES.map((mode) => <option key={mode} value={mode}>{mode}</option>)}</select>
-                            <select value={createConfig.selectionMode} onChange={(e) => setCreateConfig((p) => ({ ...p, selectionMode: e.target.value }))}>{SELECTION_MODES.map((mode) => <option key={mode} value={mode}>{mode}</option>)}</select>
-                            <select value={createConfig.themeMode} onChange={(e) => setCreateConfig((p) => ({ ...p, themeMode: e.target.value }))}>{THEME_MODES.map((mode) => <option key={mode} value={mode}>{mode}</option>)}</select>
+                        <p>Transfer host to <strong>{promoteConfirmTarget.displayName}</strong>?</p>
+                        <div className="gmq-modal-actions">
+                            <button
+                                type="button"
+                                className="gmq-btn gmq-btn-secondary"
+                                onClick={() => setPromoteConfirmTarget(null)}
+                                disabled={busy === 'promote'}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="gmq-btn gmq-btn-primary"
+                                onClick={confirmPromotePlayer}
+                                disabled={busy === 'promote'}
+                            >
+                                {busy === 'promote' ? 'Promoting...' : 'Promote'}
+                            </button>
                         </div>
-                        <label>Display Name</label>
-                        <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder={user?.nickname || user?.username || 'Player'}/>
-                        <button type="button" className="gmq-btn gmq-btn-primary" onClick={createLobby} disabled={busy === 'create'}>Create Lobby</button>
-                    </article>
-
-                    <article className="gmq-card">
-                        <h2>Join Lobby</h2>
-                        <label>Lobby Code</label>
-                        <input value={joinCode} onChange={(e) => setJoinCode(toCode(e.target.value))} placeholder="ABC123"/>
-                        <label>Invite Token (private lobby)</label>
-                        <input value={inviteToken} onChange={(e) => setInviteToken(e.target.value.trim())} placeholder="Paste invite token"/>
-                        <button type="button" className="gmq-btn gmq-btn-primary" onClick={() => joinLobby(joinCode, inviteToken)} disabled={busy === 'join'}>Join Lobby</button>
-                    </article>
-
-                    <article className="gmq-card">
-                        <h2>Joinable Lobbies</h2>
-                        <div className="gmq-inline">
-                            <input value={lobbyQuery} onChange={(e) => setLobbyQuery(e.target.value)} placeholder="Search by code/name"/>
-                            <button type="button" className="gmq-btn gmq-btn-secondary" onClick={() => fetchLobbies(lobbyQuery)}>Refresh</button>
-                        </div>
-                        <ul className="gmq-lobby-list">
-                            {lobbies.map((item) => (
-                                <li key={item.code} className="gmq-lobby-item">
-                                    <div>
-                                        <div className="gmq-lobby-title">{item.name || item.code}</div>
-                                        <div className="gmq-muted">{item.code} | {item.playerCount}/{item.maxPlayers}</div>
-                                    </div>
-                                    <button type="button" className="gmq-btn gmq-btn-secondary" onClick={() => joinLobby(item.code, '')}>Join</button>
-                                </li>
-                            ))}
-                        </ul>
                     </article>
                 </div>
+            ) : null}
+
+            {kickConfirmTarget ? (
+                <div className="gmq-modal-backdrop" onClick={() => setKickConfirmTarget(null)}>
+                    <article className="gmq-card gmq-modal-card gmq-modal-confirm-card" onClick={(event) => event.stopPropagation()}>
+                        <div className="gmq-modal-header">
+                            <h2>Kick Player</h2>
+                        </div>
+                        <p>Kick <strong>{kickConfirmTarget.displayName}</strong> from this lobby?</p>
+                        <div className="gmq-modal-actions">
+                            <button
+                                type="button"
+                                className="gmq-btn gmq-btn-secondary"
+                                onClick={() => setKickConfirmTarget(null)}
+                                disabled={busy === 'kick'}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="gmq-btn gmq-btn-danger"
+                                onClick={confirmKickPlayer}
+                                disabled={busy === 'kick'}
+                            >
+                                {busy === 'kick' ? 'Kicking...' : 'Kick Player'}
+                            </button>
+                        </div>
+                    </article>
+                </div>
+            ) : null}
+
+            {settingsModalOpen && lobby && lobby.status === 'WAITING' && isHost ? (
+                <div className="gmq-modal-backdrop" onClick={() => setSettingsModalOpen(false)}>
+                    <article className="gmq-card gmq-modal-card" onClick={(event) => event.stopPropagation()}>
+                        <div className="gmq-modal-header">
+                            <h2>Match Settings</h2>
+                            <button
+                                type="button"
+                                className="gmq-btn gmq-btn-secondary gmq-btn-modal-close"
+                                onClick={() => setSettingsModalOpen(false)}
+                            >
+                                Close
+                            </button>
+                        </div>
+                        <div className="gmq-name-private-row">
+                            <div className="gmq-field-stack">
+                                <label htmlFor="edit-lobby-name">Lobby name</label>
+                                <input
+                                    id="edit-lobby-name"
+                                    value={editConfig.name}
+                                    onChange={(e) => setEditConfig((p) => ({ ...p, name: e.target.value }))}
+                                    placeholder="Lobby name"
+                                />
+                            </div>
+                            <label className="gmq-checkbox gmq-checkbox-inline">
+                                <input
+                                    type="checkbox"
+                                    checked={editConfig.isPrivate}
+                                    onChange={(e) => setEditConfig((p) => ({ ...p, isPrivate: e.target.checked }))}
+                                />
+                                Private lobby
+                            </label>
+                        </div>
+                        <div className="gmq-field-grid">
+                            <div className="gmq-field-card">
+                                <label htmlFor="edit-max-players">Max Players</label>
+                                <input
+                                    id="edit-max-players"
+                                    type="number"
+                                    min="1"
+                                    max="8"
+                                    value={editMaxPlayersInput}
+                                    onChange={(e) => handleEditMaxPlayersChange(e.target.value)}
+                                    onBlur={commitEditMaxPlayersInput}
+                                />
+                            </div>
+                            <div className="gmq-field-card">
+                                <label htmlFor="edit-round-count">Rounds</label>
+                                <input
+                                    id="edit-round-count"
+                                    type="number"
+                                    min="1"
+                                    max="50"
+                                    value={editConfig.roundCount}
+                                    onChange={(e) => setEditConfig((p) => ({ ...p, roundCount: Number(e.target.value || 10) }))}
+                                />
+                            </div>
+                            <div className="gmq-field-card">
+                                <label htmlFor="edit-guess-seconds">Guess Time (sec)</label>
+                                <input
+                                    id="edit-guess-seconds"
+                                    type="number"
+                                    min="5"
+                                    max="120"
+                                    value={editConfig.guessSeconds}
+                                    onChange={(e) => setEditConfig((p) => ({ ...p, guessSeconds: Number(e.target.value || 20) }))}
+                                />
+                            </div>
+                        </div>
+                        <div className="gmq-field-grid">
+                            <div className="gmq-field-card">
+                                <label htmlFor="edit-source-mode">Song Source</label>
+                                <select
+                                    id="edit-source-mode"
+                                    value={editConfig.sourceMode}
+                                    onChange={(e) => setEditConfig((p) => ({ ...p, sourceMode: e.target.value }))}
+                                >
+                                    {SOURCE_MODES.map((mode) => <option key={mode} value={mode}>{SOURCE_MODE_COPY[mode]?.label || mode}</option>)}
+                                </select>
+                            </div>
+                            <div className="gmq-field-card">
+                                <label htmlFor="edit-selection-mode">Selection Style</label>
+                                <select
+                                    id="edit-selection-mode"
+                                    value={editConfig.selectionMode}
+                                    onChange={(e) => setEditConfig((p) => ({ ...p, selectionMode: e.target.value }))}
+                                >
+                                    {SELECTION_MODES.map((mode) => <option key={mode} value={mode}>{SELECTION_MODE_COPY[mode]?.label || mode}</option>)}
+                                </select>
+                            </div>
+                            <div className="gmq-field-card">
+                                <label htmlFor="edit-theme-mode">Song Types</label>
+                                <select
+                                    id="edit-theme-mode"
+                                    value={editConfig.themeMode}
+                                    onChange={(e) => setEditConfig((p) => ({ ...p, themeMode: e.target.value }))}
+                                >
+                                    {THEME_MODES.map((mode) => <option key={mode} value={mode}>{THEME_MODE_COPY[mode]?.label || mode}</option>)}
+                                </select>
+                            </div>
+                        </div>
+                        <button
+                            type="button"
+                            className="gmq-btn gmq-btn-primary"
+                            onClick={saveLobbySettings}
+                            disabled={busy === 'settings'}
+                        >
+                            {busy === 'settings' ? 'Saving...' : 'Save Settings'}
+                        </button>
+                    </article>
+                </div>
+            ) : null}
+
+            {!lobby ? (
+                <div className="gmq-menu">
+                    <div className="gmq-menu-host-wrap">
+                        <button type="button" className="gmq-btn gmq-btn-primary gmq-btn-host" onClick={() => setHostModalOpen(true)}>
+                            Host Lobby
+                        </button>
+                    </div>
+
+                    <article className="gmq-card gmq-card-directory">
+                        <div className="gmq-directory-header">
+                            <h2>Available Lobbies</h2>
+                        </div>
+
+                        <div className="gmq-directory-top">
+                            <div className="gmq-card gmq-card-toolbar">
+                                <div className="gmq-directory-controls">
+                                    <input value={lobbyQuery} onChange={(e) => setLobbyQuery(e.target.value)} placeholder="Search by code/name"/>
+                                <button type="button" className="gmq-btn gmq-btn-secondary" onClick={() => fetchLobbies()} disabled={lobbiesRefreshing}>Refresh</button>
+                                </div>
+                            </div>
+                            <div className="gmq-card gmq-card-manual-join">
+                                <div className="gmq-inline gmq-inline-manual">
+                                    <input value={joinCode} onChange={(e) => setJoinCode(toCode(e.target.value))} placeholder="Lobby code (ABC123)"/>
+                                    <button type="button" className="gmq-btn gmq-btn-primary" onClick={() => joinLobby(joinCode, '')} disabled={busy === 'join'}>Join Lobby</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="gmq-lobby-table-head">
+                            <span>Lobby</span>
+                            <span>Match Settings</span>
+                            <span>Action</span>
+                        </div>
+                        <ul className="gmq-lobby-list gmq-lobby-list-detailed">
+                            {filteredLobbies.map((item) => (
+                                <li key={item.code} className="gmq-lobby-item gmq-lobby-item-detailed">
+                                    <div>
+                                        <div className="gmq-lobby-title">{item.name || item.code}</div>
+                                        <div className="gmq-muted">{item.code} | {item.playerCount}/{item.maxPlayers} players</div>
+                                    </div>
+                                    <div className="gmq-lobby-settings">
+                                        <span>{item.roundCount} rounds</span>
+                                        <span>{item.guessSeconds}s guess</span>
+                                        <span>{SOURCE_MODE_COPY[item.sourceMode]?.label || item.sourceMode}</span>
+                                        <span>{SELECTION_MODE_COPY[item.selectionMode]?.label || item.selectionMode}</span>
+                                        <span>{THEME_MODE_COPY[item.themeMode]?.label || item.themeMode}</span>
+                                    </div>
+                                    <button type="button" className="gmq-btn gmq-btn-secondary" onClick={() => joinLobby(item.code, '', { fromDirectory: true })} disabled={busy === 'join'}>Join</button>
+                                </li>
+                            ))}
+                            {filteredLobbies.length === 0 ? (
+                                <li className="gmq-lobby-empty gmq-muted">No open public lobbies right now.</li>
+                            ) : null}
+                        </ul>
+                    </article>
+
+                    {hostModalOpen ? (
+                        <div className="gmq-modal-backdrop" onClick={() => setHostModalOpen(false)}>
+                            <article className="gmq-card gmq-modal-card" onClick={(event) => event.stopPropagation()}>
+                                <div className="gmq-modal-header">
+                                    <h2>Host Lobby</h2>
+                                    <button type="button" className="gmq-btn gmq-btn-secondary gmq-btn-modal-close" onClick={() => setHostModalOpen(false)}>Close</button>
+                                </div>
+                                <div className="gmq-name-private-row">
+                                    <div className="gmq-field-stack">
+                                        <label htmlFor="create-lobby-name">Lobby name</label>
+                                        <input
+                                            id="create-lobby-name"
+                                            value={createConfig.name}
+                                            onChange={(e) => setCreateConfig((p) => ({ ...p, name: e.target.value }))}
+                                            placeholder="Lobby name"
+                                        />
+                                    </div>
+                                    <label className="gmq-checkbox gmq-checkbox-inline">
+                                        <input
+                                            type="checkbox"
+                                            checked={createConfig.isPrivate}
+                                            onChange={(e) => setCreateConfig((p) => ({ ...p, isPrivate: e.target.checked }))}
+                                        />
+                                        Private lobby
+                                    </label>
+                                </div>
+                                <div className="gmq-field-grid">
+                                    <div className="gmq-field-card">
+                                        <label htmlFor="create-max-players">Max Players</label>
+                                        <input
+                                            id="create-max-players"
+                                            type="number"
+                                            min="1"
+                                            max="8"
+                                            value={createMaxPlayersInput}
+                                            onChange={(e) => handleCreateMaxPlayersChange(e.target.value)}
+                                            onBlur={commitCreateMaxPlayersInput}
+                                        />
+                                    </div>
+                                    <div className="gmq-field-card">
+                                        <label htmlFor="create-round-count">Rounds</label>
+                                        <input id="create-round-count" type="number" min="1" max="50" value={createConfig.roundCount} onChange={(e) => setCreateConfig((p) => ({ ...p, roundCount: Number(e.target.value || 10) }))}/>
+                                    </div>
+                                    <div className="gmq-field-card">
+                                        <label htmlFor="create-guess-seconds">Guess Time (sec)</label>
+                                        <input id="create-guess-seconds" type="number" min="5" max="120" value={createConfig.guessSeconds} onChange={(e) => setCreateConfig((p) => ({ ...p, guessSeconds: Number(e.target.value || 20) }))}/>
+                                    </div>
+                                </div>
+                                <div className="gmq-field-grid">
+                                    <div className="gmq-field-card">
+                                        <label htmlFor="create-source-mode">Song Source</label>
+                                        <select id="create-source-mode" value={createConfig.sourceMode} onChange={(e) => setCreateConfig((p) => ({ ...p, sourceMode: e.target.value }))}>
+                                            {SOURCE_MODES.map((mode) => <option key={mode} value={mode}>{SOURCE_MODE_COPY[mode]?.label || mode}</option>)}
+                                        </select>
+                                    </div>
+                                    <div className="gmq-field-card">
+                                        <label htmlFor="create-selection-mode">Selection Style</label>
+                                        <select id="create-selection-mode" value={createConfig.selectionMode} onChange={(e) => setCreateConfig((p) => ({ ...p, selectionMode: e.target.value }))}>
+                                            {SELECTION_MODES.map((mode) => <option key={mode} value={mode}>{SELECTION_MODE_COPY[mode]?.label || mode}</option>)}
+                                        </select>
+                                    </div>
+                                    <div className="gmq-field-card">
+                                        <label htmlFor="create-theme-mode">Song Types</label>
+                                        <select id="create-theme-mode" value={createConfig.themeMode} onChange={(e) => setCreateConfig((p) => ({ ...p, themeMode: e.target.value }))}>
+                                            {THEME_MODES.map((mode) => <option key={mode} value={mode}>{THEME_MODE_COPY[mode]?.label || mode}</option>)}
+                                        </select>
+                                    </div>
+                                </div>
+                                <button type="button" className="gmq-btn gmq-btn-primary" onClick={createLobby} disabled={busy === 'create'}>
+                                    {busy === 'create' ? 'Hosting...' : 'Host Lobby'}
+                                </button>
+                            </article>
+                        </div>
+                    ) : null}
+                </div>
             ) : (
-                <div className="gmq-grid gmq-grid-match">
+                <div className={`gmq-grid gmq-grid-match ${showRoundCard ? 'gmq-grid-match-live' : 'gmq-grid-match-idle'} ${showRoundCard && !showLobbyCard ? 'gmq-grid-match-round-only' : ''}`}>
+                    {showLobbyCard ? (
                     <article className="gmq-card gmq-card-lobby">
-                        <h2>Lobby {lobby.code}</h2>
+                        <h2>
+                            Lobby {lobby.code}
+                            <span className={`gmq-lobby-visibility ${lobby.isPrivate ? 'private' : 'public'}`}>
+                                {lobby.isPrivate ? 'Private' : 'Public'}
+                            </span>
+                        </h2>
                         <p className="gmq-muted">{lobby.name || 'Untitled'} | {lobby.playerCount}/{lobby.maxPlayers} players</p>
+                        <div className="gmq-stack gmq-lobby-settings-block">
+                            <strong>Current Match Settings</strong>
+                            <div className="gmq-lobby-settings">
+                                {lobbySettingsSummary.map((item) => (
+                                    <span key={item}>{item}</span>
+                                ))}
+                            </div>
+                        </div>
                         <ul className="gmq-player-list">
                             {(lobby.players || []).map((player) => (
                                 <li key={player.userId}>
                                     <span>{player.displayName}{player.userId === lobby.host?.id ? ' (Host)' : ''}{!player.isConnected ? ' (offline)' : ''}</span>
+                                    {lobby.status === 'WAITING' ? (
+                                        <span className="gmq-player-row-actions">
+                                            {isHost && user && player.userId !== user.id ? (
+                                                <>
+                                                    <button
+                                                        type="button"
+                                                        className="gmq-btn gmq-btn-secondary gmq-btn-kick"
+                                                        onClick={() => promotePlayer(player)}
+                                                        disabled={busy === 'promote' || busy === 'kick'}
+                                                    >
+                                                        Promote
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="gmq-btn gmq-btn-danger gmq-btn-kick"
+                                                        onClick={() => kickPlayer(player)}
+                                                        disabled={busy === 'kick' || busy === 'promote'}
+                                                    >
+                                                        Kick
+                                                    </button>
+                                                </>
+                                            ) : null}
+                                            <strong>{waitingLobbyReadyUserIds.includes(player.userId) ? 'Ready' : 'Not Ready'}</strong>
+                                        </span>
+                                    ) : null}
                                     {phase === 'GUESSING' ? <strong>{readyUserIds.includes(player.userId) ? 'Ready' : 'Thinking'}</strong> : null}
                                 </li>
                             ))}
                         </ul>
                         {lobby.status === 'WAITING' ? (
-                            isHost
-                                ? <button type="button" className="gmq-btn gmq-btn-primary" onClick={startGame} disabled={busy === 'start'}>Start Game</button>
-                                : <p className="gmq-muted">Waiting for host to start.</p>
+                            <div className="gmq-stack">
+                                <div className="gmq-actions">
+                                    <button
+                                        type="button"
+                                        className="gmq-btn gmq-btn-secondary"
+                                        onClick={toggleLobbyReady}
+                                        disabled={busy === 'lobby-ready'}
+                                    >
+                                        {myLobbyReady ? 'Not Ready' : 'Ready Up'}
+                                    </button>
+                                    <p className="gmq-muted">
+                                        Ready {waitingLobbyReadyUserIds.length}/{waitingLobbyRequiredUserIds.length}
+                                    </p>
+                                </div>
+                                {isHost
+                                    ? (
+                                        <>
+                                            <button
+                                                type="button"
+                                                className="gmq-btn gmq-btn-secondary"
+                                                onClick={openSettingsModal}
+                                                disabled={busy === 'settings'}
+                                            >
+                                                Match Settings
+                                            </button>
+                                            <button
+                                                type="button"
+                                                className="gmq-btn gmq-btn-primary"
+                                                onClick={startGame}
+                                                disabled={busy === 'start' || !allWaitingPlayersReady}
+                                            >
+                                                Start Game
+                                            </button>
+                                            {!allWaitingPlayersReady ? (
+                                                <p className="gmq-muted">All players must be ready before start.</p>
+                                            ) : null}
+                                        </>
+                                    )
+                                    : <p className="gmq-muted">Waiting for host to start.</p>}
+                            </div>
                         ) : null}
                     </article>
+                    ) : null}
 
-                    <article className="gmq-card gmq-card-media">
-                        <h2>Media Status</h2>
-                        <div className="gmq-status-row">
-                            <span className={`gmq-status-dot gmq-status-dot-${mediaSourceHealth.tone}`} />
-                            <div className="gmq-stack">
-                                <strong>Source API: {mediaSourceHealth.label}</strong>
-                                <p className="gmq-muted">{mediaSourceStatus?.provider || 'AnimeThemes'} | Latency {mediaSourceLatencyLabel}</p>
-                                <p className="gmq-muted">
-                                    Last check: {mediaSourceCheckedLabel}
-                                    {mediaSourceStatus?.cached ? ' (cached)' : ''}
-                                </p>
-                                {mediaSourceStatus?.ok === false && mediaSourceStatus?.error ? (
-                                    <p className="gmq-muted gmq-muted-warning">{mediaSourceStatus.error}</p>
-                                ) : null}
-                                {mediaSourceError ? <p className="gmq-muted gmq-muted-warning">{mediaSourceError}</p> : null}
-                            </div>
-                        </div>
-                        <div className="gmq-status-row">
-                            <span className={`gmq-status-dot gmq-status-dot-${localMediaHealth.tone}`} />
-                            <div className="gmq-stack">
-                                <strong>Local Client: {localMediaHealth.label}</strong>
-                                <p className="gmq-muted">{localMediaHealth.detail}</p>
-                            </div>
-                        </div>
-                        <button
-                            type="button"
-                            className="gmq-btn gmq-btn-secondary"
-                            onClick={() => refreshMediaSourceStatus({ forceRefresh: true }).catch(() => {})}
-                            disabled={mediaSourceLoading}
-                        >
-                            {mediaSourceLoading ? 'Checking...' : 'Refresh Source Status'}
-                        </button>
-                    </article>
-
-                    <article className="gmq-card gmq-card-round">
+                    {showRoundCard ? (
+                        <article className="gmq-card gmq-card-round">
                         <h2>Round</h2>
                         <p className="gmq-round-phase">{phase} | {countdown}</p>
                         {suddenDeathMessage ? <div className="gmq-alert gmq-alert-warning">{suddenDeathMessage}</div> : null}
@@ -1862,7 +2623,8 @@ export default function App() {
                                 </ul>
                             </div>
                         ) : null}
-                    </article>
+                        </article>
+                    ) : null}
                 </div>
             )}
         </section>

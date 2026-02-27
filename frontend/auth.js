@@ -13,15 +13,15 @@ const auth = {
     logout: () => {
         localStorage.removeItem('token');
         localStorage.removeItem('user');
-        window.location.href = 'login.html';
+        window.location.href = '/login';
     },
 
     requireAuth: () => {
-        if (!auth.isLoggedIn()) window.location.href = 'login.html';
+        if (!auth.isLoggedIn()) window.location.href = '/login';
     },
 
     requireGuest: () => {
-        if (auth.isLoggedIn()) window.location.href = 'dashboard.html';
+        if (auth.isLoggedIn()) window.location.href = '/dashboard';
     }
 };
 

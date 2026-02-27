@@ -5,7 +5,8 @@ export function getAuthToken() {
 }
 
 export function redirectToLogin() {
-    window.location.replace('/login.html');
+    const next = `${window.location.pathname}${window.location.search || ''}`;
+    window.location.replace(`/login?next=${encodeURIComponent(next)}`);
 }
 
 export async function apiFetch(path, options = {}) {

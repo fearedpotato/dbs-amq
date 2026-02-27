@@ -104,7 +104,7 @@ cd frontend/game-client
 npm install
 ```
 
-Build bundle used by `frontend/game.html`:
+Build bundle used by `frontend/game.html` (served at `/amq`):
 
 ```powershell
 npm run build

@@ -493,6 +493,7 @@ async function resolveRoundMedia({ animeId, animeTitle, themeMode = 'MIXED', sam
         animeTitle: selected.animeTitle,
         themeType: selected.themeType,
         themeTitle: selected.themeTitle,
+        themeSongId: selected.themeSongId,
         acceptedAnimeIds,
         sampleDurationSec,
         sampleStartSec: pickSampleStartSec(

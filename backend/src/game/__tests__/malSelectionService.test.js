@@ -159,6 +159,42 @@ describe('malSelectionService.buildRoundSeedPlan', () => {
         })).rejects.toMatchObject({ status: 400 });
     });
 
+    test('MAL_ONLY ignores players without MAL link', async () => {
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: 'token-1' },
+            { id: 2, malAccessToken: null }
+        ]);
+        axios.get.mockResolvedValueOnce(malListResponse([
+            { id: 10, title: 'Only MAL A' },
+            { id: 20, title: 'Only MAL B' }
+        ]));
+
+        const plan = await buildRoundSeedPlan({
+            session: baseSession({ roundCount: 2, sourceMode: 'MAL_ONLY', selectionMode: 'STANDARD' }),
+            lobby: baseLobby([1, 2])
+        });
+
+        expect(plan).toHaveLength(2);
+        expect(plan.every((item) => item.sourcePlayerId === 1)).toBe(true);
+        expect(axios.get).toHaveBeenCalledTimes(1);
+    });
+
+    test('MAL_ONLY falls back to popular when no players have MAL linked', async () => {
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: null },
+            { id: 2, malAccessToken: null }
+        ]);
+
+        const plan = await buildRoundSeedPlan({
+            session: baseSession({ roundCount: 3, sourceMode: 'MAL_ONLY', selectionMode: 'BALANCED_STRICT' }),
+            lobby: baseLobby([1, 2])
+        });
+
+        expect(plan).toHaveLength(3);
+        expect(plan.every((item) => item.sourcePlayerId === null)).toBe(true);
+        expect(axios.get).not.toHaveBeenCalled();
+    });
+
     test('MAL pool includes only watching/completed statuses', async () => {
         prisma.user.findMany.mockResolvedValue([
             { id: 1, malAccessToken: 'token-1' }

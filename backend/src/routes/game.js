@@ -71,6 +71,15 @@ function assertEnum(value, validValues, fieldName) {
     }
 }
 
+function emitLobbyDirectoryChanged(req, payload = {}) {
+    const io = req.app?.get('io');
+    if (!io || typeof io.emit !== 'function') return;
+    io.emit('lobby:directory_changed', {
+        ...payload,
+        at: Date.now()
+    });
+}
+
 async function getCurrentUserFromToken(req) {
     const user = await prisma.user.findUnique({
         where: { id: req.user.userId },
@@ -128,6 +137,10 @@ router.post('/lobbies', authMiddleware, async (req, res) => {
         const user = await getCurrentUserFromToken(req);
         await lobbyService.enforceSingleLobbyMembership(user.id);
         const lobby = await lobbyService.createLobby(user, req.body);
+        emitLobbyDirectoryChanged(req, {
+            reason: 'create',
+            lobbyCode: lobby?.code || null
+        });
         return res.status(201).json({ lobby });
     } catch (err) {
         return handleError(res, err);
@@ -143,10 +156,16 @@ router.post('/lobbies/:code/join', authMiddleware, joinLobbyRateLimit, async (re
         await lobbyService.enforceSingleLobbyMembership(user.id, { exceptCode: code });
         const inviteToken = typeof req.body?.inviteToken === 'string'
             ? req.body.inviteToken
+            : (typeof req.query?.i === 'string'
+                    ? req.query.i
             : (typeof req.query?.inviteToken === 'string'
                     ? req.query.inviteToken
-                    : (typeof req.headers['x-invite-token'] === 'string' ? req.headers['x-invite-token'] : null));
+                    : (typeof req.headers['x-invite-token'] === 'string' ? req.headers['x-invite-token'] : null)));
         const lobby = await lobbyService.joinLobby(code, user, req.body?.displayName, { inviteToken });
+        emitLobbyDirectoryChanged(req, {
+            reason: 'join',
+            lobbyCode: code
+        });
         return res.json({ lobby });
     } catch (err) {
         return handleError(res, err);
@@ -204,13 +223,14 @@ router.get('/lobbies/:code/invite', authMiddleware, async (req, res) => {
         if (!lobby) throw httpError(404, 'Lobby not found');
         if (!canAccessLobby(lobby, user.id)) throw httpError(403, 'You do not have access to this lobby');
 
-        const inviteToken = lobbyService.generateInviteToken(code);
+        const inviteToken = lobby.isPrivate ? lobbyService.generateInviteToken(code) : null;
         const inviteUrl = lobbyService.buildInviteLink(process.env.BASE_URL, code, inviteToken);
-        return res.json({
+        const payload = {
             lobbyCode: code,
-            inviteUrl,
-            inviteToken
-        });
+            inviteUrl
+        };
+        if (inviteToken) payload.inviteToken = inviteToken;
+        return res.json(payload);
     } catch (err) {
         return handleError(res, err);
     }

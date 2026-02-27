@@ -31,6 +31,7 @@ const prisma = require('../../lib/prisma');
 const axios = require('axios');
 const { buildRoundSeedPlan, __clearMalWatchedCache } = require('../malSelectionService');
 const roundService = require('../roundService');
+const { resolveRoundMedia } = require('../mediaService');
 
 function malListResponse(items) {
     return {
@@ -68,6 +69,16 @@ describe('round generation integration (mal selection modes)', () => {
     beforeEach(() => {
         jest.clearAllMocks();
         __clearMalWatchedCache();
+        resolveRoundMedia.mockImplementation(async ({ animeId, animeTitle, roundIndex }) => ({
+            animeId: Number(animeId),
+            animeTitle: String(animeTitle || `Anime ${animeId}`),
+            themeType: 'OP',
+            themeTitle: `Theme ${roundIndex}`,
+            sampleStartSec: 0,
+            sampleDurationSec: 10,
+            solutionVideoUrl: `https://media.local/video-${animeId}.mp4`,
+            solutionAudioUrl: `https://media.local/audio-${animeId}.mp3`
+        }));
     });
 
     test('STANDARD + HYBRID: generates expected number of rounds and mixes popular seeds', async () => {
@@ -94,6 +105,12 @@ describe('round generation integration (mal selection modes)', () => {
         await roundService.generateInitialRoundsForSession({ session, lobby });
 
         expect(created).toHaveLength(5);
+        const sampleSecondsArgs = resolveRoundMedia.mock.calls
+            .map(([payload]) => payload?.sampleSeconds)
+            .filter((value) => value !== undefined);
+        expect(sampleSecondsArgs.length).toBeGreaterThan(0);
+        const expectedSampleSeconds = session.guessSeconds + session.answersRevealSeconds;
+        expect(sampleSecondsArgs.every((value) => value === expectedSampleSeconds)).toBe(true);
         const animeIds = created.map((r) => r.animeId);
         expect(new Set(animeIds).size).toBe(5);
         // Some sourcePlayerId should be null if popular fill happened
@@ -150,5 +167,136 @@ describe('round generation integration (mal selection modes)', () => {
         expect(Number(sourceCounts['2'] || 0)).toBeGreaterThan(0);
         // and some popular fill may exist
         expect(sourceCounts['popular']).toBeDefined();
+    });
+
+    test('MAL_ONLY does not fallback to popular media when MAL seed media is unavailable', async () => {
+        prisma.gameRound.count.mockResolvedValue(0);
+        prisma.gameRound.createMany.mockResolvedValue({ count: 0 });
+
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: 'token-1' }
+        ]);
+
+        axios.get.mockResolvedValueOnce(malListResponse([
+            { id: 100, title: 'MAL Seed 1' },
+            { id: 101, title: 'MAL Seed 2' }
+        ]));
+
+        resolveRoundMedia.mockImplementation(async ({ animeId, animeTitle, roundIndex }) => {
+            if (Number(animeId) === 100) return null;
+            return {
+                animeId: Number(animeId),
+                animeTitle: String(animeTitle || `Anime ${animeId}`),
+                themeType: 'OP',
+                themeTitle: `Theme ${roundIndex}`,
+                sampleStartSec: 0,
+                sampleDurationSec: 10,
+                solutionVideoUrl: `https://media.local/video-${animeId}.mp4`,
+                solutionAudioUrl: `https://media.local/audio-${animeId}.mp3`
+            };
+        });
+
+        const session = baseSession({ roundCount: 2, sourceMode: 'MAL_ONLY', selectionMode: 'STANDARD' });
+        const lobby = baseLobby([1]);
+
+        await expect(roundService.generateInitialRoundsForSession({ session, lobby })).rejects.toMatchObject({ status: 503 });
+        expect(prisma.gameRound.createMany).not.toHaveBeenCalled();
+    });
+
+    test('MAL_ONLY uses additional MAL reserve seeds when initial MAL seeds are unplayable', async () => {
+        prisma.gameRound.count.mockResolvedValue(0);
+        const created = [];
+        prisma.gameRound.createMany.mockImplementation(async ({ data }) => {
+            created.push(...data);
+            return { count: data.length };
+        });
+
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: 'token-1' }
+        ]);
+
+        axios.get.mockResolvedValueOnce(malListResponse([
+            { id: 100, title: 'MAL Seed 1' },
+            { id: 101, title: 'MAL Seed 2' },
+            { id: 102, title: 'MAL Seed 3' },
+            { id: 103, title: 'MAL Seed 4' }
+        ]));
+
+        resolveRoundMedia.mockImplementation(async ({ animeId, animeTitle, roundIndex }) => {
+            if (Number(animeId) === 100) return null;
+            return {
+                animeId: Number(animeId),
+                animeTitle: String(animeTitle || `Anime ${animeId}`),
+                themeType: 'OP',
+                themeTitle: `Theme ${roundIndex}`,
+                sampleStartSec: 0,
+                sampleDurationSec: 10,
+                solutionVideoUrl: `https://media.local/video-${animeId}.mp4`,
+                solutionAudioUrl: `https://media.local/audio-${animeId}.mp3`
+            };
+        });
+
+        const session = baseSession({ roundCount: 2, sourceMode: 'MAL_ONLY', selectionMode: 'STANDARD' });
+        const lobby = baseLobby([1]);
+
+        await roundService.generateInitialRoundsForSession({ session, lobby });
+
+        expect(created).toHaveLength(2);
+        expect(created.map((row) => row.animeId)).not.toContain(100);
+        expect(created.every((row) => row.sourcePlayerId === 1)).toBe(true);
+    });
+
+    test('does not allow duplicate exact media entries in one match', async () => {
+        prisma.gameRound.count.mockResolvedValue(0);
+        prisma.gameRound.createMany.mockResolvedValue({ count: 0 });
+
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: 'token-1' }
+        ]);
+        axios.get.mockResolvedValueOnce(malListResponse([
+            { id: 10, title: 'A1' },
+            { id: 20, title: 'A2' }
+        ]));
+
+        resolveRoundMedia.mockImplementation(async ({ roundIndex }) => ({
+            animeId: 10,
+            animeTitle: 'A1',
+            themeType: 'OP',
+            themeTitle: 'Same Theme',
+            themeSongId: 777,
+            sampleStartSec: 0,
+            sampleDurationSec: 10,
+            solutionVideoUrl: 'https://media.local/dup.mp4',
+            solutionAudioUrl: `https://media.local/dup-${roundIndex}.mp3`
+        }));
+
+        const session = baseSession({ roundCount: 2, sourceMode: 'HYBRID', selectionMode: 'STANDARD' });
+        const lobby = baseLobby([1]);
+
+        await expect(roundService.generateInitialRoundsForSession({ session, lobby })).rejects.toMatchObject({ status: 503 });
+        expect(prisma.gameRound.createMany).not.toHaveBeenCalled();
+    });
+
+    test('MAL_ONLY falls back to popular when no players have MAL linked', async () => {
+        prisma.gameRound.count.mockResolvedValue(0);
+        const created = [];
+        prisma.gameRound.createMany.mockImplementation(async ({ data }) => {
+            created.push(...data);
+            return { count: data.length };
+        });
+
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: null },
+            { id: 2, malAccessToken: null }
+        ]);
+
+        const session = baseSession({ roundCount: 3, sourceMode: 'MAL_ONLY', selectionMode: 'BALANCED_STRICT' });
+        const lobby = baseLobby([1, 2]);
+
+        await roundService.generateInitialRoundsForSession({ session, lobby });
+
+        expect(created).toHaveLength(3);
+        expect(created.every((row) => row.sourcePlayerId === null)).toBe(true);
+        expect(axios.get).not.toHaveBeenCalled();
     });
 });

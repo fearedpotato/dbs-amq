@@ -1,10 +1,13 @@
 // Navbar & Settings Modal
+let nicknameSaveInFlight = false;
+let malConnectInFlight = false;
+let malDisconnectInFlight = false;
 
 function renderNavbar() {
     const nav = document.createElement('nav');
     nav.className = 'navbar';
     nav.innerHTML = `
-    <a class="navbar-brand" href="/dashboard.html">DBS<span>.</span></a>
+    <a class="navbar-brand" href="/dashboard">DBS<span>.</span></a>
     <div class="navbar-links">
       <div class="nav-user" id="navUser">
         <button class="nav-user-btn" id="navUserBtn" onclick="toggleDropdown()">
@@ -186,9 +189,13 @@ function cancelEditNickname() {
 }
 
 async function saveNickname() {
+    if (nicknameSaveInFlight) return;
     const current = auth.getUser()?.nickname || '';
     const newNickname = document.getElementById('usernameInput').value.trim();
     if (!newNickname || newNickname === current) { cancelEditNickname(); return; }
+    nicknameSaveInFlight = true;
+    const actionsEl = document.getElementById('usernameActions');
+    actionsEl?.querySelectorAll('button')?.forEach((btn) => { btn.disabled = true; });
     try {
         await apiFetch('/auth/nickname', {
             method: 'PATCH',
@@ -201,10 +208,17 @@ async function saveNickname() {
         cancelEditNickname();
     } catch (err) {
         alert(err.message);
+    } finally {
+        nicknameSaveInFlight = false;
+        actionsEl?.querySelectorAll('button')?.forEach((btn) => { btn.disabled = false; });
     }
 }
 
 async function connectMAL() {
+    if (malConnectInFlight) return;
+    const malBtn = document.getElementById('malBtn');
+    malConnectInFlight = true;
+    if (malBtn) malBtn.disabled = true;
     try {
         const data = await apiFetch('/mal/login', { method: 'POST' });
         let targetUrl = data?.browserUrl || data?.url;
@@ -216,11 +230,18 @@ async function connectMAL() {
         window.location.href = targetUrl;
     } catch (err) {
         alert(err.message);
+    } finally {
+        malConnectInFlight = false;
+        if (malBtn) malBtn.disabled = false;
     }
 }
 
 function disconnectMAL() {
+    if (malDisconnectInFlight) return;
     if (!confirm('Unbind your MAL account?')) return;
+    const malBtn = document.getElementById('malBtn');
+    malDisconnectInFlight = true;
+    if (malBtn) malBtn.disabled = true;
     apiFetch('/mal/disconnect', { method: 'POST' })
         .then(() => {
             const user = auth.getUser();
@@ -228,5 +249,9 @@ function disconnectMAL() {
             auth.save(auth.getToken(), user);
             updateNavbarUI(user);
         })
-        .catch(err => alert(err.message));
+        .catch(err => alert(err.message))
+        .finally(() => {
+            malDisconnectInFlight = false;
+            if (malBtn) malBtn.disabled = false;
+        });
 }

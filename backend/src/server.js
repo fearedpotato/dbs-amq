@@ -9,6 +9,7 @@ function createServer() {
     const io = attachRealtime(httpServer, {
         origin: getSocketCorsOrigin(process.env)
     });
+    app.set('io', io);
 
     return { app, httpServer, io };
 }

@@ -53,7 +53,7 @@ router.get('/callback', async (req, res) => {
 
     if (!code || !codeVerifier || !userId || !oauthState || state !== oauthState) {
         clearMalOauthSession(req);
-        return res.redirect('/dashboard.html?error=mal_failed');
+        return res.redirect('/dashboard?error=mal_failed');
     }
 
     try {
@@ -89,11 +89,11 @@ router.get('/callback', async (req, res) => {
 
         clearMalOauthSession(req);
 
-        res.redirect('/dashboard.html?mal_connected=true');
+        res.redirect('/dashboard?mal_connected=true');
     } catch (err) {
         clearMalOauthSession(req);
         console.error(err.response?.data || err.message);
-        res.redirect('/dashboard.html?error=mal_failed');
+        res.redirect('/dashboard?error=mal_failed');
     }
 });
 

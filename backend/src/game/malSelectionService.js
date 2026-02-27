@@ -11,6 +11,8 @@ const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 20;
 const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_CACHE_MAX_USERS = 500;
+const MAL_ONLY_RESERVE_MULTIPLIER = 4;
+const MAL_ONLY_RESERVE_CAP = 200;
 
 const watchedCache = new Map();
 
@@ -222,6 +224,46 @@ function buildPlayerPoolsInOrder(playerIds, poolByPlayer) {
     }));
 }
 
+function getMalOnlyReserveTarget(roundCount) {
+    const base = Math.max(
+        Number.parseInt(roundCount, 10) || 0,
+        (Number.parseInt(roundCount, 10) || 0) * MAL_ONLY_RESERVE_MULTIPLIER
+    );
+    return Math.max(1, Math.min(base, MAL_ONLY_RESERVE_CAP));
+}
+
+function appendMalOnlyReserveFromPools({
+    plan,
+    pools,
+    usedAnimeIds,
+    roundCount
+}) {
+    const target = getMalOnlyReserveTarget(roundCount);
+    if (!Array.isArray(plan) || !Array.isArray(pools) || plan.length >= target) return;
+
+    let progressed = true;
+    while (plan.length < target && progressed) {
+        progressed = false;
+        for (const player of pools) {
+            const picked = nextAvailableFromPool({
+                pool: player.pool,
+                cursorRef: player.cursorRef,
+                usedAnimeIds
+            });
+            if (!picked) continue;
+
+            usedAnimeIds.add(picked.animeId);
+            plan.push({
+                animeId: picked.animeId,
+                animeTitle: picked.animeTitle,
+                sourcePlayerId: player.userId
+            });
+            progressed = true;
+            if (plan.length >= target) break;
+        }
+    }
+}
+
 function fillFromPopular({ plan, roundCount, usedAnimeIds, popularCatalog }) {
     const source = Array.isArray(popularCatalog) && popularCatalog.length > 0
         ? popularCatalog
@@ -281,6 +323,15 @@ function selectStandard({
 
     if (sourceMode === 'HYBRID' || sourceMode === 'POPULAR') {
         fillFromPopular({ plan, roundCount, usedAnimeIds, popularCatalog });
+    }
+
+    if (sourceMode === 'MAL_ONLY') {
+        appendMalOnlyReserveFromPools({
+            plan,
+            pools,
+            usedAnimeIds,
+            roundCount
+        });
     }
 
     if (plan.length < roundCount) {
@@ -357,6 +408,15 @@ function selectBalanced({
         });
     }
 
+    if (sourceMode === 'MAL_ONLY') {
+        appendMalOnlyReserveFromPools({
+            plan,
+            pools,
+            usedAnimeIds,
+            roundCount
+        });
+    }
+
     return plan;
 }
 
@@ -401,11 +461,8 @@ function assertMalAvailability({ sourceMode, selectionMode, playerIds, linkedByU
     if (sourceMode === 'POPULAR') return;
 
     const missingLinked = playerIds.filter((userId) => !linkedByUserId.get(userId));
-    if (selectionMode === 'BALANCED_STRICT' && missingLinked.length > 0) {
+    if (selectionMode === 'BALANCED_STRICT' && sourceMode !== 'MAL_ONLY' && missingLinked.length > 0) {
         failMode(`Balanced strict mode requires MAL linked for all players (missing: ${missingLinked.join(', ')})`);
-    }
-    if (sourceMode === 'MAL_ONLY' && missingLinked.length > 0) {
-        failMode(`MAL_ONLY mode requires MAL linked for all players (missing: ${missingLinked.join(', ')})`);
     }
 
     if (selectionMode === 'BALANCED_STRICT') {
@@ -438,14 +495,34 @@ async function buildRoundSeedPlan({ session, lobby }) {
     }
 
     const { pools, linkedByUserId, errorsByUserId } = await loadPlayerMalPools(playerIds);
-    assertMalAvailability({ sourceMode, selectionMode, playerIds, linkedByUserId, errorsByUserId });
+    const selectedPlayerIds = sourceMode === 'MAL_ONLY'
+        ? playerIds.filter((userId) => linkedByUserId.get(userId))
+        : playerIds;
 
-    if (selectionMode.startsWith('BALANCED') && playerIds.length > 1) {
+    if (sourceMode === 'MAL_ONLY' && selectedPlayerIds.length === 0) {
+        return selectStandard({
+            roundCount,
+            sourceMode: 'POPULAR',
+            playerIds,
+            poolByPlayer: new Map(),
+            popularCatalog
+        });
+    }
+
+    assertMalAvailability({
+        sourceMode,
+        selectionMode,
+        playerIds: selectedPlayerIds,
+        linkedByUserId,
+        errorsByUserId
+    });
+
+    if (selectionMode.startsWith('BALANCED') && selectedPlayerIds.length > 1) {
         return selectBalanced({
             roundCount,
             sourceMode,
             selectionMode,
-            playerIds,
+            playerIds: selectedPlayerIds,
             poolByPlayer: pools,
             popularCatalog
         });
@@ -454,7 +531,7 @@ async function buildRoundSeedPlan({ session, lobby }) {
     return selectStandard({
         roundCount,
         sourceMode,
-        playerIds,
+        playerIds: selectedPlayerIds,
         poolByPlayer: pools,
         popularCatalog
     });

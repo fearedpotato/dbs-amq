@@ -4,7 +4,7 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Dashboard — DBS</title>
-  <script>if (!localStorage.getItem('token')) window.location.replace('login.html');</script>
+  <script>if (!localStorage.getItem('token')) window.location.replace('/login');</script>
   <link rel="stylesheet" href="style.css"/>
   <style>
     body { visibility: hidden; }
@@ -22,7 +22,7 @@
   </div>
 
   <div class="cards-grid">
-    <div class="card" style="cursor:pointer" onclick="window.location.href='game.html'">
+    <div class="card" style="cursor:pointer" onclick="window.location.href='/amq'">
       <div class="card-icon">🎮</div>
       <h3>Anime Music Quiz</h3>
       <p>Guess the anime from its opening song</p>
@@ -51,11 +51,11 @@
 
   const params = new URLSearchParams(window.location.search);
   if (params.get('mal_connected') === 'true') {
-    history.replaceState({}, '', '/dashboard.html');
+    history.replaceState({}, '', '/dashboard');
     openSettings();
   }
   if (params.get('error') === 'mal_failed') {
-    history.replaceState({}, '', '/dashboard.html');
+    history.replaceState({}, '', '/dashboard');
     alert('Failed to connect MAL account. Please try again.');
   }
 

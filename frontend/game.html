@@ -4,8 +4,13 @@
     <meta charset="UTF-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>Anime Music Quiz - DBS</title>
-    <script>if (!localStorage.getItem('token')) window.location.replace('login.html');</script>
-    <link rel="stylesheet" href="style.css"/>
+    <script>
+        if (!localStorage.getItem('token')) {
+            const next = `${window.location.pathname}${window.location.search || ''}`;
+            window.location.replace(`/login?next=${encodeURIComponent(next)}`);
+        }
+    </script>
+    <link rel="stylesheet" href="/style.css"/>
     <link rel="stylesheet" href="/game-app/assets/game-client.css"/>
     <style>
         body { visibility: hidden; }
@@ -19,11 +24,11 @@
     </div>
 </main>
 
-<script src="auth.js"></script>
-<script src="navbar.js?v=malfix2"></script>
+<script src="/auth.js"></script>
+<script src="/navbar.js?v=malfix2"></script>
 <script>
-    renderNavbar();
     document.body.style.visibility = 'visible';
+    renderNavbar();
 
     const cachedUser = auth.getUser();
     if (cachedUser) updateNavbarUI(cachedUser);
@@ -31,7 +36,12 @@
     apiFetch('/auth/me').then(freshUser => {
         auth.save(auth.getToken(), freshUser);
         updateNavbarUI(freshUser);
-    }).catch(() => auth.logout());
+    }).catch(() => {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        const next = `${window.location.pathname}${window.location.search || ''}`;
+        window.location.replace(`/login?next=${encodeURIComponent(next)}`);
+    });
 </script>
 <script type="module" src="/game-app/main.js"></script>
 </body>

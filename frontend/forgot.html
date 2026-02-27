@@ -24,7 +24,7 @@
     </form>
 
     <div class="auth-footer">
-      Back to <a href="login.html">Sign in</a>
+      Back to <a href="/login">Sign in</a>
     </div>
   </div>
 </div>
@@ -36,9 +36,11 @@
   const form = document.getElementById('forgotForm');
   const alertEl = document.getElementById('alert');
   const submitBtn = document.getElementById('submitBtn');
+  let forgotCooldownUntil = 0;
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
+    if (Date.now() < forgotCooldownUntil) return;
     setLoading(submitBtn, true);
 
     try {
@@ -48,7 +50,13 @@
       });
 
       showAlert(alertEl, 'A reset link has been sent if an account does exist.', 'success');
-      setLoading(submitBtn, false);
+      forgotCooldownUntil = Date.now() + 15000;
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Please wait...';
+      window.setTimeout(() => {
+        if (Date.now() < forgotCooldownUntil) return;
+        setLoading(submitBtn, false);
+      }, 15000);
     } catch (err) {
       showAlert(alertEl, err.message);
       setLoading(submitBtn, false);

@@ -9,7 +9,9 @@ jest.mock('../../game/lobbyService', () => ({
     setPlayerConnection: jest.fn(),
     getLobbyByCode: jest.fn(),
     leaveLobby: jest.fn(),
-    updateLobbyConfig: jest.fn()
+    updateLobbyConfig: jest.fn(),
+    kickPlayer: jest.fn(),
+    promoteHost: jest.fn()
 }));
 
 jest.mock('../../game/sessionService', () => ({
@@ -39,6 +41,7 @@ function buildLobby({ code = 'ABC123', hostId = 1, playerIds = [1, 2] } = {}) {
     return {
         id: 1,
         code,
+        status: 'WAITING',
         minPlayers: 1,
         maxPlayers: 8,
         playerCount: playerIds.length,
@@ -89,7 +92,7 @@ describe('socket gateway', () => {
         };
         createRoundEngine.mockReturnValue(roundEngineMock);
 
-        io = attachRealtime(server, { origin: true });
+        io = attachRealtime(server, { origin: true, mediaStatusBroadcast: false });
 
         await new Promise((resolve) => {
             server.listen(0, resolve);
@@ -165,6 +168,50 @@ describe('socket gateway', () => {
 
         expect(ack.ok).toBe(false);
         expect(ack.code).toBe('forbidden');
+    });
+
+    test('requires all waiting players to be ready before host can start game', async () => {
+        const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1, 2] });
+        lobbyService.joinLobby.mockResolvedValue(lobby);
+        lobbyService.setPlayerConnection.mockResolvedValue(lobby);
+        lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+
+        const c1 = await connectClient({ userId: 1, username: 'u1' });
+        const c2 = await connectClient({ userId: 2, username: 'u2' });
+        await emitWithAck(c1, 'lobby:join', { lobbyCode: 'ABC123' });
+        await emitWithAck(c2, 'lobby:join', { lobbyCode: 'ABC123' });
+
+        const readyAck = await emitWithAck(c1, 'lobby:set_ready', { lobbyCode: 'ABC123', ready: true });
+        expect(readyAck.ok).toBe(true);
+        expect(readyAck.allReady).toBe(false);
+
+        const startAck = await emitWithAck(c1, 'game:start', { lobbyCode: 'ABC123' });
+        expect(startAck.ok).toBe(false);
+        expect(startAck.code).toBe('bad_request');
+        expect(startAck.error).toBe('All players must be ready before the host can start the game');
+        expect(sessionService.startSessionFromLobby).not.toHaveBeenCalled();
+    });
+
+    test('resets waiting ready state after host updates settings', async () => {
+        const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1, 2] });
+        lobbyService.joinLobby.mockResolvedValue(lobby);
+        lobbyService.setPlayerConnection.mockResolvedValue(lobby);
+        lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+        lobbyService.updateLobbyConfig.mockResolvedValue(lobby);
+
+        const c1 = await connectClient({ userId: 1, username: 'u1' });
+        const c2 = await connectClient({ userId: 2, username: 'u2' });
+        await emitWithAck(c1, 'lobby:join', { lobbyCode: 'ABC123' });
+        await emitWithAck(c2, 'lobby:join', { lobbyCode: 'ABC123' });
+        await emitWithAck(c1, 'lobby:set_ready', { lobbyCode: 'ABC123', ready: true });
+        await emitWithAck(c2, 'lobby:set_ready', { lobbyCode: 'ABC123', ready: true });
+
+        const readyResetPromise = new Promise((resolve) => c1.once('lobby:ready_state', resolve));
+        const ack = await emitWithAck(c1, 'lobby:update_settings', { lobbyCode: 'ABC123', settings: { roundCount: 12 } });
+        expect(ack.ok).toBe(true);
+        const readyState = await readyResetPromise;
+        expect(readyState.readyUserIds).toEqual([]);
+        expect(readyState.allReady).toBe(false);
     });
 
     test('tracks ready state and reports allReady', async () => {
@@ -250,7 +297,7 @@ describe('socket gateway', () => {
     });
 
     test('triggers media prewarm when game starts', async () => {
-        const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1, 2] });
+        const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1] });
         const session = { id: 44, roundCount: 1 };
         lobbyService.getLobbyByCode.mockResolvedValue(lobby);
         sessionService.startSessionFromLobby.mockResolvedValue(session);
@@ -261,6 +308,7 @@ describe('socket gateway', () => {
 
         const host = await connectClient({ userId: 1, username: 'u1' });
         await emitWithAck(host, 'lobby:join', { lobbyCode: 'ABC123' });
+        await emitWithAck(host, 'lobby:set_ready', { lobbyCode: 'ABC123', ready: true });
 
         const ack = await emitWithAck(host, 'game:start', { lobbyCode: 'ABC123' });
         expect(ack.ok).toBe(true);
@@ -275,7 +323,7 @@ describe('socket gateway', () => {
     });
 
     test('fails game start when first media warmup cannot cache any media', async () => {
-        const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1, 2] });
+        const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1] });
         const session = { id: 51, roundCount: 1 };
         lobbyService.getLobbyByCode.mockResolvedValue(lobby);
         sessionService.startSessionFromLobby.mockResolvedValue(session);
@@ -292,11 +340,67 @@ describe('socket gateway', () => {
 
         const host = await connectClient({ userId: 1, username: 'u1' });
         await emitWithAck(host, 'lobby:join', { lobbyCode: 'ABC123' });
+        await emitWithAck(host, 'lobby:set_ready', { lobbyCode: 'ABC123', ready: true });
 
         const ack = await emitWithAck(host, 'game:start', { lobbyCode: 'ABC123' });
         expect(ack.ok).toBe(false);
         expect(ack.code).toBe('game_start_failed');
         expect(ack.error).toBe('Could not cache first round media');
         expect(sessionService.rollbackSessionStart).toHaveBeenCalledWith(51);
+    });
+
+    test('kicked users receive notification and cannot immediately rejoin', async () => {
+        const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1, 2] });
+        lobbyService.joinLobby
+            .mockResolvedValueOnce(lobby)
+            .mockResolvedValueOnce(lobby)
+            .mockRejectedValueOnce(Object.assign(new Error('You were kicked from this lobby. Try again in 120s'), { status: 403 }));
+        lobbyService.setPlayerConnection.mockResolvedValue(lobby);
+        lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+        lobbyService.kickPlayer.mockResolvedValue({
+            lobby: buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1] }),
+            kickedUserId: 2,
+            cooldownUntil: Date.now() + 120_000
+        });
+
+        const host = await connectClient({ userId: 1, username: 'u1' });
+        const guest = await connectClient({ userId: 2, username: 'u2' });
+        await emitWithAck(host, 'lobby:join', { lobbyCode: 'ABC123' });
+        await emitWithAck(guest, 'lobby:join', { lobbyCode: 'ABC123' });
+
+        const kickedPromise = new Promise((resolve) => guest.once('lobby:kicked', resolve));
+        const kickAck = await emitWithAck(host, 'lobby:kick', { lobbyCode: 'ABC123', userId: 2 });
+        expect(kickAck.ok).toBe(true);
+        const kickedEvent = await kickedPromise;
+        expect(kickedEvent.kickedUserId).toBe(2);
+
+        const rejoinAck = await emitWithAck(guest, 'lobby:join', { lobbyCode: 'ABC123' });
+        expect(rejoinAck.ok).toBe(false);
+        expect(rejoinAck.code).toBe('forbidden');
+        expect(rejoinAck.error).toContain('kicked from this lobby');
+    });
+
+    test('host can promote another player to host', async () => {
+        const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1, 2] });
+        const promotedLobby = buildLobby({ code: 'ABC123', hostId: 2, playerIds: [1, 2] });
+        lobbyService.joinLobby.mockResolvedValue(lobby);
+        lobbyService.setPlayerConnection.mockResolvedValue(lobby);
+        lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+        lobbyService.promoteHost.mockResolvedValue({
+            lobby: promotedLobby,
+            promotedUserId: 2
+        });
+
+        const host = await connectClient({ userId: 1, username: 'u1' });
+        const guest = await connectClient({ userId: 2, username: 'u2' });
+        await emitWithAck(host, 'lobby:join', { lobbyCode: 'ABC123' });
+        await emitWithAck(guest, 'lobby:join', { lobbyCode: 'ABC123' });
+
+        const statePromise = new Promise((resolve) => guest.once('lobby:state', resolve));
+        const ack = await emitWithAck(host, 'lobby:promote', { lobbyCode: 'ABC123', userId: 2 });
+        expect(ack.ok).toBe(true);
+        expect(ack.promotedUserId).toBe(2);
+        const nextState = await statePromise;
+        expect(nextState.lobby.host.id).toBe(2);
     });
 });

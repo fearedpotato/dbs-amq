@@ -562,7 +562,7 @@ describe('socket integration', () => {
 
         const app = express();
         server = http.createServer(app);
-        io = attachRealtime(server, { origin: true });
+        io = attachRealtime(server, { origin: true, mediaStatusBroadcast: false });
 
         await new Promise((resolve) => server.listen(0, resolve));
         const { port } = server.address();
@@ -609,6 +609,8 @@ describe('socket integration', () => {
 
         expect((await emitWithAck(host, 'lobby:join', { lobbyCode: 'MATCH1' })).ok).toBe(true);
         expect((await emitWithAck(guest, 'lobby:join', { lobbyCode: 'MATCH1' })).ok).toBe(true);
+        expect((await emitWithAck(host, 'lobby:set_ready', { lobbyCode: 'MATCH1', ready: true })).ok).toBe(true);
+        expect((await emitWithAck(guest, 'lobby:set_ready', { lobbyCode: 'MATCH1', ready: true })).ok).toBe(true);
 
         const gameStartedPromise = waitForEvent(host, 'game:started');
         const startedPromise = waitForEvent(host, 'round:started');
@@ -781,6 +783,7 @@ describe('socket integration', () => {
 
         const host = await connectClient({ userId: 1, username: 'host' });
         expect((await emitWithAck(host, 'lobby:join', { lobbyCode: 'RECON1' })).ok).toBe(true);
+        expect((await emitWithAck(host, 'lobby:set_ready', { lobbyCode: 'RECON1', ready: true })).ok).toBe(true);
 
         const startedPromise = waitForEvent(host, 'round:started');
         const startAck = await emitWithAck(host, 'game:start', { lobbyCode: 'RECON1' });
@@ -823,6 +826,8 @@ describe('socket integration', () => {
         const guest = await connectClient({ userId: 2, username: 'guest' });
         expect((await emitWithAck(host, 'lobby:join', { lobbyCode: 'PRELOAD1' })).ok).toBe(true);
         expect((await emitWithAck(guest, 'lobby:join', { lobbyCode: 'PRELOAD1' })).ok).toBe(true);
+        expect((await emitWithAck(host, 'lobby:set_ready', { lobbyCode: 'PRELOAD1', ready: true })).ok).toBe(true);
+        expect((await emitWithAck(guest, 'lobby:set_ready', { lobbyCode: 'PRELOAD1', ready: true })).ok).toBe(true);
 
         const startedPromise = waitForEvent(host, 'round:started');
         expect((await emitWithAck(host, 'game:start', { lobbyCode: 'PRELOAD1' })).ok).toBe(true);

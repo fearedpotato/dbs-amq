@@ -25,20 +25,27 @@
         <input type="password" id="password" placeholder="********" autocomplete="current-password" required/>
       </div>
       <div class="auth-row-link">
-        <a href="forgot.html">Forgot password?</a>
+        <a href="/forgot">Forgot password?</a>
       </div>
       <button type="submit" class="btn btn-primary" id="submitBtn" data-label="Sign in">Sign in</button>
     </form>
 
     <div class="auth-footer">
-      Don't have an account? <a href="register.html">Register</a>
+      Don't have an account? <a href="/register">Register</a>
     </div>
   </div>
 </div>
 
 <script src="auth.js"></script>
 <script>
-  auth.requireGuest();
+  const params = new URLSearchParams(window.location.search);
+  const nextPath = (() => {
+    const value = String(params.get('next') || '').trim();
+    return value.startsWith('/') ? value : '';
+  })();
+  if (auth.isLoggedIn()) {
+    window.location.href = nextPath || '/dashboard';
+  }
 
   const form = document.getElementById('loginForm');
   const alert = document.getElementById('alert');
@@ -62,7 +69,7 @@
       const user = await apiFetch('/auth/me');
       auth.save(token, user);
 
-      window.location.href = 'dashboard.html';
+      window.location.href = nextPath || '/dashboard';
     } catch (err) {
       showAlert(alert, err.message);
       setLoading(submitBtn, false);

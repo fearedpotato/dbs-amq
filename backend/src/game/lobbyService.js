@@ -10,6 +10,66 @@ const {
 } = require('./constants');
 const { httpError } = require('./errors');
 
+const kickedLobbyUsers = new Map();
+const DEFAULT_KICK_COOLDOWN_MS = 2 * 60 * 1000;
+
+function normalizeLobbyCode(code) {
+    return String(code || '').toUpperCase();
+}
+
+function kickCooldownKey(code, userId) {
+    return `${normalizeLobbyCode(code)}:${userId}`;
+}
+
+function parseKickCooldownMs() {
+    const parsed = Number.parseInt(process.env.LOBBY_KICK_COOLDOWN_MS, 10);
+    if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_KICK_COOLDOWN_MS;
+    return parsed;
+}
+
+function clearExpiredKickCooldownsForCode(code) {
+    const normalizedCode = normalizeLobbyCode(code);
+    const now = Date.now();
+    for (const [key, value] of kickedLobbyUsers.entries()) {
+        if (!key.startsWith(`${normalizedCode}:`)) continue;
+        if (!Number.isFinite(value) || value <= now) {
+            kickedLobbyUsers.delete(key);
+        }
+    }
+}
+
+function setKickCooldown(code, userId, ttlMs = parseKickCooldownMs()) {
+    const normalizedCode = normalizeLobbyCode(code);
+    const expiresAt = Date.now() + Math.max(1, Number.parseInt(ttlMs, 10) || DEFAULT_KICK_COOLDOWN_MS);
+    kickedLobbyUsers.set(kickCooldownKey(normalizedCode, userId), expiresAt);
+    return expiresAt;
+}
+
+function clearKickCooldownsForLobby(code) {
+    const normalizedCode = normalizeLobbyCode(code);
+    for (const key of kickedLobbyUsers.keys()) {
+        if (key.startsWith(`${normalizedCode}:`)) {
+            kickedLobbyUsers.delete(key);
+        }
+    }
+}
+
+function assertKickCooldownAllowsJoin(code, userId) {
+    const normalizedCode = normalizeLobbyCode(code);
+    clearExpiredKickCooldownsForCode(normalizedCode);
+    const cooldownUntil = kickedLobbyUsers.get(kickCooldownKey(normalizedCode, userId));
+    if (!Number.isFinite(cooldownUntil)) return;
+
+    const remainingMs = cooldownUntil - Date.now();
+    if (remainingMs <= 0) {
+        kickedLobbyUsers.delete(kickCooldownKey(normalizedCode, userId));
+        return;
+    }
+
+    const remainingSec = Math.max(1, Math.ceil(remainingMs / 1000));
+    throw httpError(403, `You were kicked from this lobby. Try again in ${remainingSec}s`);
+}
+
 function sanitizeLobbyConfig(input = {}) {
     const config = {
         name: typeof input.name === 'string' ? input.name.trim() : null,
@@ -111,9 +171,9 @@ function mapLobby(lobby) {
 
 function buildInviteLink(baseUrl, code, inviteToken) {
     const origin = (typeof baseUrl === 'string' && baseUrl.trim()) ? baseUrl : 'http://localhost:3000';
-    const url = `${origin.replace(/\/$/, '')}/game?lobby=${encodeURIComponent(code)}`;
-    if (!inviteToken) return url;
-    return `${url}&inviteToken=${encodeURIComponent(inviteToken)}`;
+    const invitePath = `${origin.replace(/\/$/, '')}/invite/${encodeURIComponent(code)}`;
+    if (!inviteToken) return invitePath;
+    return `${invitePath}?i=${encodeURIComponent(inviteToken)}`;
 }
 
 function generateInviteToken(code, options = {}) {
@@ -172,14 +232,18 @@ async function getLobbyByCode(code) {
 }
 
 async function joinLobby(code, user, displayName, options = {}) {
-    const normalizedCode = String(code || '').toUpperCase();
+    const normalizedCode = normalizeLobbyCode(code);
     const inviteToken = typeof options.inviteToken === 'string' ? options.inviteToken : null;
     let attempts = 0;
+
+    assertKickCooldownAllowsJoin(normalizedCode, user.id);
 
     while (attempts < 3) {
         attempts += 1;
         try {
             await prisma.$transaction(async (tx) => {
+                assertKickCooldownAllowsJoin(normalizedCode, user.id);
+
                 const lobby = await tx.lobby.findUnique({
                     where: { code: normalizedCode },
                     include: {
@@ -189,7 +253,6 @@ async function joinLobby(code, user, displayName, options = {}) {
                 });
 
                 if (!lobby) throw httpError(404, 'Lobby not found');
-                if (lobby.status !== 'WAITING') throw httpError(400, 'Lobby is not accepting new players');
 
                 const existing = lobby.players.find((player) => player.userId === user.id);
                 if (existing) {
@@ -201,6 +264,8 @@ async function joinLobby(code, user, displayName, options = {}) {
                     }
                     return;
                 }
+
+                if (lobby.status !== 'WAITING') throw httpError(400, 'Lobby is not accepting new players');
 
                 if (lobby.isPrivate && lobby.hostUserId !== user.id) {
                     const validInvite = verifyLobbyInviteToken(inviteToken, normalizedCode);
@@ -292,6 +357,7 @@ async function leaveLobby(code, userId, options = {}) {
                 where: { id: lobby.id },
                 data: { status: 'CLOSED' }
             });
+            clearKickCooldownsForLobby(code);
             return;
         }
 
@@ -304,6 +370,72 @@ async function leaveLobby(code, userId, options = {}) {
     });
 
     return getLobbyByCode(code);
+}
+
+async function kickPlayer(code, actorUserId, targetUserId, options = {}) {
+    const normalizedCode = normalizeLobbyCode(code);
+    const targetId = Number.parseInt(targetUserId, 10);
+    if (!Number.isInteger(targetId)) throw httpError(400, 'Target user is invalid');
+
+    const lobby = await prisma.lobby.findUnique({
+        where: { code: normalizedCode },
+        include: {
+            players: { orderBy: { joinedAt: 'asc' } }
+        }
+    });
+
+    if (!lobby) throw httpError(404, 'Lobby not found');
+    if (lobby.hostUserId !== actorUserId) throw httpError(403, 'Only the host can kick players');
+    if (lobby.status !== 'WAITING') throw httpError(400, 'Cannot kick players after game has started');
+    if (targetId === lobby.hostUserId) throw httpError(400, 'Host cannot kick themselves');
+
+    const targetPlayer = lobby.players.find((player) => player.userId === targetId);
+    if (!targetPlayer) throw httpError(404, 'Player is not in this lobby');
+
+    await prisma.lobbyPlayer.delete({
+        where: { id: targetPlayer.id }
+    });
+
+    const cooldownUntil = setKickCooldown(normalizedCode, targetId, options.cooldownMs);
+    const updatedLobby = await getLobbyByCode(normalizedCode);
+
+    return {
+        lobby: updatedLobby,
+        kickedUserId: targetId,
+        cooldownUntil
+    };
+}
+
+async function promoteHost(code, actorUserId, targetUserId) {
+    const normalizedCode = normalizeLobbyCode(code);
+    const targetId = Number.parseInt(targetUserId, 10);
+    if (!Number.isInteger(targetId)) throw httpError(400, 'Target user is invalid');
+
+    const lobby = await prisma.lobby.findUnique({
+        where: { code: normalizedCode },
+        include: {
+            players: true
+        }
+    });
+
+    if (!lobby) throw httpError(404, 'Lobby not found');
+    if (lobby.hostUserId !== actorUserId) throw httpError(403, 'Only the host can promote a new host');
+    if (lobby.status !== 'WAITING') throw httpError(400, 'Cannot transfer host after game has started');
+    if (targetId === lobby.hostUserId) throw httpError(400, 'Selected player is already host');
+
+    const targetPlayer = lobby.players.find((player) => player.userId === targetId);
+    if (!targetPlayer) throw httpError(404, 'Player is not in this lobby');
+
+    await prisma.lobby.update({
+        where: { id: lobby.id },
+        data: { hostUserId: targetId }
+    });
+
+    const updatedLobby = await getLobbyByCode(normalizedCode);
+    return {
+        lobby: updatedLobby,
+        promotedUserId: targetId
+    };
 }
 
 async function updateLobbyConfig(code, actorUserId, patch = {}) {
@@ -323,6 +455,9 @@ async function updateLobbyConfig(code, actorUserId, patch = {}) {
         ...current,
         ...patch
     });
+    if (config.maxPlayers < current.players.length) {
+        throw httpError(400, `maxPlayers cannot be lower than current player count (${current.players.length})`);
+    }
 
     const updated = await prisma.lobby.update({
         where: { id: current.id },
@@ -412,9 +547,12 @@ module.exports = {
     mapLobby,
     buildInviteLink,
     generateInviteToken,
+    parseKickCooldownMs,
     createLobby,
     getLobbyByCode,
     joinLobby,
+    kickPlayer,
+    promoteHost,
     enforceSingleLobbyMembership,
     setPlayerConnection,
     leaveLobby,
