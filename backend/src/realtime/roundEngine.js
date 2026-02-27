@@ -8,8 +8,21 @@ const {
 const telemetry = require('../lib/telemetry');
 
 const MAX_SUDDEN_DEATH_ROUNDS = 20;
+const DEFAULT_ZERO_CONNECTED_ROUNDS_TO_KILL = 3;
 
-function createRoundEngine(io) {
+function parsePositiveInt(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getZeroConnectedRoundsToKill() {
+    return parsePositiveInt(
+        process.env.LOBBY_ZERO_CONNECTED_ROUNDS_TO_KILL,
+        DEFAULT_ZERO_CONNECTED_ROUNDS_TO_KILL
+    );
+}
+
+function createRoundEngine(io, options = {}) {
     const stateByLobby = new Map();
 
     function clearRoundTimers(state) {
@@ -39,7 +52,8 @@ function createRoundEngine(io) {
             phase: 'PENDING',
             timers: {},
             readyUserIds: new Set(),
-            suddenDeathRounds: 0
+            suddenDeathRounds: 0,
+            zeroConnectedRoundStreak: 0
         };
     }
 
@@ -298,6 +312,36 @@ function createRoundEngine(io) {
                 error: err?.message || String(err)
             });
         });
+
+        const sessionSnapshot = await roundService.getSessionById(state.sessionId);
+        if (sessionSnapshot?.lobby?.players) {
+            state.players = sessionSnapshot.lobby.players;
+        }
+        const connectedPlayers = (state.players || []).filter((player) => player?.isConnected !== false);
+        if (connectedPlayers.length === 0) {
+            state.zeroConnectedRoundStreak += 1;
+        } else {
+            state.zeroConnectedRoundStreak = 0;
+        }
+
+        if (state.zeroConnectedRoundStreak >= getZeroConnectedRoundsToKill()) {
+            telemetry.info('lobby.auto_close_zero_connected_round_streak', {
+                lobbyCode,
+                sessionId: state.sessionId,
+                streak: state.zeroConnectedRoundStreak,
+                roundIndex: state.currentRound?.index || null
+            });
+
+            if (typeof options.onNoConnectedRoundStreakExceeded === 'function') {
+                await options.onNoConnectedRoundStreakExceeded({
+                    lobbyCode,
+                    sessionId: state.sessionId,
+                    streak: state.zeroConnectedRoundStreak,
+                    roundIndex: state.currentRound?.index || null
+                });
+            }
+            return;
+        }
 
         const scores = await roundService.getScoresForSession({
             sessionId: state.sessionId,
@@ -666,6 +710,25 @@ function createRoundEngine(io) {
         return stateByLobby.has(sanitizeLobbyCode(lobbyCode));
     }
 
+    async function forceStopLobby(lobbyCode, reason = 'terminated') {
+        const code = sanitizeLobbyCode(lobbyCode);
+        const state = stateByLobby.get(code);
+        if (!state) return false;
+
+        clearRoundTimers(state);
+        stateByLobby.delete(code);
+        io.to(code).emit('lobby:terminated', {
+            lobbyCode: code,
+            reason
+        });
+        telemetry.info('lobby.force_stopped', {
+            lobbyCode: code,
+            sessionId: state.sessionId,
+            reason
+        });
+        return true;
+    }
+
     async function getSessionMediaManifest(sessionId) {
         const media = await roundService.listRoundMediaForSession(sessionId);
         return Array.isArray(media) ? media : [];
@@ -686,6 +749,7 @@ function createRoundEngine(io) {
         getSyncState,
         onPlayerDisconnected,
         hasActiveSession,
+        forceStopLobby,
         getSessionMediaManifest,
         recoverActiveSessions
     };

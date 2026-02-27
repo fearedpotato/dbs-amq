@@ -372,6 +372,97 @@ async function leaveLobby(code, userId, options = {}) {
     return getLobbyByCode(code);
 }
 
+async function closeLobby(code, options = {}) {
+    const normalizedCode = normalizeLobbyCode(code);
+    const cancelActiveSession = options.cancelActiveSession !== false;
+
+    const lobby = await prisma.lobby.findUnique({
+        where: { code: normalizedCode },
+        include: {
+            players: { orderBy: { joinedAt: 'asc' } }
+        }
+    });
+    if (!lobby) return null;
+
+    await prisma.$transaction(async (tx) => {
+        if (cancelActiveSession) {
+            await tx.gameSession.updateMany({
+                where: {
+                    lobbyId: lobby.id,
+                    status: 'IN_PROGRESS'
+                },
+                data: {
+                    status: 'CANCELLED',
+                    endedAt: new Date()
+                }
+            });
+        }
+
+        await tx.lobbyPlayer.deleteMany({
+            where: { lobbyId: lobby.id }
+        });
+
+        await tx.lobby.update({
+            where: { id: lobby.id },
+            data: { status: 'CLOSED' }
+        });
+    });
+
+    clearKickCooldownsForLobby(normalizedCode);
+    return getLobbyByCode(normalizedCode);
+}
+
+async function resolveOfflineHostTimeout(code) {
+    const normalizedCode = normalizeLobbyCode(code);
+    const lobby = await prisma.lobby.findUnique({
+        where: { code: normalizedCode },
+        include: {
+            players: { orderBy: { joinedAt: 'asc' } },
+            host: { select: { id: true, username: true, nickname: true } }
+        }
+    });
+    if (!lobby || lobby.status === 'CLOSED') {
+        return { action: 'none', lobby: null };
+    }
+
+    const hostPlayer = (lobby.players || []).find((player) => player.userId === lobby.hostUserId);
+    if (!hostPlayer || hostPlayer.isConnected !== false) {
+        return { action: 'none', lobby: mapLobby(lobby) };
+    }
+
+    if (lobby.status === 'WAITING') {
+        const transferTarget = (lobby.players || []).find((player) => (
+            player.userId !== lobby.hostUserId && player.isConnected !== false
+        ));
+        if (transferTarget) {
+            await prisma.$transaction(async (tx) => {
+                await tx.lobby.update({
+                    where: { id: lobby.id },
+                    data: { hostUserId: transferTarget.userId }
+                });
+                await tx.lobbyPlayer.delete({
+                    where: { id: hostPlayer.id }
+                });
+            });
+
+            const updatedLobby = await getLobbyByCode(normalizedCode);
+            return {
+                action: 'transferred',
+                lobby: updatedLobby,
+                removedUserId: hostPlayer.userId,
+                newHostUserId: transferTarget.userId
+            };
+        }
+    }
+
+    const closedLobby = await closeLobby(normalizedCode, { cancelActiveSession: true });
+    return {
+        action: 'closed',
+        lobby: closedLobby,
+        removedUserId: hostPlayer.userId
+    };
+}
+
 async function kickPlayer(code, actorUserId, targetUserId, options = {}) {
     const normalizedCode = normalizeLobbyCode(code);
     const targetId = Number.parseInt(targetUserId, 10);
@@ -556,6 +647,8 @@ module.exports = {
     enforceSingleLobbyMembership,
     setPlayerConnection,
     leaveLobby,
+    closeLobby,
+    resolveOfflineHostTimeout,
     updateLobbyConfig,
     listJoinableLobbies
 };

@@ -53,6 +53,17 @@ function normalizeUserIds(values) {
     return values.filter((value) => Number.isInteger(value));
 }
 
+const DEFAULT_HOST_OFFLINE_TIMEOUT_MS = 5 * 60 * 1000;
+
+function parsePositiveInt(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getHostOfflineTimeoutMs() {
+    return parsePositiveInt(process.env.LOBBY_HOST_OFFLINE_TIMEOUT_MS, DEFAULT_HOST_OFFLINE_TIMEOUT_MS);
+}
+
 function attachRealtime(httpServer, options = {}) {
     const io = new Server(httpServer, {
         cors: {
@@ -61,9 +72,10 @@ function attachRealtime(httpServer, options = {}) {
         }
     });
 
-    const roundEngine = createRoundEngine(io);
+    let roundEngine = null;
     const pendingPreloadByLobby = new Map();
     const waitingReadyByLobby = new Map();
+    const hostOfflineTimersByLobby = new Map();
     const socketIdsByUserId = new Map();
     const mediaStatusBroadcastEnabled = options.mediaStatusBroadcast !== false;
     let mediaStatusBroadcastTimer = null;
@@ -124,8 +136,67 @@ function attachRealtime(httpServer, options = {}) {
             clearInterval(mediaStatusBroadcastTimer);
             mediaStatusBroadcastTimer = null;
         }
+        for (const timer of hostOfflineTimersByLobby.values()) {
+            clearTimeout(timer);
+        }
+        hostOfflineTimersByLobby.clear();
         return originalClose(...args);
     };
+
+    function clearHostOfflineTimer(lobbyCode) {
+        const code = normalizeLobbyCode(lobbyCode);
+        const timer = hostOfflineTimersByLobby.get(code);
+        if (!timer) return;
+        clearTimeout(timer);
+        hostOfflineTimersByLobby.delete(code);
+    }
+
+    async function removeUserFromLobbyRoom(lobbyCode, memberUserId) {
+        const code = normalizeLobbyCode(lobbyCode);
+        const targetSocketIds = socketIdsByUserId.get(memberUserId)
+            ? [...socketIdsByUserId.get(memberUserId)]
+            : [];
+
+        for (const socketId of targetSocketIds) {
+            const targetSocket = io.sockets.sockets.get(socketId);
+            if (!targetSocket) continue;
+            targetSocket.leave(code);
+            targetSocket.data?.lobbies?.delete?.(code);
+        }
+    }
+
+    async function terminateLobby(lobbyCode, reason, options = {}) {
+        const code = normalizeLobbyCode(lobbyCode);
+        const alreadyClosed = options.alreadyClosed === true;
+
+        clearHostOfflineTimer(code);
+        pendingPreloadByLobby.delete(code);
+        clearWaitingReady(code);
+
+        if (!alreadyClosed) {
+            await lobbyService.closeLobby(code, { cancelActiveSession: true });
+        }
+
+        const stoppedByEngine = await roundEngine.forceStopLobby(code, reason);
+        if (!stoppedByEngine) {
+            io.to(code).emit('lobby:terminated', {
+                lobbyCode: code,
+                reason
+            });
+        }
+
+        const roomSockets = await io.in(code).fetchSockets();
+        for (const roomSocket of roomSockets) {
+            roomSocket.leave(code);
+            roomSocket.data?.lobbies?.delete?.(code);
+        }
+
+        broadcastLobbyDirectoryChanged(io, {
+            reason,
+            lobbyCode: code,
+            lobbyClosed: true
+        });
+    }
 
     function getOrCreateWaitingReadySet(lobbyCode) {
         const code = normalizeLobbyCode(lobbyCode);
@@ -233,6 +304,94 @@ function attachRealtime(httpServer, options = {}) {
             socketIdsByUserId.delete(memberUserId);
         }
     }
+
+    async function handleHostOfflineTimeout(lobbyCode) {
+        const code = normalizeLobbyCode(lobbyCode);
+        hostOfflineTimersByLobby.delete(code);
+
+        try {
+            const result = await lobbyService.resolveOfflineHostTimeout(code);
+            if (!result || result.action === 'none') return;
+
+            if (result.action === 'transferred') {
+                if (Number.isInteger(result.removedUserId)) {
+                    await removeUserFromLobbyRoom(code, result.removedUserId);
+                }
+                if (result.lobby) {
+                    io.to(code).emit('lobby:state', { lobby: result.lobby });
+                    emitLobbyReadyState(code, (result.lobby.players || []).map((player) => player.userId));
+                }
+                broadcastLobbyDirectoryChanged(io, {
+                    reason: 'host_offline_transfer',
+                    lobbyCode: code
+                });
+                telemetry.info('lobby.host_offline_transferred', {
+                    lobbyCode: code,
+                    removedUserId: result.removedUserId || null,
+                    newHostUserId: result.newHostUserId || null
+                });
+                return;
+            }
+
+            if (result.action === 'closed') {
+                await terminateLobby(code, 'host_offline_timeout', { alreadyClosed: true });
+                telemetry.info('lobby.host_offline_closed', {
+                    lobbyCode: code,
+                    removedUserId: result.removedUserId || null
+                });
+            }
+        } catch (err) {
+            telemetry.warn('lobby.host_offline_timeout_failed', {
+                lobbyCode: code,
+                error: err?.message || String(err)
+            });
+        }
+    }
+
+    function scheduleHostOfflineTimeout(lobbyCode) {
+        const code = normalizeLobbyCode(lobbyCode);
+        clearHostOfflineTimer(code);
+
+        const timeoutMs = getHostOfflineTimeoutMs();
+        const timer = setTimeout(() => {
+            handleHostOfflineTimeout(code).catch(() => {});
+        }, timeoutMs);
+        if (typeof timer?.unref === 'function') {
+            timer.unref();
+        }
+        hostOfflineTimersByLobby.set(code, timer);
+    }
+
+    function syncHostOfflineTimeoutFromLobby(lobby, lobbyCode = null) {
+        const code = normalizeLobbyCode(lobby?.code || lobbyCode);
+        if (!code) return;
+        if (!lobby || lobby.status === 'CLOSED') {
+            clearHostOfflineTimer(code);
+            return;
+        }
+
+        const hostUserId = lobby.host?.id;
+        const hostPlayer = (lobby.players || []).find((player) => player.userId === hostUserId);
+        if (hostPlayer && hostPlayer.isConnected === false) {
+            scheduleHostOfflineTimeout(code);
+            return;
+        }
+
+        clearHostOfflineTimer(code);
+    }
+
+    roundEngine = createRoundEngine(io, {
+        onNoConnectedRoundStreakExceeded: async ({ lobbyCode, sessionId, streak, roundIndex }) => {
+            const code = normalizeLobbyCode(lobbyCode);
+            await terminateLobby(code, 'zero_connected_round_streak');
+            telemetry.info('lobby.zero_connected_round_streak_closed', {
+                lobbyCode: code,
+                sessionId,
+                streak,
+                roundIndex
+            });
+        }
+    });
 
     async function assertEventRateLimit(userId, eventName, { windowMs, max }) {
         const key = `${userId}:${eventName}`;
@@ -355,12 +514,14 @@ function attachRealtime(httpServer, options = {}) {
                 for (const removedCode of affectedPreviousLobbies) {
                     removeWaitingReadyUser(removedCode, userId);
                     await roundEngine.onPlayerDisconnected(removedCode, userId);
-                    await broadcastLobbyStateAndReady(removedCode);
+                    const previousLobby = await broadcastLobbyStateAndReady(removedCode);
+                    syncHostOfflineTimeoutFromLobby(previousLobby, removedCode);
                 }
 
                 socket.join(code);
                 socket.data.lobbies.add(code);
                 await broadcastLobbyStateAndReady(code);
+                syncHostOfflineTimeoutFromLobby(lobby, code);
                 broadcastLobbyDirectoryChanged(io, {
                     reason: 'join',
                     lobbyCodes: [...new Set([code, ...affectedPreviousLobbies])]
@@ -395,6 +556,7 @@ function attachRealtime(httpServer, options = {}) {
                 } else {
                     clearWaitingReady(code);
                 }
+                syncHostOfflineTimeoutFromLobby(lobby, code);
                 broadcastLobbyDirectoryChanged(io, {
                     reason: 'leave',
                     lobbyCode: code,
@@ -437,6 +599,7 @@ function attachRealtime(httpServer, options = {}) {
                     requiredUserIds: (lobby.players || []).map((player) => player.userId),
                     allReady: false
                 });
+                syncHostOfflineTimeoutFromLobby(lobby);
                 broadcastLobbyDirectoryChanged(io, {
                     reason: 'settings',
                     lobbyCode: code
@@ -527,6 +690,7 @@ function attachRealtime(httpServer, options = {}) {
                 } else {
                     clearWaitingReady(code);
                 }
+                syncHostOfflineTimeoutFromLobby(result.lobby, code);
                 broadcastLobbyDirectoryChanged(io, {
                     reason: 'kick',
                     lobbyCode: code
@@ -569,6 +733,7 @@ function attachRealtime(httpServer, options = {}) {
                     io.to(code).emit('lobby:state', { lobby: result.lobby });
                     emitLobbyReadyState(code, (result.lobby.players || []).map((player) => player.userId));
                 }
+                syncHostOfflineTimeoutFromLobby(result.lobby, code);
                 broadcastLobbyDirectoryChanged(io, {
                     reason: 'promote',
                     lobbyCode: code
@@ -654,6 +819,7 @@ function attachRealtime(httpServer, options = {}) {
                     lobby: updatedLobby,
                     preloadManifest
                 });
+                syncHostOfflineTimeoutFromLobby(updatedLobby);
                 broadcastLobbyDirectoryChanged(io, {
                     reason: 'game_started',
                     lobbyCode: code
@@ -793,6 +959,9 @@ function attachRealtime(httpServer, options = {}) {
 
         socket.on('disconnect', async () => {
             untrackSocketForUser(userId, socket.id);
+            if (socketIdsByUserId.has(userId)) {
+                return;
+            }
             for (const code of socket.data.lobbies) {
                 try {
                     const pending = pendingPreloadByLobby.get(code);
@@ -807,8 +976,9 @@ function attachRealtime(httpServer, options = {}) {
 
                     await roundEngine.onPlayerDisconnected(code, userId);
                     removeWaitingReadyUser(code, userId);
-                    await lobbyService.setPlayerConnection(code, userId, false);
+                    const lobby = await lobbyService.setPlayerConnection(code, userId, false);
                     await broadcastLobbyStateAndReady(code);
+                    syncHostOfflineTimeoutFromLobby(lobby);
                     telemetry.info('lobby.player_disconnected', {
                         lobbyCode: code,
                         userId

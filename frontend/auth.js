@@ -35,8 +35,17 @@ async function apiFetch(path, options = {}) {
         },
         ...options
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Something went wrong');
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        const err = new Error(data.error || 'Something went wrong');
+        err.status = res.status;
+        const retryAfterRaw = res.headers.get('Retry-After');
+        const retryAfterSec = Number.parseInt(retryAfterRaw, 10);
+        if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
+            err.retryAfterSec = retryAfterSec;
+        }
+        throw err;
+    }
     return data;
 }
 

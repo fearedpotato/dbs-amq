@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const mailer = require('../lib/mailer');
 const { createRateLimit } = require('../middleware/rateLimit');
 const { signAuthToken } = require('../lib/authToken');
+const { consumeRateLimitBucket } = require('../lib/rateLimiterStore');
 
 const registerRateLimit = createRateLimit({
     keyPrefix: 'auth:register',
@@ -44,6 +45,7 @@ function hashToken(token) {
 }
 
 const VERIFY_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+const NICKNAME_CHANGE_COOLDOWN_MS = 30 * 1000;
 
 // Register account
 router.post('/register', registerRateLimit, async (req, res) => {
@@ -329,6 +331,13 @@ router.patch('/nickname', authMiddleware, async (req, res) => {
     if (forbiddenNickname.includes(nickname.toLowerCase())) return res.status(400).json({ error: 'This nickname is not allowed' });
 
     try {
+        const bucket = await consumeRateLimitBucket(`auth:nickname_change:${req.user.userId}`, NICKNAME_CHANGE_COOLDOWN_MS);
+        if (bucket.count > 1) {
+            const retryAfterSec = Math.max(1, Math.ceil((bucket.resetAt.getTime() - Date.now()) / 1000));
+            res.setHeader('Retry-After', String(retryAfterSec));
+            return res.status(429).json({ error: 'Nickname can only be changed once every 30 seconds' });
+        }
+
         await prisma.user.update({
             where: { id: req.user.userId },
             data: { nickname }

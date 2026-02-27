@@ -28,6 +28,11 @@ function createApp() {
     return app;
 }
 
+function authHeader(userId = 1, username = 'demo') {
+    const token = jwt.sign({ type: 'auth_access', userId, username }, process.env.JWT_SECRET);
+    return { Authorization: `Bearer ${token}` };
+}
+
 describe('auth routes', () => {
     beforeAll(() => {
         process.env.JWT_SECRET = 'test-jwt-secret';
@@ -205,5 +210,23 @@ describe('auth routes', () => {
             where: { id: 22 },
             data: { isVerified: true, verifyToken: null, verifyTokenExpires: null }
         });
+    });
+
+    test('PATCH /api/auth/nickname enforces a 30-second cooldown', async () => {
+        prisma.user.update.mockResolvedValue({ id: 1, nickname: 'new_name' });
+
+        const first = await request(createApp())
+            .patch('/api/auth/nickname')
+            .set(authHeader(1, 'demo'))
+            .send({ nickname: 'new_name' });
+
+        const second = await request(createApp())
+            .patch('/api/auth/nickname')
+            .set(authHeader(1, 'demo'))
+            .send({ nickname: 'new_name_2' });
+
+        expect(first.status).toBe(200);
+        expect(second.status).toBe(429);
+        expect(second.body.error).toBe('Nickname can only be changed once every 30 seconds');
     });
 });

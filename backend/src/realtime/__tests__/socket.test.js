@@ -87,6 +87,7 @@ describe('socket gateway', () => {
             setReady: jest.fn(),
             onPlayerDisconnected: jest.fn(),
             hasActiveSession: jest.fn(),
+            forceStopLobby: jest.fn().mockResolvedValue(false),
             getSyncState: jest.fn(),
             getSessionMediaManifest: jest.fn().mockResolvedValue([])
         };

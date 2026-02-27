@@ -233,6 +233,17 @@ function toJoinErrorMessage(message) {
     return normalizeErrorMessage(message);
 }
 
+function toLobbyTerminatedMessage(reason) {
+    const value = String(reason || '').trim().toLowerCase();
+    if (value === 'host_offline_timeout') {
+        return 'Lobby was closed because the host stayed offline too long.';
+    }
+    if (value === 'zero_connected_round_streak') {
+        return 'Lobby was closed due to inactivity (no connected players for multiple rounds).';
+    }
+    return 'Lobby was closed.';
+}
+
 function classifyPlaybackError(err) {
     const name = String(err?.name || '');
     const message = normalizeErrorMessage(err?.message).toLowerCase();
@@ -1645,6 +1656,21 @@ export default function App() {
             clearRoundState();
             fetchLobbies().catch(() => {});
         };
+        const onLobbyTerminated = (payload) => {
+            const code = toCode(payload?.lobbyCode);
+            const currentCode = toCode(lobbyRef.current?.code);
+            if (currentCode && code && code !== currentCode) return;
+
+            setError(toLobbyTerminatedMessage(payload?.reason));
+            setLobby(null);
+            setInviteToken('');
+            setSettingsModalOpen(false);
+            setPromoteConfirmTarget(null);
+            setKickConfirmTarget(null);
+            updateUrl('', '');
+            clearRoundState();
+            fetchLobbies().catch(() => {});
+        };
         const onLobbyDirectoryChanged = () => {
             if (lobbyRef.current?.code) return;
             if (lobbyDirectoryRefreshTimerRef.current) {
@@ -1676,6 +1702,7 @@ export default function App() {
         socket.on('round:ready_state', onReadyState);
         socket.on('lobby:ready_state', onLobbyReadyState);
         socket.on('lobby:kicked', onLobbyKicked);
+        socket.on('lobby:terminated', onLobbyTerminated);
         socket.on('media:source_status', onMediaSourceStatus);
         socket.connect();
 
@@ -1694,6 +1721,7 @@ export default function App() {
             socket.off('round:ready_state', onReadyState);
             socket.off('lobby:ready_state', onLobbyReadyState);
             socket.off('lobby:kicked', onLobbyKicked);
+            socket.off('lobby:terminated', onLobbyTerminated);
             socket.off('media:source_status', onMediaSourceStatus);
             if (lobbyDirectoryRefreshTimerRef.current) {
                 window.clearTimeout(lobbyDirectoryRefreshTimerRef.current);

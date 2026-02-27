@@ -2,6 +2,70 @@
 let nicknameSaveInFlight = false;
 let malConnectInFlight = false;
 let malDisconnectInFlight = false;
+let navbarToastCounter = 0;
+
+function showNavbarToast(message, type = 'error', { durationMs = 4500 } = {}) {
+    const viewport = document.getElementById('navbarToastViewport');
+    if (!viewport) return;
+
+    const toastId = `navbar-toast-${Date.now()}-${++navbarToastCounter}`;
+    const toast = document.createElement('div');
+    toast.id = toastId;
+    toast.className = `navbar-toast navbar-toast-${type}`;
+    const text = document.createElement('p');
+    text.textContent = String(message || '');
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'navbar-toast-close';
+    closeBtn.setAttribute('aria-label', 'Close');
+    closeBtn.textContent = 'X';
+    toast.appendChild(text);
+    toast.appendChild(closeBtn);
+
+    const dismiss = () => {
+        const node = document.getElementById(toastId);
+        if (node) node.remove();
+    };
+
+    closeBtn.addEventListener('click', dismiss);
+    viewport.appendChild(toast);
+
+    if (durationMs > 0) {
+        window.setTimeout(dismiss, durationMs);
+    }
+}
+
+function maskEmailForSettings(email) {
+    const value = String(email || '').trim();
+    if (!value) return '-';
+
+    const atIndex = value.indexOf('@');
+    if (atIndex <= 0 || atIndex >= value.length - 1) return value;
+
+    const localPart = value.slice(0, atIndex);
+    const domainPart = value.slice(atIndex + 1);
+
+    let maskedLocal = localPart;
+    if (localPart.length <= 2) {
+        maskedLocal = `${localPart.slice(0, 1)}*`;
+    } else {
+        maskedLocal = `${localPart.slice(0, 2)}${'*'.repeat(Math.max(1, localPart.length - 3))}${localPart.slice(-1)}`;
+    }
+
+    const domainLabels = domainPart.split('.');
+    const topLevelDomain = domainLabels.length > 1 ? domainLabels.pop() : '';
+    const domainRoot = domainLabels.join('.');
+    let maskedDomainRoot = domainRoot;
+    if (domainRoot.length <= 2) {
+        maskedDomainRoot = `${domainRoot.slice(0, 1)}*`;
+    } else {
+        maskedDomainRoot = `${domainRoot.slice(0, 1)}${'*'.repeat(Math.max(1, domainRoot.length - 2))}${domainRoot.slice(-1)}`;
+    }
+
+    return topLevelDomain
+        ? `${maskedLocal}@${maskedDomainRoot}.${topLevelDomain}`
+        : `${maskedLocal}@${maskedDomainRoot}`;
+}
 
 function renderNavbar() {
     const nav = document.createElement('nav');
@@ -99,8 +163,15 @@ function renderNavbar() {
 
       </div>
     </div>
-  `;
+    `;
     document.body.appendChild(modal);
+
+    if (!document.getElementById('navbarToastViewport')) {
+        const toastViewport = document.createElement('div');
+        toastViewport.id = 'navbarToastViewport';
+        toastViewport.className = 'navbar-toast-viewport';
+        document.body.appendChild(toastViewport);
+    }
 
     // Close dropdown on outside click
     document.addEventListener('click', (e) => {
@@ -122,7 +193,7 @@ function updateNavbarUI(user) {
     if (settingsNickname) settingsNickname.textContent = user.nickname || user.username || '-';
 
     const settingsEmail = document.getElementById('settingsEmail');
-    if (settingsEmail) settingsEmail.textContent = user.email || '-';
+    if (settingsEmail) settingsEmail.textContent = maskEmailForSettings(user.email);
 
     const settingsBadge = document.getElementById('settingsVerifiedBadge');
     if (settingsBadge) {
@@ -207,7 +278,16 @@ async function saveNickname() {
         updateNavbarUI(user);
         cancelEditNickname();
     } catch (err) {
-        alert(err.message);
+        if (Number(err?.status) === 429) {
+            const retryAfterSec = Number.parseInt(err?.retryAfterSec, 10);
+            if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
+                showNavbarToast(`Please wait ${retryAfterSec}s before changing nickname again.`, 'error');
+            } else {
+                showNavbarToast('Please wait before changing nickname again.', 'error');
+            }
+        } else {
+            showNavbarToast(err?.message || 'Could not update nickname right now.', 'error');
+        }
     } finally {
         nicknameSaveInFlight = false;
         actionsEl?.querySelectorAll('button')?.forEach((btn) => { btn.disabled = false; });
