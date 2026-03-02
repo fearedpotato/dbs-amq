@@ -22,10 +22,12 @@ function malListResponse(items) {
             data: items.map((item) => ({
                 node: {
                     id: item.id,
-                    title: item.title
+                    title: item.title,
+                    mean: item.mean ?? 8.5
                 },
                 list_status: {
-                    status: item.status || 'completed'
+                    status: item.status || 'completed',
+                    score: item.playerScore ?? 7
                 }
             })),
             paging: {}
@@ -47,6 +49,10 @@ function baseSession(overrides = {}) {
         roundCount: 4,
         sourceMode: 'HYBRID',
         selectionMode: 'STANDARD',
+        animeScoreMin: 1,
+        animeScoreMax: 10,
+        playerScoreMin: 1,
+        playerScoreMax: 10,
         ...overrides
     };
 }
@@ -214,5 +220,138 @@ describe('malSelectionService.buildRoundSeedPlan', () => {
 
         const ids = plan.map((item) => item.animeId).sort((a, b) => a - b);
         expect(ids).toEqual([10, 20]);
+    });
+
+    test('applies anime score filter using truncated MAL mean scores', async () => {
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: 'token-1' }
+        ]);
+        axios.get.mockResolvedValueOnce(malListResponse([
+            { id: 10, title: 'Anime A', mean: 7.89 },
+            { id: 20, title: 'Anime B', mean: 8.01 },
+            { id: 30, title: 'Anime C', mean: 9.12 },
+            { id: 40, title: 'Anime D', mean: 8.99 }
+        ]));
+
+        const plan = await buildRoundSeedPlan({
+            session: baseSession({
+                roundCount: 2,
+                sourceMode: 'MAL_ONLY',
+                selectionMode: 'STANDARD',
+                animeScoreMin: 8,
+                animeScoreMax: 8
+            }),
+            lobby: baseLobby([1])
+        });
+
+        expect(plan).toHaveLength(2);
+        expect(plan.some((item) => item.animeId === 10)).toBe(false);
+        expect(plan.some((item) => item.animeId === 30)).toBe(false);
+        expect(plan.every((item) => [20, 40].includes(item.animeId))).toBe(true);
+    });
+
+    test('excludes unrated MAL entries when player score filter is narrowed', async () => {
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: 'token-1' }
+        ]);
+        axios.get.mockResolvedValueOnce(malListResponse([
+            { id: 10, title: 'Rated High', playerScore: 9 },
+            { id: 20, title: 'Unrated', playerScore: 0 },
+            { id: 30, title: 'Rated Mid', playerScore: 6 }
+        ]));
+
+        const plan = await buildRoundSeedPlan({
+            session: baseSession({
+                roundCount: 1,
+                sourceMode: 'MAL_ONLY',
+                selectionMode: 'STANDARD',
+                playerScoreMin: 9,
+                playerScoreMax: 10
+            }),
+            lobby: baseLobby([1])
+        });
+
+        expect(plan).toHaveLength(1);
+        expect(plan[0].animeId).toBe(10);
+    });
+
+    test('includes unrated MAL entries when full player score range is selected', async () => {
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: 'token-1' }
+        ]);
+        axios.get.mockResolvedValueOnce(malListResponse([
+            { id: 10, title: 'Rated', playerScore: 8 },
+            { id: 20, title: 'Unrated', playerScore: 0 }
+        ]));
+
+        const plan = await buildRoundSeedPlan({
+            session: baseSession({
+                roundCount: 2,
+                sourceMode: 'MAL_ONLY',
+                selectionMode: 'STANDARD',
+                playerScoreMin: 1,
+                playerScoreMax: 10
+            }),
+            lobby: baseLobby([1])
+        });
+
+        const ids = plan.map((item) => item.animeId).sort((a, b) => a - b);
+        expect(ids).toEqual([10, 20]);
+    });
+
+    test('applies anime score filter in POPULAR mode', async () => {
+        const plan = await buildRoundSeedPlan({
+            session: baseSession({
+                roundCount: 2,
+                sourceMode: 'POPULAR',
+                selectionMode: 'STANDARD',
+                animeScoreMin: 9,
+                animeScoreMax: 10
+            }),
+            lobby: baseLobby([1])
+        });
+
+        expect(plan).toHaveLength(2);
+        expect(plan.every((item) => item.sourcePlayerId === null)).toBe(true);
+    });
+
+    test('player score filter does not affect popular fallback in HYBRID', async () => {
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: 'token-1' }
+        ]);
+        axios.get.mockResolvedValueOnce(malListResponse([
+            { id: 10, title: 'Low User Score', playerScore: 2 },
+            { id: 20, title: 'Unrated', playerScore: 0 }
+        ]));
+
+        const plan = await buildRoundSeedPlan({
+            session: baseSession({
+                roundCount: 2,
+                sourceMode: 'HYBRID',
+                selectionMode: 'STANDARD',
+                playerScoreMin: 9,
+                playerScoreMax: 10
+            }),
+            lobby: baseLobby([1])
+        });
+
+        expect(plan).toHaveLength(2);
+        expect(plan.some((item) => item.sourcePlayerId === 1)).toBe(false);
+        expect(plan.every((item) => item.sourcePlayerId === null)).toBe(true);
+    });
+
+    test('rejects inverted player score range in session config', async () => {
+        await expect(buildRoundSeedPlan({
+            session: baseSession({
+                roundCount: 2,
+                sourceMode: 'POPULAR',
+                playerScoreMin: 10,
+                playerScoreMax: 2
+            }),
+            lobby: baseLobby([1])
+        })).rejects.toMatchObject({
+            status: 400,
+            message: 'playerScoreMin cannot be greater than playerScoreMax'
+        });
     });
 });

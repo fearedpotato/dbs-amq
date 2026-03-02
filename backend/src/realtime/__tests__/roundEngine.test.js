@@ -16,6 +16,12 @@ jest.mock('../../game/roundService', () => ({
 }));
 jest.mock('../../game/mediaProxyService', () => ({
     buildMediaProxyUrl: jest.fn((url) => url),
+    prewarmManifest: jest.fn().mockResolvedValue({
+        attempted: 0,
+        warmed: 0,
+        failed: 0,
+        skipped: 0
+    }),
     evictCacheForMediaUrls: jest.fn().mockResolvedValue({
         attempted: 0,
         removed: 0,
@@ -45,7 +51,7 @@ function createIoStub() {
     };
 }
 
-function createSession(roundCount = 1) {
+function createSession(roundCount = 1, overrides = {}) {
     return {
         id: 100,
         status: 'IN_PROGRESS',
@@ -59,7 +65,8 @@ function createSession(roundCount = 1) {
                 { userId: 1, displayName: 'P1' },
                 { userId: 2, displayName: 'P2' }
             ]
-        }
+        },
+        ...overrides
     };
 }
 
@@ -76,6 +83,11 @@ function createRound(index = 1) {
         solutionVideoUrl: `video-${index}`,
         solutionAudioUrl: `audio-${index}`
     };
+}
+
+async function flushMicrotasks() {
+    await Promise.resolve();
+    await Promise.resolve();
 }
 
 describe('round engine', () => {
@@ -145,7 +157,7 @@ describe('round engine', () => {
         })).rejects.toThrow('Player is locked; unskip before changing guess');
     });
 
-    test('all ready moves round early to answers reveal', async () => {
+    test('all ready moves round early to answers reveal after a short grace period', async () => {
         const io = createIoStub();
         const engine = createRoundEngine(io);
 
@@ -166,12 +178,50 @@ describe('round engine', () => {
 
         await engine.startSession({
             lobbyCode: 'ABC123',
-            session: createSession(1),
+            session: createSession(1, { guessSeconds: 3 }),
             lobby: { players: [{ userId: 1 }, { userId: 2 }] }
         });
 
         await engine.setReady({ lobbyCode: 'ABC123', userId: 1, ready: true });
         await engine.setReady({ lobbyCode: 'ABC123', userId: 2, ready: true });
+
+        expect(io.events.find((event) => event.event === 'round:answers_reveal')).toBeFalsy();
+        await jest.advanceTimersByTimeAsync(1000);
+
+        const answersReveal = io.events.find((event) => event.event === 'round:answers_reveal');
+        expect(answersReveal).toBeTruthy();
+        expect(answersReveal.payload.reason).toBe('all_ready');
+    });
+
+    test('all-ready delayed transition is canceled when a player unreadies', async () => {
+        const io = createIoStub();
+        const engine = createRoundEngine(io);
+
+        roundService.generateInitialRoundsForSession.mockResolvedValue();
+        roundService.getSessionById.mockResolvedValue(createSession(1));
+        roundService.ensureRoundForIndex.mockResolvedValue(createRound(1));
+        roundService.setRoundStatus.mockResolvedValue({});
+        roundService.setPlayerReady.mockResolvedValue({});
+        roundService.evaluateRound.mockResolvedValue({
+            round: createRound(1),
+            answers: [{ userId: 1, guessText: 'Anime 1', isCorrect: true }]
+        });
+
+        await engine.startSession({
+            lobbyCode: 'ABC123',
+            session: createSession(1, { guessSeconds: 4 }),
+            lobby: { players: [{ userId: 1 }, { userId: 2 }] }
+        });
+
+        await engine.setReady({ lobbyCode: 'ABC123', userId: 1, ready: true });
+        await engine.setReady({ lobbyCode: 'ABC123', userId: 2, ready: true });
+        await engine.setReady({ lobbyCode: 'ABC123', userId: 2, ready: false });
+
+        await jest.advanceTimersByTimeAsync(1100);
+        expect(io.events.find((event) => event.event === 'round:answers_reveal')).toBeFalsy();
+
+        await engine.setReady({ lobbyCode: 'ABC123', userId: 2, ready: true });
+        await jest.advanceTimersByTimeAsync(1000);
 
         const answersReveal = io.events.find((event) => event.event === 'round:answers_reveal');
         expect(answersReveal).toBeTruthy();
@@ -180,7 +230,8 @@ describe('round engine', () => {
 
     test('timer lifecycle ends game and emits game:finished', async () => {
         const io = createIoStub();
-        const engine = createRoundEngine(io);
+        const onSessionFinished = jest.fn().mockResolvedValue();
+        const engine = createRoundEngine(io, { onSessionFinished });
 
         roundService.generateInitialRoundsForSession.mockResolvedValue();
         roundService.getSessionById.mockResolvedValue(createSession(1));
@@ -209,6 +260,61 @@ describe('round engine', () => {
         const finished = io.events.find((event) => event.event === 'game:finished');
         expect(finished).toBeTruthy();
         expect(roundService.finishSession).toHaveBeenCalled();
-        expect(mediaProxyService.evictCacheForMediaUrls).toHaveBeenCalled();
+        expect(onSessionFinished).toHaveBeenCalledWith(expect.objectContaining({
+            lobbyCode: 'ABC123',
+            sessionId: 100
+        }));
+        expect(mediaProxyService.evictCacheForMediaUrls).not.toHaveBeenCalled();
+    });
+
+    test('does not prewarm sudden death when last-round lead is 2 or more', async () => {
+        const io = createIoStub();
+        const engine = createRoundEngine(io);
+
+        roundService.generateInitialRoundsForSession.mockResolvedValue();
+        roundService.getSessionById.mockResolvedValue(createSession(1));
+        roundService.ensureRoundForIndex.mockResolvedValue(createRound(1));
+        roundService.setRoundStatus.mockResolvedValue({});
+        roundService.getScoresForSession.mockResolvedValue([
+            { userId: 1, displayName: 'P1', score: 5 },
+            { userId: 2, displayName: 'P2', score: 3 }
+        ]);
+
+        await engine.startSession({
+            lobbyCode: 'ABC123',
+            session: createSession(1),
+            lobby: { players: [{ userId: 1 }, { userId: 2 }] }
+        });
+        await flushMicrotasks();
+
+        expect(mediaProxyService.prewarmManifest).not.toHaveBeenCalled();
+    });
+
+    test('prewarms sudden death when last-round lead is 1 or less', async () => {
+        const io = createIoStub();
+        const engine = createRoundEngine(io);
+
+        roundService.generateInitialRoundsForSession.mockResolvedValue();
+        roundService.getSessionById.mockResolvedValue(createSession(1));
+        roundService.ensureRoundForIndex.mockImplementation(async ({ index }) => createRound(index));
+        roundService.setRoundStatus.mockResolvedValue({});
+        roundService.getScoresForSession.mockResolvedValue([
+            { userId: 1, displayName: 'P1', score: 5 },
+            { userId: 2, displayName: 'P2', score: 4 }
+        ]);
+
+        await engine.startSession({
+            lobbyCode: 'ABC123',
+            session: createSession(1),
+            lobby: { players: [{ userId: 1 }, { userId: 2 }] }
+        });
+        await flushMicrotasks();
+
+        expect(mediaProxyService.prewarmManifest).toHaveBeenCalledWith(
+            expect.arrayContaining([
+                expect.objectContaining({ index: 2 })
+            ]),
+            expect.objectContaining({ roundLimit: 1, maxConcurrent: 2 })
+        );
     });
 });

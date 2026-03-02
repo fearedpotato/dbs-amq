@@ -2,7 +2,10 @@ jest.mock('../../lib/prisma', () => ({
     user: { findMany: jest.fn() },
     gameRound: {
         count: jest.fn(),
-        createMany: jest.fn()
+        createMany: jest.fn(),
+        findUnique: jest.fn(),
+        findMany: jest.fn(),
+        create: jest.fn()
     }
 }));
 
@@ -37,8 +40,8 @@ function malListResponse(items) {
     return {
         data: {
             data: items.map((item) => ({
-                node: { id: String(item.id), title: item.title },
-                list_status: { status: item.status || 'completed' }
+                node: { id: String(item.id), title: item.title, mean: item.mean ?? 8.5 },
+                list_status: { status: item.status || 'completed', score: item.playerScore ?? 7 }
             })),
             paging: {}
         }
@@ -69,6 +72,14 @@ describe('round generation integration (mal selection modes)', () => {
     beforeEach(() => {
         jest.clearAllMocks();
         __clearMalWatchedCache();
+        prisma.gameRound.findUnique.mockResolvedValue(null);
+        prisma.gameRound.findMany.mockResolvedValue([]);
+        prisma.gameRound.create.mockImplementation(async ({ data }) => ({
+            id: 1000,
+            ...data,
+            createdAt: new Date(),
+            updatedAt: new Date()
+        }));
         resolveRoundMedia.mockImplementation(async ({ animeId, animeTitle, roundIndex }) => ({
             animeId: Number(animeId),
             animeTitle: String(animeTitle || `Anime ${animeId}`),
@@ -298,5 +309,52 @@ describe('round generation integration (mal selection modes)', () => {
         expect(created).toHaveLength(3);
         expect(created.every((row) => row.sourcePlayerId === null)).toBe(true);
         expect(axios.get).not.toHaveBeenCalled();
+    });
+
+    test('MAL_ONLY sudden death uses fresh MAL seeds instead of replaying already used anime', async () => {
+        prisma.user.findMany.mockResolvedValue([
+            { id: 1, malAccessToken: 'token-1' }
+        ]);
+
+        axios.get.mockResolvedValueOnce(malListResponse([
+            { id: 100, title: 'MAL Seed 1' },
+            { id: 101, title: 'MAL Seed 2' },
+            { id: 102, title: 'MAL Seed 3' },
+            { id: 103, title: 'MAL Seed 4' }
+        ]));
+
+        prisma.gameRound.findMany.mockResolvedValue([
+            {
+                animeId: 100,
+                animeTitle: 'MAL Seed 1',
+                themeType: 'OP',
+                themeTitle: 'Theme 1',
+                solutionVideoUrl: '/api/game/media/proxy?u=aHR0cHM6Ly9tZWRpYS5sb2NhbC92aWRlby0xMDAubXA0&exp=1&sig=old'
+            },
+            {
+                animeId: 101,
+                animeTitle: 'MAL Seed 2',
+                themeType: 'OP',
+                themeTitle: 'Theme 2',
+                solutionVideoUrl: '/api/game/media/proxy?u=aHR0cHM6Ly9tZWRpYS5sb2NhbC92aWRlby0xMDEubXA0&exp=1&sig=old'
+            }
+        ]);
+
+        const session = baseSession({
+            roundCount: 2,
+            sourceMode: 'MAL_ONLY',
+            selectionMode: 'BALANCED_STRICT',
+            themeMode: 'OP_ONLY',
+            lobby: baseLobby([1])
+        });
+
+        const created = await roundService.ensureRoundForIndex({
+            session,
+            index: 3,
+            lobbyPlayers: baseLobby([1]).players
+        });
+
+        expect([100, 101]).not.toContain(created.animeId);
+        expect([102, 103]).toContain(created.animeId);
     });
 });

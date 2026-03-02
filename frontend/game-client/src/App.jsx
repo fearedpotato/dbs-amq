@@ -59,7 +59,11 @@ const CREATE_DEFAULTS = {
     guessSeconds: 20,
     sourceMode: 'HYBRID',
     selectionMode: 'STANDARD',
-    themeMode: 'MIXED'
+    themeMode: 'MIXED',
+    animeScoreMin: 1,
+    animeScoreMax: 10,
+    playerScoreMin: 1,
+    playerScoreMax: 10
 };
 
 function toLobbyConfig(lobby) {
@@ -72,7 +76,11 @@ function toLobbyConfig(lobby) {
         guessSeconds: Number.isInteger(lobby.guessSeconds) ? lobby.guessSeconds : CREATE_DEFAULTS.guessSeconds,
         sourceMode: SOURCE_MODES.includes(lobby.sourceMode) ? lobby.sourceMode : CREATE_DEFAULTS.sourceMode,
         selectionMode: SELECTION_MODES.includes(lobby.selectionMode) ? lobby.selectionMode : CREATE_DEFAULTS.selectionMode,
-        themeMode: THEME_MODES.includes(lobby.themeMode) ? lobby.themeMode : CREATE_DEFAULTS.themeMode
+        themeMode: THEME_MODES.includes(lobby.themeMode) ? lobby.themeMode : CREATE_DEFAULTS.themeMode,
+        animeScoreMin: Number.isInteger(lobby.animeScoreMin) ? lobby.animeScoreMin : CREATE_DEFAULTS.animeScoreMin,
+        animeScoreMax: Number.isInteger(lobby.animeScoreMax) ? lobby.animeScoreMax : CREATE_DEFAULTS.animeScoreMax,
+        playerScoreMin: Number.isInteger(lobby.playerScoreMin) ? lobby.playerScoreMin : CREATE_DEFAULTS.playerScoreMin,
+        playerScoreMax: Number.isInteger(lobby.playerScoreMax) ? lobby.playerScoreMax : CREATE_DEFAULTS.playerScoreMax
     };
 }
 
@@ -151,6 +159,80 @@ function clampInteger(value, min, max) {
     return Math.max(min, Math.min(max, parsed));
 }
 
+function nextScoreRangeConfig(config, minKey, maxKey, boundary, rawValue) {
+    const currentMin = clampInteger(config?.[minKey], 1, 10);
+    const currentMax = clampInteger(config?.[maxKey], 1, 10);
+    const nextValue = clampInteger(rawValue, 1, 10);
+
+    if (boundary === 'min') {
+        return {
+            ...config,
+            [minKey]: Math.min(nextValue, currentMax),
+            [maxKey]: currentMax
+        };
+    }
+
+    return {
+        ...config,
+        [minKey]: currentMin,
+        [maxKey]: Math.max(nextValue, currentMin)
+    };
+}
+
+function ScoreRangeSlider({
+    label,
+    minValue,
+    maxValue,
+    onMinChange,
+    onMaxChange,
+    hint = ''
+}) {
+    const clampedMin = clampInteger(minValue, 1, 10);
+    const clampedMax = clampInteger(maxValue, 1, 10);
+    const startPercent = ((clampedMin - 1) / 9) * 100;
+    const endPercent = ((clampedMax - 1) / 9) * 100;
+
+    return (
+        <div className="gmq-field-card gmq-score-range-card">
+            <div className="gmq-score-range-head">
+                <span>{label}</span>
+                <strong>{clampedMin} - {clampedMax}</strong>
+            </div>
+            <div
+                className="gmq-score-range-slider"
+                style={{
+                    '--range-start': `${startPercent}%`,
+                    '--range-end': `${endPercent}%`
+                }}
+            >
+                <input
+                    type="range"
+                    min="1"
+                    max="10"
+                    step="1"
+                    value={clampedMin}
+                    onChange={(event) => onMinChange(event.target.value)}
+                    aria-label={`${label} minimum`}
+                />
+                <input
+                    type="range"
+                    min="1"
+                    max="10"
+                    step="1"
+                    value={clampedMax}
+                    onChange={(event) => onMaxChange(event.target.value)}
+                    aria-label={`${label} maximum`}
+                />
+            </div>
+            <div className="gmq-score-range-foot">
+                <span>1</span>
+                <span>10</span>
+            </div>
+            {hint ? <p className="gmq-field-help gmq-muted">{hint}</p> : null}
+        </div>
+    );
+}
+
 function normalizeMaxPlayersInput(rawValue) {
     const digits = String(rawValue || '').replace(/\D+/g, '');
     if (!digits) return '';
@@ -158,7 +240,9 @@ function normalizeMaxPlayersInput(rawValue) {
 }
 
 function byScoreDesc(a, b) {
-    return (b.score || 0) - (a.score || 0);
+    const scoreDiff = (Number(b?.score) || 0) - (Number(a?.score) || 0);
+    if (scoreDiff !== 0) return scoreDiff;
+    return String(a?.displayName || '').localeCompare(String(b?.displayName || ''));
 }
 
 function normalizePreloadManifest(rawManifest) {
@@ -310,6 +394,12 @@ export default function App() {
     const preloadSessionIdRef = useRef(null);
     const preloadReadySentRef = useRef(false);
     const searchRequestSeqRef = useRef(0);
+    const autoSubmitTimerRef = useRef(null);
+    const deadlineSubmitTimerRef = useRef(null);
+    const lastSubmittedGuessRef = useRef({ roundId: null, key: '' });
+    const postGameDisplayTimerRef = useRef(null);
+    const guessTextRef = useRef('');
+    const guessAnimeIdRef = useRef(null);
 
     const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState('');
@@ -342,6 +432,8 @@ export default function App() {
     const [answers, setAnswers] = useState([]);
     const [solution, setSolution] = useState(null);
     const [finalResult, setFinalResult] = useState(null);
+    const [showPostGameResults, setShowPostGameResults] = useState(false);
+    const [scoreboard, setScoreboard] = useState([]);
     const [readyUserIds, setReadyUserIds] = useState([]);
     const [lobbyReadyUserIds, setLobbyReadyUserIds] = useState([]);
     const [lobbyReadyRequiredUserIds, setLobbyReadyRequiredUserIds] = useState([]);
@@ -365,6 +457,7 @@ export default function App() {
     const [suddenDeathState, setSuddenDeathState] = useState(null);
     const [mediaSourceStatus, setMediaSourceStatus] = useState(null);
     const [mediaSourceError, setMediaSourceError] = useState('');
+    const [gameStartPending, setGameStartPending] = useState(false);
 
     const handleCreateMaxPlayersChange = useCallback((rawValue) => {
         const nextInput = normalizeMaxPlayersInput(rawValue);
@@ -384,6 +477,38 @@ export default function App() {
             ...previous,
             maxPlayers: clampInteger(nextInput, 1, 8)
         }));
+    }, []);
+
+    const handleCreateAnimeScoreMinChange = useCallback((rawValue) => {
+        setCreateConfig((previous) => nextScoreRangeConfig(previous, 'animeScoreMin', 'animeScoreMax', 'min', rawValue));
+    }, []);
+
+    const handleCreateAnimeScoreMaxChange = useCallback((rawValue) => {
+        setCreateConfig((previous) => nextScoreRangeConfig(previous, 'animeScoreMin', 'animeScoreMax', 'max', rawValue));
+    }, []);
+
+    const handleCreatePlayerScoreMinChange = useCallback((rawValue) => {
+        setCreateConfig((previous) => nextScoreRangeConfig(previous, 'playerScoreMin', 'playerScoreMax', 'min', rawValue));
+    }, []);
+
+    const handleCreatePlayerScoreMaxChange = useCallback((rawValue) => {
+        setCreateConfig((previous) => nextScoreRangeConfig(previous, 'playerScoreMin', 'playerScoreMax', 'max', rawValue));
+    }, []);
+
+    const handleEditAnimeScoreMinChange = useCallback((rawValue) => {
+        setEditConfig((previous) => nextScoreRangeConfig(previous, 'animeScoreMin', 'animeScoreMax', 'min', rawValue));
+    }, []);
+
+    const handleEditAnimeScoreMaxChange = useCallback((rawValue) => {
+        setEditConfig((previous) => nextScoreRangeConfig(previous, 'animeScoreMin', 'animeScoreMax', 'max', rawValue));
+    }, []);
+
+    const handleEditPlayerScoreMinChange = useCallback((rawValue) => {
+        setEditConfig((previous) => nextScoreRangeConfig(previous, 'playerScoreMin', 'playerScoreMax', 'min', rawValue));
+    }, []);
+
+    const handleEditPlayerScoreMaxChange = useCallback((rawValue) => {
+        setEditConfig((previous) => nextScoreRangeConfig(previous, 'playerScoreMin', 'playerScoreMax', 'max', rawValue));
     }, []);
 
     const commitCreateMaxPlayersInput = useCallback(() => {
@@ -406,6 +531,12 @@ export default function App() {
         return committed;
     }, [editConfig.maxPlayers, editMaxPlayersInput]);
 
+    const clearPostGameDisplayTimer = useCallback(() => {
+        if (!postGameDisplayTimerRef.current) return;
+        window.clearTimeout(postGameDisplayTimerRef.current);
+        postGameDisplayTimerRef.current = null;
+    }, []);
+
     useEffect(() => {
         lobbyRef.current = lobby;
     }, [lobby]);
@@ -417,6 +548,14 @@ export default function App() {
     useEffect(() => {
         sampleVolumeRef.current = sampleVolume;
     }, [sampleVolume]);
+
+    useEffect(() => {
+        guessTextRef.current = guessText;
+    }, [guessText]);
+
+    useEffect(() => {
+        guessAnimeIdRef.current = Number.isInteger(guessAnimeId) ? guessAnimeId : null;
+    }, [guessAnimeId]);
 
     useEffect(() => {
         if (!hostModalOpen && !settingsModalOpen && !promoteConfirmTarget && !kickConfirmTarget) return undefined;
@@ -457,6 +596,12 @@ export default function App() {
     }, [promoteConfirmTarget, lobby]);
 
     useEffect(() => {
+        if (!gameStartPending) return;
+        setPromoteConfirmTarget(null);
+        setKickConfirmTarget(null);
+    }, [gameStartPending]);
+
+    useEffect(() => {
         if (!lobby || lobby.status !== 'WAITING') {
             setSettingsModalOpen(false);
             return;
@@ -478,6 +623,28 @@ export default function App() {
         const timer = window.setTimeout(() => setInfo(''), 4500);
         return () => window.clearTimeout(timer);
     }, [info]);
+
+    useEffect(() => () => {
+        clearPostGameDisplayTimer();
+    }, [clearPostGameDisplayTimer]);
+
+    useEffect(() => {
+        clearPostGameDisplayTimer();
+        if (phase !== 'FINISHED' || !finalResult) {
+            setShowPostGameResults(false);
+            return undefined;
+        }
+
+        setShowPostGameResults(true);
+        postGameDisplayTimerRef.current = window.setTimeout(() => {
+            postGameDisplayTimerRef.current = null;
+            setShowPostGameResults(false);
+        }, 7000);
+
+        return () => {
+            clearPostGameDisplayTimer();
+        };
+    }, [clearPostGameDisplayTimer, finalResult, phase]);
 
     useEffect(() => {
         if (!searchMenuOpen || phase !== 'GUESSING') return undefined;
@@ -518,8 +685,10 @@ export default function App() {
 
     const stopSamplePlayback = useCallback(() => {
         clearSampleStopTimer();
-        if (sampleAudioRef.current) sampleAudioRef.current.pause();
-        if (sampleVideoRef.current) sampleVideoRef.current.pause();
+        const activeMedia = sampleActiveMediaRef.current;
+        if (activeMedia?.pause) activeMedia.pause();
+        if (sampleAudioRef.current && sampleAudioRef.current !== activeMedia) sampleAudioRef.current.pause();
+        if (sampleVideoRef.current && sampleVideoRef.current !== activeMedia) sampleVideoRef.current.pause();
         sampleActiveMediaRef.current = null;
         setSamplePlaying(false);
     }, [clearSampleStopTimer]);
@@ -1018,7 +1187,7 @@ export default function App() {
                 return false;
             }
             if (reason !== 'aborted') {
-                setSolutionMediaError('Could not play solution video in this browser. Use "Open video source".');
+                setSolutionMediaError('Could not play solution video in this browser.');
             }
             setSolutionVideoAutoplayBlocked(false);
             return false;
@@ -1026,9 +1195,15 @@ export default function App() {
     }, []);
 
     const playSample = useCallback(async ({ isAutoplay = false } = {}) => {
-        const audio = sampleAudioRef.current;
-        const video = sampleVideoRef.current;
         const sample = round?.sample;
+        const preloadedAudio = sample?.audioUrl
+            ? preloadElementsByUrlRef.current.get(sample.audioUrl)
+            : null;
+        const preloadedVideo = sample?.videoUrl
+            ? preloadElementsByUrlRef.current.get(sample.videoUrl)
+            : null;
+        const audio = preloadedAudio || sampleAudioRef.current;
+        const video = preloadedVideo || sampleVideoRef.current;
         if (phase !== 'GUESSING' || (!audio && !video) || (!sample?.audioUrl && !sample?.videoUrl)) return false;
 
         clearSampleStopTimer();
@@ -1100,6 +1275,16 @@ export default function App() {
     }, [clearSampleStopTimer, phase, resolveSampleStartSec, round, stopSamplePlayback]);
 
     const clearRoundState = useCallback(() => {
+        clearPostGameDisplayTimer();
+        if (autoSubmitTimerRef.current) {
+            window.clearTimeout(autoSubmitTimerRef.current);
+            autoSubmitTimerRef.current = null;
+        }
+        if (deadlineSubmitTimerRef.current) {
+            window.clearTimeout(deadlineSubmitTimerRef.current);
+            deadlineSubmitTimerRef.current = null;
+        }
+        lastSubmittedGuessRef.current = { roundId: null, key: '' };
         resetPreloadManager();
         stopSamplePlayback();
         stopSolutionVideoPlayback();
@@ -1110,11 +1295,15 @@ export default function App() {
         setAnswers([]);
         setSolution(null);
         setFinalResult(null);
+        setShowPostGameResults(false);
+        setScoreboard([]);
         setReadyUserIds([]);
         setLobbyReadyUserIds([]);
         setLobbyReadyRequiredUserIds([]);
         setGuessText('');
         setGuessAnimeId(null);
+        guessTextRef.current = '';
+        guessAnimeIdRef.current = null;
         setSearchResults([]);
         setSearchError('');
         setMediaError('');
@@ -1123,15 +1312,22 @@ export default function App() {
         setSamplePlaybackSource(null);
         setSolutionVideoAutoplayBlocked(false);
         setSuddenDeathState(null);
-    }, [resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback]);
+        setGameStartPending(false);
+    }, [clearPostGameDisplayTimer, resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback]);
 
     const applySyncState = useCallback((syncState) => {
         const state = syncState || {};
         const nextPhase = state.phase || 'WAITING';
+        const syncedScores = Array.isArray(state?.solution?.scores) ? state.solution.scores : null;
         setPhase(nextPhase);
         setRound(state.round || null);
         setReadyUserIds(Array.isArray(state.readyUserIds) ? state.readyUserIds : []);
         setPhaseEndsAt(state.endsAt || state.solution?.endsAt || null);
+        if (nextPhase === 'WAITING') {
+            setScoreboard([]);
+        } else if (Array.isArray(syncedScores)) {
+            setScoreboard(syncedScores.slice().sort(byScoreDesc));
+        }
         if (!state?.round?.isSuddenDeath) {
             setSuddenDeathState(null);
         } else {
@@ -1327,34 +1523,50 @@ export default function App() {
     const startGame = useCallback(async () => {
         if (!lobby?.code || !socketRef.current) return;
         setBusy('start');
+        setGameStartPending(true);
         setError('');
         try {
             await emitWithAck(socketRef.current, 'game:start', { lobbyCode: lobby.code }, { timeoutMs: 120_000 });
         } catch (err) {
+            setGameStartPending(false);
             setError(toStartErrorMessage(err.message));
         } finally {
             setBusy('');
         }
     }, [lobby]);
 
-    const submitGuess = useCallback(async () => {
+    const submitGuess = useCallback(async ({ force = false, guessTextOverride, guessAnimeIdOverride } = {}) => {
         if (!lobby?.code || !round?.roundId || !socketRef.current) return;
-        setBusy('guess');
-        setError('');
+        if (user && readyUserIds.includes(user.id)) return;
+        const rawGuessText = typeof guessTextOverride === 'string' ? guessTextOverride : guessTextRef.current;
+        const rawGuessAnimeId = guessAnimeIdOverride !== undefined ? guessAnimeIdOverride : guessAnimeIdRef.current;
+        const normalizedGuessText = String(rawGuessText || '').trim();
+        const normalizedGuessAnimeId = Number.isInteger(rawGuessAnimeId) ? rawGuessAnimeId : null;
+        const submissionKey = `${normalizedGuessText.toLowerCase()}|${normalizedGuessAnimeId ?? ''}`;
+        const previousSubmission = lastSubmittedGuessRef.current;
+        if (
+            !force
+            && previousSubmission.roundId === round.roundId
+            && previousSubmission.key === submissionKey
+        ) {
+            return;
+        }
+
         try {
             await emitWithAck(socketRef.current, 'round:submit_guess', {
                 lobbyCode: lobby.code,
                 roundId: round.roundId,
-                guessText: guessText.trim(),
-                guessAnimeId: Number.isInteger(guessAnimeId) ? guessAnimeId : null
+                guessText: normalizedGuessText,
+                guessAnimeId: normalizedGuessAnimeId
             });
-            setInfo('Guess saved');
+            lastSubmittedGuessRef.current = {
+                roundId: round.roundId,
+                key: submissionKey
+            };
         } catch (err) {
-            setError(err.message);
-        } finally {
-            setBusy('');
+            // Auto-submit is best-effort; deadline force submit still runs separately.
         }
-    }, [guessAnimeId, guessText, lobby, round]);
+    }, [lobby, readyUserIds, round, user]);
 
     const toggleReady = useCallback(async () => {
         if (!lobby?.code || !socketRef.current || !user) return;
@@ -1362,13 +1574,16 @@ export default function App() {
         setError('');
         try {
             const mine = readyUserIds.includes(user.id);
+            if (!mine) {
+                await submitGuess({ force: true });
+            }
             await emitWithAck(socketRef.current, 'round:set_ready', { lobbyCode: lobby.code, ready: !mine });
         } catch (err) {
             setError(err.message);
         } finally {
             setBusy('');
         }
-    }, [lobby, readyUserIds, user]);
+    }, [lobby, readyUserIds, submitGuess, user]);
 
     const toggleLobbyReady = useCallback(async () => {
         if (!lobby?.code || !socketRef.current || !user) return;
@@ -1516,6 +1731,7 @@ export default function App() {
             const code = String(payload?.code || '');
             const message = normalizeErrorMessage(payload?.message);
             if (code === 'game_start_failed') {
+                setGameStartPending(false);
                 setError(toStartErrorMessage(message));
                 return;
             }
@@ -1527,13 +1743,33 @@ export default function App() {
             if (nextLobby.status !== 'WAITING') {
                 setLobbyReadyUserIds([]);
                 setLobbyReadyRequiredUserIds([]);
+                setGameStartPending(false);
             }
         };
-        const onGameStarted = ({ sessionId, config, preloadManifest }) => {
+        const onGameStarting = (payload) => {
+            const eventCode = toCode(payload?.lobbyCode);
+            const currentCode = toCode(lobbyRef.current?.code);
+            if (eventCode && currentCode && eventCode !== currentCode) return;
+            setGameStartPending(true);
+        };
+        const onGameStarted = ({ sessionId, config, preloadManifest, lobby: startedLobby }) => {
+            setGameStartPending(false);
+            if (startedLobby) {
+                setLobby(startedLobby);
+            }
             setSessionInfo({ sessionId, ...(config || {}) });
             setFinalResult(null);
             setPhase('PENDING');
             setSuddenDeathState(null);
+            setScoreboard(
+                (lobbyRef.current?.players || [])
+                    .map((player) => ({
+                        userId: player.userId,
+                        displayName: player.displayName,
+                        score: 0
+                    }))
+                    .sort(byScoreDesc)
+            );
             setLobbyReadyUserIds([]);
             setLobbyReadyRequiredUserIds([]);
             if (lobbyRef.current?.code) {
@@ -1543,6 +1779,13 @@ export default function App() {
                     manifest: preloadManifest
                 }).catch(() => {});
             }
+        };
+        const onGameStartCancelled = (payload) => {
+            const eventCode = toCode(payload?.lobbyCode);
+            const currentCode = toCode(lobbyRef.current?.code);
+            if (eventCode && currentCode && eventCode !== currentCode) return;
+            clearRoundState();
+            setLobby((prev) => (prev ? { ...prev, status: 'WAITING' } : prev));
         };
         const onRoundStarted = (payload) => {
             stopSamplePlayback();
@@ -1559,6 +1802,8 @@ export default function App() {
             setReadyUserIds([]);
             setGuessText('');
             setGuessAnimeId(null);
+            guessTextRef.current = '';
+            guessAnimeIdRef.current = null;
             setSearchResults([]);
             setSearchError('');
             setMediaError('');
@@ -1566,6 +1811,10 @@ export default function App() {
             setSampleAutoplayBlocked(false);
             setSamplePlaybackSource(null);
             setSolutionVideoAutoplayBlocked(false);
+            lastSubmittedGuessRef.current = {
+                roundId: Number.isInteger(payload?.roundId) ? payload.roundId : null,
+                key: ''
+            };
             sampleResolvedStartSecRef.current = null;
             if (payload?.isSuddenDeath) {
                 setSuddenDeathState((prev) => ({
@@ -1587,19 +1836,29 @@ export default function App() {
             setPhase('SOLUTION_REVEAL');
             setPhaseEndsAt(payload?.endsAt || null);
             setSolution(payload || null);
+            if (Array.isArray(payload?.scores)) {
+                setScoreboard(payload.scores.slice().sort(byScoreDesc));
+            }
             setMediaError('');
             setSolutionMediaError('');
             setSolutionVideoAutoplayBlocked(false);
         };
         const onFinished = (payload) => {
+            clearPostGameDisplayTimer();
             resetPreloadManager();
             stopSamplePlayback();
             stopSolutionVideoPlayback();
             setPhase('FINISHED');
+            setGameStartPending(false);
             setPhaseEndsAt(null);
             setMediaError('');
             setSolutionMediaError('');
             setFinalResult(payload || null);
+            setShowPostGameResults(true);
+            setLobby((prev) => (prev ? { ...prev, status: 'WAITING' } : prev));
+            if (Array.isArray(payload?.finalScores)) {
+                setScoreboard(payload.finalScores.slice().sort(byScoreDesc));
+            }
             setSuddenDeathState(null);
             setLobbyReadyUserIds([]);
             setLobbyReadyRequiredUserIds([]);
@@ -1693,7 +1952,9 @@ export default function App() {
         socket.on('error', onSocketError);
         socket.on('lobby:state', onLobbyState);
         socket.on('lobby:directory_changed', onLobbyDirectoryChanged);
+        socket.on('game:starting', onGameStarting);
         socket.on('game:started', onGameStarted);
+        socket.on('game:start_cancelled', onGameStartCancelled);
         socket.on('round:started', onRoundStarted);
         socket.on('round:answers_reveal', onAnswersReveal);
         socket.on('round:solution', onSolution);
@@ -1712,7 +1973,9 @@ export default function App() {
             socket.off('error', onSocketError);
             socket.off('lobby:state', onLobbyState);
             socket.off('lobby:directory_changed', onLobbyDirectoryChanged);
+            socket.off('game:starting', onGameStarting);
             socket.off('game:started', onGameStarted);
+            socket.off('game:start_cancelled', onGameStartCancelled);
             socket.off('round:started', onRoundStarted);
             socket.off('round:answers_reveal', onAnswersReveal);
             socket.off('round:solution', onSolution);
@@ -1729,7 +1992,7 @@ export default function App() {
             }
             closeGameSocket();
         };
-    }, [beginSessionPreload, clearRoundState, fetchLobbies, preloadRollingWindow, requestRoundSync, resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback, token]);
+    }, [beginSessionPreload, clearPostGameDisplayTimer, clearRoundState, fetchLobbies, preloadRollingWindow, requestRoundSync, resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback, token]);
 
     useEffect(() => {
         if (!token) return;
@@ -1807,6 +2070,63 @@ export default function App() {
         }, 120);
         return () => window.clearTimeout(timer);
     }, [guessText, phase]);
+
+    useEffect(() => {
+        const mineReady = Boolean(user && readyUserIds.includes(user.id));
+        if (phase !== 'GUESSING' || !lobby?.code || !round?.roundId || !socketConnected || mineReady) {
+            if (autoSubmitTimerRef.current) {
+                window.clearTimeout(autoSubmitTimerRef.current);
+                autoSubmitTimerRef.current = null;
+            }
+            return;
+        }
+
+        if (autoSubmitTimerRef.current) {
+            window.clearTimeout(autoSubmitTimerRef.current);
+            autoSubmitTimerRef.current = null;
+        }
+        autoSubmitTimerRef.current = window.setTimeout(() => {
+            submitGuess().catch(() => {});
+        }, 420);
+
+        return () => {
+            if (!autoSubmitTimerRef.current) return;
+            window.clearTimeout(autoSubmitTimerRef.current);
+            autoSubmitTimerRef.current = null;
+        };
+    }, [guessAnimeId, guessText, lobby?.code, phase, readyUserIds, round?.roundId, socketConnected, submitGuess, user]);
+
+    useEffect(() => {
+        const mineReady = Boolean(user && readyUserIds.includes(user.id));
+        if (phase !== 'GUESSING' || !phaseEndsAt || !lobby?.code || !round?.roundId || !socketConnected || mineReady) {
+            if (deadlineSubmitTimerRef.current) {
+                window.clearTimeout(deadlineSubmitTimerRef.current);
+                deadlineSubmitTimerRef.current = null;
+            }
+            return;
+        }
+        const submitAtMs = new Date(phaseEndsAt).getTime() - Date.now() - 120;
+        if (!Number.isFinite(submitAtMs)) return;
+        if (submitAtMs <= 0) {
+            submitGuess({ force: true }).catch(() => {});
+            return;
+        }
+
+        if (deadlineSubmitTimerRef.current) {
+            window.clearTimeout(deadlineSubmitTimerRef.current);
+            deadlineSubmitTimerRef.current = null;
+        }
+        deadlineSubmitTimerRef.current = window.setTimeout(() => {
+            submitGuess({ force: true }).catch(() => {});
+            deadlineSubmitTimerRef.current = null;
+        }, submitAtMs);
+
+        return () => {
+            if (!deadlineSubmitTimerRef.current) return;
+            window.clearTimeout(deadlineSubmitTimerRef.current);
+            deadlineSubmitTimerRef.current = null;
+        };
+    }, [lobby?.code, phase, phaseEndsAt, readyUserIds, round?.roundId, socketConnected, submitGuess, user]);
 
     useEffect(() => {
         const hasSampleMedia = Boolean(round?.sample?.audioUrl || round?.sample?.videoUrl);
@@ -1895,9 +2215,18 @@ export default function App() {
 
     useEffect(() => {
         const resolvedVolume = Math.max(0, Math.min(1, Number(sampleVolume)));
-        if (sampleAudioRef.current) sampleAudioRef.current.volume = resolvedVolume;
-        if (sampleVideoRef.current) sampleVideoRef.current.volume = resolvedVolume;
-        if (solutionVideoRef.current) solutionVideoRef.current.volume = resolvedVolume;
+        const applyVolume = (mediaEl) => {
+            if (!mediaEl) return;
+            mediaEl.volume = resolvedVolume;
+        };
+
+        applyVolume(sampleAudioRef.current);
+        applyVolume(sampleVideoRef.current);
+        applyVolume(solutionVideoRef.current);
+        applyVolume(sampleActiveMediaRef.current);
+        for (const mediaEl of preloadElementsByUrlRef.current.values()) {
+            applyVolume(mediaEl);
+        }
     }, [sampleVolume, round?.roundId, solution?.video]);
 
     const isHost = useMemo(() => Boolean(lobby && user && lobby.host?.id === user.id), [lobby, user]);
@@ -1920,7 +2249,18 @@ export default function App() {
             && waitingLobbyReadyUserIds.length === waitingLobbyRequiredUserIds.length;
     }, [lobby, waitingLobbyReadyUserIds.length, waitingLobbyRequiredUserIds.length]);
     const hasSampleMedia = useMemo(() => Boolean(round?.sample?.audioUrl || round?.sample?.videoUrl), [round]);
-    const showSamplePlayer = useMemo(() => Boolean(round && hasSampleMedia && (phase === 'GUESSING' || phase === 'ANSWERS_REVEAL')), [hasSampleMedia, phase, round]);
+    const isGuessingPhase = useMemo(() => phase === 'GUESSING', [phase]);
+    const isAnswersRevealPhase = useMemo(() => phase === 'ANSWERS_REVEAL', [phase]);
+    const isSolutionRevealPhase = useMemo(() => phase === 'SOLUTION_REVEAL', [phase]);
+    const showRevealContent = useMemo(() => Boolean(isSolutionRevealPhase && solution), [isSolutionRevealPhase, solution]);
+    const showAnswerBubbles = useMemo(
+        () => isAnswersRevealPhase || isSolutionRevealPhase,
+        [isAnswersRevealPhase, isSolutionRevealPhase]
+    );
+    const showAnswerCorrectness = useMemo(
+        () => Boolean(showRevealContent),
+        [showRevealContent]
+    );
     const sampleDurationLabel = useMemo(() => {
         const seconds = Number.parseInt(round?.sample?.sampleDurationSec, 10);
         if (!Number.isFinite(seconds) || seconds <= 0) return 'Sample ready';
@@ -1968,27 +2308,68 @@ export default function App() {
         }
         return details;
     }, [mediaSourceCheckedLabel, mediaSourceError, mediaSourceHealth.label, mediaSourceLatencyLabel, mediaSourceStatus]);
-    const showRoundCard = useMemo(() => Boolean(lobby) && phase !== 'WAITING' && phase !== 'FINISHED', [lobby, phase]);
-    const showLobbyCard = useMemo(() => Boolean(lobby) && (phase === 'WAITING' || phase === 'FINISHED'), [lobby, phase]);
+    const postGameRows = useMemo(() => {
+        const rawRows = Array.isArray(finalResult?.finalScores) && finalResult.finalScores.length > 0
+            ? finalResult.finalScores
+            : scoreboard;
+        return rawRows.slice().sort(byScoreDesc);
+    }, [finalResult?.finalScores, scoreboard]);
+    const postGameWinnerName = useMemo(() => {
+        const winnerUserId = Number.parseInt(finalResult?.winner?.userId, 10);
+        if (Number.isInteger(winnerUserId)) {
+            return resolvePlayerName(winnerUserId);
+        }
+        return postGameRows[0]?.displayName || '';
+    }, [finalResult?.winner?.userId, postGameRows, resolvePlayerName]);
+    const showPostGameCard = useMemo(
+        () => Boolean(lobby) && phase === 'FINISHED' && showPostGameResults,
+        [lobby, phase, showPostGameResults]
+    );
+    const showRoundCard = useMemo(
+        () => Boolean(lobby) && phase !== 'WAITING' && phase !== 'FINISHED',
+        [lobby, phase]
+    );
+    const showLobbyCard = useMemo(
+        () => Boolean(lobby) && (phase === 'WAITING' || (phase === 'FINISHED' && !showPostGameResults)),
+        [lobby, phase, showPostGameResults]
+    );
+    const answerByUserId = useMemo(() => {
+        const map = new Map();
+        for (const answer of answers || []) {
+            if (!Number.isInteger(answer?.userId)) continue;
+            map.set(answer.userId, answer);
+        }
+        return map;
+    }, [answers]);
+    const standingsRows = useMemo(() => {
+        const raw = Array.isArray(scoreboard) && scoreboard.length > 0
+            ? scoreboard
+            : (lobby?.players || []).map((player) => ({
+                userId: player.userId,
+                displayName: player.displayName,
+                score: 0
+            }));
+        return raw.slice().sort(byScoreDesc);
+    }, [lobby, scoreboard]);
+    const standingsPanelHeight = useMemo(() => {
+        const rowCount = Math.max(1, standingsRows.length);
+        return Math.max(118, Math.min(300, 92 + (rowCount * 24)));
+    }, [standingsRows.length]);
+    const playerSquares = useMemo(() => (
+        (lobby?.players || [])
+            .filter((player) => Number.isInteger(player?.userId))
+            .map((player) => ({
+                userId: player.userId,
+                displayName: String(player?.displayName || `Player ${player.userId}`)
+            }))
+    ), [lobby]);
 
     const onSampleVolumeChange = useCallback((event) => {
         const next = Math.max(0, Math.min(1, Number.parseFloat(event.target.value)));
-        setSampleVolume(Number.isFinite(next) ? next : 0.8);
+        const resolved = Number.isFinite(next) ? next : 0.8;
+        sampleVolumeRef.current = resolved;
+        setSampleVolume(resolved);
     }, []);
-    const displayedScores = useMemo(() => {
-        if (phase === 'FINISHED') return (finalResult?.finalScores || []).slice().sort(byScoreDesc);
-        if (phase === 'SOLUTION_REVEAL') return (solution?.scores || []).slice().sort(byScoreDesc);
-        return [];
-    }, [finalResult, phase, solution]);
-    const suddenDeathMessage = useMemo(() => {
-        if (!round?.isSuddenDeath || phase === 'FINISHED') return '';
-        const tiedUserIds = Array.isArray(suddenDeathState?.tiedUserIds) ? suddenDeathState.tiedUserIds : [];
-        const tiedNames = tiedUserIds.map((userId) => resolvePlayerName(userId)).filter(Boolean);
-        if (tiedNames.length > 0) {
-            return `Sudden Death: tie for first between ${tiedNames.join(', ')}.`;
-        }
-        return 'Sudden Death: tie for first place. Extra rounds continue until the tie is broken.';
-    }, [phase, resolvePlayerName, round?.isSuddenDeath, suddenDeathState?.tiedUserIds]);
     const filteredLobbies = useMemo(() => {
         const q = String(lobbyQuery || '').trim().toLowerCase();
         if (!q) return lobbies;
@@ -2006,7 +2387,9 @@ export default function App() {
             `${lobby.guessSeconds}s guess`,
             SOURCE_MODE_COPY[lobby.sourceMode]?.label || lobby.sourceMode,
             SELECTION_MODE_COPY[lobby.selectionMode]?.label || lobby.selectionMode,
-            THEME_MODE_COPY[lobby.themeMode]?.label || lobby.themeMode
+            THEME_MODE_COPY[lobby.themeMode]?.label || lobby.themeMode,
+            `Anime score ${lobby.animeScoreMin ?? 1}-${lobby.animeScoreMax ?? 10}`,
+            `Player score ${lobby.playerScoreMin ?? 1}-${lobby.playerScoreMax ?? 10}`
         ];
     }, [lobby]);
 
@@ -2016,7 +2399,7 @@ export default function App() {
         <section className="gmq-shell">
             <header className="gmq-header">
                 <div>
-                    <h1>Anime Music Quiz</h1>
+                    {!showRoundCard ? <h1>Anime Music Quiz</h1> : null}
                     <p className="gmq-muted">
                         Socket: {socketConnected ? 'Connected' : 'Disconnected'}
                         {lobby ? ` | Lobby ${lobby.code}` : ''}
@@ -2214,6 +2597,23 @@ export default function App() {
                                 </select>
                             </div>
                         </div>
+                        <div className="gmq-field-grid gmq-field-grid-2">
+                            <ScoreRangeSlider
+                                label="Anime MAL Score"
+                                minValue={editConfig.animeScoreMin}
+                                maxValue={editConfig.animeScoreMax}
+                                onMinChange={handleEditAnimeScoreMinChange}
+                                onMaxChange={handleEditAnimeScoreMaxChange}
+                            />
+                            <ScoreRangeSlider
+                                label="Player MAL Score"
+                                minValue={editConfig.playerScoreMin}
+                                maxValue={editConfig.playerScoreMax}
+                                onMinChange={handleEditPlayerScoreMinChange}
+                                onMaxChange={handleEditPlayerScoreMaxChange}
+                                hint="Used for MAL-list entries (MAL_ONLY, and MAL portion of HYBRID)."
+                            />
+                        </div>
                         <button
                             type="button"
                             className="gmq-btn gmq-btn-primary"
@@ -2350,6 +2750,23 @@ export default function App() {
                                         </select>
                                     </div>
                                 </div>
+                                <div className="gmq-field-grid gmq-field-grid-2">
+                                    <ScoreRangeSlider
+                                        label="Anime MAL Score"
+                                        minValue={createConfig.animeScoreMin}
+                                        maxValue={createConfig.animeScoreMax}
+                                        onMinChange={handleCreateAnimeScoreMinChange}
+                                        onMaxChange={handleCreateAnimeScoreMaxChange}
+                                    />
+                                    <ScoreRangeSlider
+                                        label="Player MAL Score"
+                                        minValue={createConfig.playerScoreMin}
+                                        maxValue={createConfig.playerScoreMax}
+                                        onMinChange={handleCreatePlayerScoreMinChange}
+                                        onMaxChange={handleCreatePlayerScoreMaxChange}
+                                        hint="Used for MAL-list entries (MAL_ONLY, and MAL portion of HYBRID)."
+                                    />
+                                </div>
                                 <button type="button" className="gmq-btn gmq-btn-primary" onClick={createLobby} disabled={busy === 'create'}>
                                     {busy === 'create' ? 'Hosting...' : 'Host Lobby'}
                                 </button>
@@ -2382,7 +2799,7 @@ export default function App() {
                                     <span>{player.displayName}{player.userId === lobby.host?.id ? ' (Host)' : ''}{!player.isConnected ? ' (offline)' : ''}</span>
                                     {lobby.status === 'WAITING' ? (
                                         <span className="gmq-player-row-actions">
-                                            {isHost && user && player.userId !== user.id ? (
+                                            {isHost && user && player.userId !== user.id && !gameStartPending ? (
                                                 <>
                                                     <button
                                                         type="button"
@@ -2424,7 +2841,9 @@ export default function App() {
                                         Ready {waitingLobbyReadyUserIds.length}/{waitingLobbyRequiredUserIds.length}
                                     </p>
                                 </div>
-                                {isHost
+                                {gameStartPending
+                                    ? <p className="gmq-muted">Starting game...</p>
+                                    : isHost
                                     ? (
                                         <>
                                             <button
@@ -2454,203 +2873,270 @@ export default function App() {
                     </article>
                     ) : null}
 
+                    {showPostGameCard ? (
+                        <article className="gmq-card gmq-card-round gmq-postgame-shell">
+                            <div className="gmq-postgame-header">
+                                <h2>Match Results</h2>
+                                {postGameWinnerName ? (
+                                    <p className="gmq-postgame-winner">Winner: {postGameWinnerName}</p>
+                                ) : null}
+                            </div>
+                            <ol className="gmq-postgame-list">
+                                {postGameRows.map((row, index) => (
+                                    <li key={`${row.userId || 'row'}-${index}`} className={`gmq-postgame-row${index === 0 ? ' gmq-postgame-row-winner' : ''}`}>
+                                        <span>{index + 1}. {row.displayName}</span>
+                                        <strong>{row.score || 0}</strong>
+                                    </li>
+                                ))}
+                            </ol>
+                        </article>
+                    ) : null}
+
                     {showRoundCard ? (
-                        <article className="gmq-card gmq-card-round">
-                        <h2>Round</h2>
-                        <p className="gmq-round-phase">{phase} | {countdown}</p>
-                        {suddenDeathMessage ? <div className="gmq-alert gmq-alert-warning">{suddenDeathMessage}</div> : null}
-                        {phase === 'PENDING' && preloadBlocking ? (
-                            <div className="gmq-stack">
-                                <p>Preparing media cache before round 1...</p>
-                                <p className="gmq-muted">
-                                    Ready {preloadProgress.ready}/{preloadProgress.total}
-                                    {preloadProgress.failed > 0 ? ` | Failed ${preloadProgress.failed}` : ''}
-                                </p>
-                                {preloadGateError ? <p className="gmq-muted gmq-muted-warning">{preloadGateError}</p> : null}
-                                {preloadGateError ? (
-                                    <button
-                                        type="button"
-                                        className="gmq-btn gmq-btn-secondary"
-                                        onClick={() => retryInitialPreloadGate().catch(() => {})}
-                                        disabled={preloadRetrying}
+                        <article className="gmq-card gmq-card-round gmq-match-shell">
+                            <div className="gmq-match-round-pill">
+                                <h2>{round?.isSuddenDeath ? 'Sudden Death' : `Round ${round?.index || '-'}/${round?.totalRounds || '-'}`}</h2>
+                                <p className="gmq-round-phase">{countdown}</p>
+                            </div>
+
+                            <div className="gmq-match-stage">
+                                <div className="gmq-match-grid gmq-match-main-row">
+                                    <section
+                                        className="gmq-match-panel gmq-standings-panel"
+                                        style={{ minHeight: `${standingsPanelHeight}px`, maxHeight: `${standingsPanelHeight}px` }}
                                     >
-                                        {preloadRetrying ? 'Retrying...' : 'Retry preload'}
-                                    </button>
-                                ) : null}
-                            </div>
-                        ) : null}
+                                    <h3>Standings</h3>
+                                    <ul className="gmq-score-list">
+                                        {standingsRows.map((row) => (
+                                            <li key={row.userId} className="gmq-score-row">
+                                                <span>{row.displayName}</span>
+                                                <strong>{row.score || 0}</strong>
+                                            </li>
+                                        ))}
+                                    </ul>
+                                    </section>
 
-                        {showSamplePlayer ? (
-                            <div className="gmq-sample-player">
-                                {round?.sample?.audioUrl ? (
-                                    <audio
-                                        key={`audio-${round.roundId}`}
-                                        ref={sampleAudioRef}
-                                        src={round.sample.audioUrl}
-                                        preload="auto"
-                                        onPlay={() => setSamplePlaying(true)}
-                                        onPause={() => setSamplePlaying(false)}
-                                        onEnded={() => setSamplePlaying(false)}
-                                        onError={() => setMediaError(toMediaErrorMessage('source_unavailable'))}
-                                    />
-                                ) : null}
-                                {round?.sample?.videoUrl ? (
-                                    <video
-                                        key={`video-${round.roundId}`}
-                                        ref={sampleVideoRef}
-                                        src={round.sample.videoUrl}
-                                        preload="auto"
-                                        playsInline
-                                        onPlay={() => setSamplePlaying(true)}
-                                        onPause={() => setSamplePlaying(false)}
-                                        onEnded={() => setSamplePlaying(false)}
-                                        onError={() => setMediaError(toMediaErrorMessage('source_unavailable'))}
-                                    />
-                                ) : null}
-                                <label className="gmq-volume-row">
-                                    <span>Volume {sampleVolumePercent}</span>
-                                    <input
-                                        type="range"
-                                        min="0"
-                                        max="1"
-                                        step="0.01"
-                                        value={sampleVolume}
-                                        onChange={onSampleVolumeChange}
-                                    />
-                                </label>
-                                {sampleAutoplayBlocked ? (
-                                    <div className="gmq-stack">
-                                        <p className="gmq-muted">Autoplay was blocked by your browser.</p>
-                                        <button type="button" className="gmq-btn gmq-btn-secondary" onClick={() => playSample({ isAutoplay: false }).catch(() => {})}>
-                                            Play sample
-                                        </button>
-                                    </div>
-                                ) : (samplePlaybackSource === 'video' && !round?.sample?.audioUrl) ? (
-                                    <p className="gmq-muted">Using video source audio. {sampleDurationLabel}</p>
-                                ) : samplePlaying ? (
-                                    <p className="gmq-muted">Sample is playing. {sampleDurationLabel}</p>
-                                ) : (
-                                    <p className="gmq-muted">{sampleDurationLabel}</p>
-                                )}
-                                {mediaError ? <p className="gmq-muted gmq-muted-warning">{mediaError}</p> : null}
-                            </div>
-                        ) : null}
+                                <section className="gmq-match-center-column">
+                                    <div className="gmq-match-panel gmq-video-panel">
+                                        <h3>Video</h3>
+                                        {round?.sample?.audioUrl ? (
+                                            <audio
+                                                key={`audio-${round.roundId}`}
+                                                ref={sampleAudioRef}
+                                                className="gmq-hidden-media"
+                                                src={round.sample.audioUrl}
+                                                preload="auto"
+                                                onPlay={() => setSamplePlaying(true)}
+                                                onPause={() => setSamplePlaying(false)}
+                                                onEnded={() => setSamplePlaying(false)}
+                                                onError={() => setMediaError(toMediaErrorMessage('source_unavailable'))}
+                                            />
+                                        ) : null}
+                                        {round?.sample?.videoUrl ? (
+                                            <video
+                                                key={`video-${round.roundId}`}
+                                                ref={sampleVideoRef}
+                                                className="gmq-hidden-media"
+                                                src={round.sample.videoUrl}
+                                                preload="auto"
+                                                playsInline
+                                                onPlay={() => setSamplePlaying(true)}
+                                                onPause={() => setSamplePlaying(false)}
+                                                onEnded={() => setSamplePlaying(false)}
+                                                onError={() => setMediaError(toMediaErrorMessage('source_unavailable'))}
+                                            />
+                                        ) : null}
 
-                        {phase === 'GUESSING' && round ? (
-                            <div className="gmq-stack">
-                                <p>Round {round.index}/{round.totalRounds}</p>
-                                {!hasSampleMedia ? (
-                                    <p className="gmq-muted">Sample audio is unavailable for this round.</p>
-                                ) : null}
-                                <div className="gmq-search-box">
-                                    <input
-                                        ref={guessInputRef}
-                                        value={guessText}
-                                        onChange={(e) => { setGuessText(e.target.value); setGuessAnimeId(null); setSearchMenuOpen(true); }}
-                                        onFocus={() => setSearchMenuOpen(true)}
-                                        onBlur={() => {
-                                            window.setTimeout(() => {
-                                                setSearchMenuOpen(false);
-                                            }, 100);
-                                        }}
-                                        placeholder="Type anime name"
-                                    />
-                                    {(searchMenuOpen && searchResults.length > 0) ? (
-                                        <ul className="gmq-search-results">
-                                            {searchResults.map((item) => (
-                                                <li key={`${item.id}-${item.title}`}>
+                                        {showRevealContent ? (
+                                            solution.video ? (
+                                                <div className="gmq-solution-video-wrap">
+                                                    <video
+                                                        key={`solution-${round?.roundId || solution.correctAnime?.animeId || 'video'}`}
+                                                        ref={solutionVideoRef}
+                                                        className="gmq-solution-video"
+                                                        src={solution.video}
+                                                        preload="auto"
+                                                        controls
+                                                        playsInline
+                                                        onError={() => setSolutionMediaError('Could not play solution video in this browser.')}
+                                                    />
+                                                    {solutionVideoAutoplayBlocked ? (
+                                                        <div className="gmq-stack">
+                                                            <p className="gmq-muted">Autoplay was blocked by your browser.</p>
+                                                            <button type="button" className="gmq-btn gmq-btn-secondary" onClick={() => playSolutionVideo().catch(() => {})}>
+                                                                Play solution video
+                                                            </button>
+                                                        </div>
+                                                    ) : null}
+                                                    {solutionMediaError ? <p className="gmq-muted gmq-muted-warning">{solutionMediaError}</p> : null}
+                                                </div>
+                                            ) : (
+                                                <p className="gmq-muted">Solution video is unavailable for this round.</p>
+                                            )
+                                        ) : (
+                                            <div className="gmq-video-placeholder">
+                                                <span>Video hidden until solution reveal</span>
+                                            </div>
+                                        )}
+
+                                        {phase === 'PENDING' && preloadBlocking ? (
+                                            <div className="gmq-stack">
+                                                <p>Preparing media cache before round 1...</p>
+                                                <p className="gmq-muted">
+                                                    Ready {preloadProgress.ready}/{preloadProgress.total}
+                                                    {preloadProgress.failed > 0 ? ` | Failed ${preloadProgress.failed}` : ''}
+                                                </p>
+                                                {preloadGateError ? <p className="gmq-muted gmq-muted-warning">{preloadGateError}</p> : null}
+                                                {preloadGateError ? (
                                                     <button
                                                         type="button"
-                                                        onMouseDown={(event) => event.preventDefault()}
-                                                        onClick={() => { setGuessText(item.title || ''); setGuessAnimeId(Number.isInteger(item.id) ? item.id : null); setSearchResults([]); setSearchMenuOpen(false); }}
+                                                        className="gmq-btn gmq-btn-secondary"
+                                                        onClick={() => retryInitialPreloadGate().catch(() => {})}
+                                                        disabled={preloadRetrying}
                                                     >
-                                                        {item.title}
+                                                        {preloadRetrying ? 'Retrying...' : 'Retry preload'}
                                                     </button>
-                                                </li>
-                                            ))}
-                                        </ul>
-                                    ) : null}
-                                </div>
-                                {searchError ? <p className="gmq-muted gmq-muted-warning">{searchError}</p> : null}
-                                <div className="gmq-actions">
-                                    <button type="button" className="gmq-btn gmq-btn-primary" onClick={submitGuess} disabled={busy === 'guess'}>Submit Guess</button>
-                                    <button type="button" className="gmq-btn gmq-btn-secondary" onClick={toggleReady} disabled={busy === 'ready'}>
-                                        {myReady ? 'Unskip' : 'Skip / Ready'}
-                                    </button>
-                                </div>
-                                <p className="gmq-muted">{readyUserIds.length} ready</p>
-                            </div>
-                        ) : null}
-
-                        {phase === 'ANSWERS_REVEAL' ? (
-                            <div className="gmq-stack">
-                                <h3>Answers</h3>
-                                <ul className="gmq-answer-list">
-                                    {answers.map((item) => (
-                                        <li key={`${item.userId}-${item.guessText || 'blank'}`}>
-                                            <span>{resolvePlayerName(item.userId)}</span>
-                                            <span>{item.guessText || '(blank)'}</span>
-                                            <strong>{item.isCorrect ? 'Correct' : 'Wrong'}</strong>
-                                        </li>
-                                    ))}
-                                </ul>
-                            </div>
-                        ) : null}
-
-                        {phase === 'SOLUTION_REVEAL' && solution ? (
-                            <div className="gmq-stack">
-                                <h3>Solution</h3>
-                                <p>{solution.correctAnime?.animeTitle} ({solution.correctAnime?.themeType})</p>
-                                <p className="gmq-muted">{solution.correctAnime?.themeTitle || ''}</p>
-                                {solution.video ? (
-                                    <div className="gmq-solution-video-wrap">
-                                        <video
-                                            key={`solution-${round?.roundId || solution.correctAnime?.animeId || 'video'}`}
-                                            ref={solutionVideoRef}
-                                            className="gmq-solution-video"
-                                            src={solution.video}
-                                            preload="auto"
-                                            controls
-                                            playsInline
-                                            onError={() => setSolutionMediaError('Could not play solution video in this browser. Use "Open video source".')}
-                                        />
-                                        {solutionVideoAutoplayBlocked ? (
-                                            <div className="gmq-stack">
-                                                <p className="gmq-muted">Autoplay was blocked by your browser.</p>
-                                                <button type="button" className="gmq-btn gmq-btn-secondary" onClick={() => playSolutionVideo().catch(() => {})}>
-                                                    Play solution video
-                                                </button>
+                                                ) : null}
                                             </div>
                                         ) : null}
-                                        {solutionMediaError ? <p className="gmq-muted gmq-muted-warning">{solutionMediaError}</p> : null}
-                                        <a href={solution.video} target="_blank" rel="noreferrer">Open video source</a>
+
+                                        {isGuessingPhase ? (
+                                            !hasSampleMedia ? (
+                                                <p className="gmq-muted">Sample audio is unavailable for this round.</p>
+                                            ) : sampleAutoplayBlocked ? (
+                                                <div className="gmq-stack">
+                                                    <p className="gmq-muted">Autoplay was blocked by your browser.</p>
+                                                    <button type="button" className="gmq-btn gmq-btn-secondary" onClick={() => playSample({ isAutoplay: false }).catch(() => {})}>
+                                                        Play sample
+                                                    </button>
+                                                </div>
+                                            ) : null
+                                        ) : null}
+                                        {mediaError ? <p className="gmq-muted gmq-muted-warning">{mediaError}</p> : null}
+                                        <label className="gmq-volume-row gmq-volume-row-compact gmq-video-volume">
+                                            <span>Volume {sampleVolumePercent}</span>
+                                            <input
+                                                className="gmq-volume-slider-small"
+                                                type="range"
+                                                min="0"
+                                                max="1"
+                                                step="0.01"
+                                                value={sampleVolume}
+                                                onChange={onSampleVolumeChange}
+                                            />
+                                        </label>
                                     </div>
-                                ) : (
-                                    <p className="gmq-muted">Solution video is unavailable for this round.</p>
-                                )}
-                            </div>
-                        ) : null}
 
-                        {phase === 'FINISHED' && finalResult ? (
-                            <div className="gmq-stack">
-                                <h3>Final Result</h3>
-                                <p>Winner: {finalResult.winner?.displayName || 'Tie'}</p>
-                            </div>
-                        ) : null}
+                                    <div className="gmq-match-panel gmq-guess-panel">
+                                        <div className="gmq-search-row">
+                                            <div className="gmq-search-box">
+                                                <input
+                                                    ref={guessInputRef}
+                                                    value={guessText}
+                                                    disabled={!isGuessingPhase}
+                                                    onChange={(e) => {
+                                                        const nextGuessText = e.target.value;
+                                                        guessTextRef.current = nextGuessText;
+                                                        guessAnimeIdRef.current = null;
+                                                        setGuessText(nextGuessText);
+                                                        setGuessAnimeId(null);
+                                                        setSearchMenuOpen(true);
+                                                    }}
+                                                    onFocus={() => {
+                                                        if (isGuessingPhase) setSearchMenuOpen(true);
+                                                    }}
+                                                    onBlur={() => {
+                                                        window.setTimeout(() => {
+                                                            setSearchMenuOpen(false);
+                                                        }, 100);
+                                                    }}
+                                                    placeholder={isGuessingPhase ? 'Type anime name' : 'Waiting for guessing phase'}
+                                                />
+                                                {(searchMenuOpen && searchResults.length > 0 && isGuessingPhase) ? (
+                                                    <ul className="gmq-search-results">
+                                                        {searchResults.map((item) => (
+                                                            <li key={`${item.id}-${item.title}`}>
+                                                                <button
+                                                                    type="button"
+                                                                    onMouseDown={(event) => event.preventDefault()}
+                                                                    onClick={() => {
+                                                                        const nextGuessText = String(item?.title || '');
+                                                                        const parsedAnimeId = Number.parseInt(item?.id, 10);
+                                                                        const nextGuessAnimeId = Number.isInteger(parsedAnimeId) ? parsedAnimeId : null;
+                                                                        guessTextRef.current = nextGuessText;
+                                                                        guessAnimeIdRef.current = nextGuessAnimeId;
+                                                                        setGuessText(nextGuessText);
+                                                                        setGuessAnimeId(nextGuessAnimeId);
+                                                                        setSearchResults([]);
+                                                                        setSearchMenuOpen(false);
+                                                                        submitGuess({
+                                                                            force: true,
+                                                                            guessTextOverride: nextGuessText,
+                                                                            guessAnimeIdOverride: nextGuessAnimeId
+                                                                        }).catch(() => {});
+                                                                    }}
+                                                                >
+                                                                    {item.title}
+                                                                </button>
+                                                            </li>
+                                                        ))}
+                                                    </ul>
+                                                ) : null}
+                                            </div>
+                                            <button
+                                                type="button"
+                                                className="gmq-btn gmq-btn-secondary"
+                                                onClick={toggleReady}
+                                                disabled={busy === 'ready' || !isGuessingPhase}
+                                            >
+                                                {myReady ? 'Unskip' : 'Skip'}
+                                            </button>
+                                        </div>
+                                        {searchError ? <p className="gmq-muted gmq-muted-warning">{searchError}</p> : null}
+                                    </div>
+                                </section>
 
-                        {displayedScores.length ? (
-                            <div className="gmq-stack">
-                                <h3>Scoreboard</h3>
-                                <ul className="gmq-score-list">
-                                    {displayedScores.map((row) => (
-                                        <li key={row.userId} className="gmq-score-row">
-                                            <span>{row.displayName}</span>
-                                            <strong>{row.score}</strong>
-                                        </li>
-                                    ))}
-                                </ul>
+                                    <section className="gmq-match-panel gmq-info-panel">
+                                    <h3>Music Info</h3>
+                                    {showRevealContent ? (
+                                        <div className="gmq-stack">
+                                            <p>{solution.correctAnime?.animeTitle} ({solution.correctAnime?.themeType})</p>
+                                            <p className="gmq-muted">{solution.correctAnime?.themeTitle || ''}</p>
+                                        </div>
+                                    ) : (
+                                        <p className="gmq-muted">Music info hidden until solution reveal.</p>
+                                    )}
+                                    </section>
+                                </div>
+
+                                <section className="gmq-player-grid gmq-match-player-row">
+                                    {playerSquares.map((player) => {
+                                        const answer = answerByUserId.get(player.userId) || null;
+                                        const hasScoredAnswer = showAnswerCorrectness && typeof answer?.isCorrect === 'boolean';
+                                        const bubbleToneClass = hasScoredAnswer
+                                            ? (answer.isCorrect ? ' gmq-answer-bubble-correct' : ' gmq-answer-bubble-wrong')
+                                            : '';
+                                        const answerText = (typeof answer?.guessText === 'string' && answer.guessText.trim())
+                                            ? answer.guessText
+                                            : '-';
+                                        return (
+                                            <div key={player.userId} className="gmq-player-square-wrap">
+                                                {showAnswerBubbles ? (
+                                                    <div className={`gmq-answer-bubble${bubbleToneClass}`}>
+                                                        {answerText}
+                                                    </div>
+                                                ) : null}
+                                                {isGuessingPhase && readyUserIds.includes(player.userId) ? (
+                                                    <span className="gmq-player-ready-indicator">Ready</span>
+                                                ) : null}
+                                                <div className="gmq-player-square">
+                                                    <span>{player.displayName}</span>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </section>
                             </div>
-                        ) : null}
                         </article>
                     ) : null}
                 </div>

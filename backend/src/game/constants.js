@@ -4,11 +4,15 @@ const THEME_MODES = ['OP_ONLY', 'ED_ONLY', 'MIXED'];
 
 const MAX_LOBBY_SIZE = 8;
 const MIN_LOBBY_SIZE = 1;
+const MIN_SCORE_FILTER = 1;
+const MAX_SCORE_FILTER = 10;
 
 module.exports = {
     SOURCE_MODES,
     SELECTION_MODES,
     THEME_MODES,
     MAX_LOBBY_SIZE,
-    MIN_LOBBY_SIZE
+    MIN_LOBBY_SIZE,
+    MIN_SCORE_FILTER,
+    MAX_SCORE_FILTER
 };

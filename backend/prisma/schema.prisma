@@ -54,6 +54,10 @@ model Lobby {
   sourceMode            SourceMode    @default(HYBRID)
   selectionMode         SelectionMode @default(STANDARD)
   themeMode             ThemeMode     @default(MIXED)
+  animeScoreMin         Int           @default(1)
+  animeScoreMax         Int           @default(10)
+  playerScoreMin        Int           @default(1)
+  playerScoreMax        Int           @default(10)
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
 
@@ -90,6 +94,10 @@ model GameSession {
   sourceMode            SourceMode
   selectionMode         SelectionMode
   themeMode             ThemeMode
+  animeScoreMin         Int               @default(1)
+  animeScoreMax         Int               @default(10)
+  playerScoreMin        Int               @default(1)
+  playerScoreMax        Int               @default(10)
   startedAt             DateTime?
   endedAt               DateTime?
   createdAt             DateTime          @default(now())

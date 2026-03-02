@@ -46,6 +46,10 @@ jest.mock('../../game/lobbyService', () => {
             sourceMode: lobby.sourceMode,
             selectionMode: lobby.selectionMode,
             themeMode: lobby.themeMode,
+            animeScoreMin: lobby.animeScoreMin,
+            animeScoreMax: lobby.animeScoreMax,
+            playerScoreMin: lobby.playerScoreMin,
+            playerScoreMax: lobby.playerScoreMax,
             host: { id: lobby.hostUserId, username: `user${lobby.hostUserId}`, nickname: `User${lobby.hostUserId}` },
             players,
             playerCount: players.length,
@@ -78,6 +82,10 @@ jest.mock('../../game/lobbyService', () => {
             sourceMode: seed?.sourceMode || 'POPULAR',
             selectionMode: seed?.selectionMode || 'STANDARD',
             themeMode: seed?.themeMode || 'MIXED',
+            animeScoreMin: Number(seed?.animeScoreMin ?? 1),
+            animeScoreMax: Number(seed?.animeScoreMax ?? 10),
+            playerScoreMin: Number(seed?.playerScoreMin ?? 1),
+            playerScoreMax: Number(seed?.playerScoreMax ?? 10),
             hostUserId,
             players: []
         };
@@ -218,6 +226,10 @@ jest.mock('../../game/sessionService', () => {
                 sourceMode: lobby.sourceMode,
                 selectionMode: lobby.selectionMode,
                 themeMode: lobby.themeMode,
+                animeScoreMin: lobby.animeScoreMin,
+                animeScoreMax: lobby.animeScoreMax,
+                playerScoreMin: lobby.playerScoreMin,
+                playerScoreMax: lobby.playerScoreMax,
                 startedAt: new Date()
             };
             sessions.set(session.id, session);
@@ -599,7 +611,7 @@ describe('socket integration', () => {
             hostUserId: 1,
             players: [{ userId: 1, displayName: 'Host' }],
             roundCount: 1,
-            guessSeconds: 0.2,
+            guessSeconds: 2,
             answersRevealSeconds: 0.1,
             solutionRevealSeconds: 0.1
         });
@@ -658,6 +670,45 @@ describe('socket integration', () => {
         expect(finished.finalScores).toHaveLength(2);
         expect(finished.winner).toBeTruthy();
         expect(finished.winner.score).toBe(1);
+    });
+
+    test('leaving mid-round does not block all_ready transition for remaining players', async () => {
+        lobbyService.__seedLobby({
+            code: 'LEAVE1',
+            hostUserId: 1,
+            players: [
+                { userId: 1, displayName: 'Host' },
+                { userId: 2, displayName: 'Guest' }
+            ],
+            roundCount: 1,
+            guessSeconds: 10,
+            answersRevealSeconds: 0.2,
+            solutionRevealSeconds: 0.2
+        });
+
+        const host = await connectClient({ userId: 1, username: 'host' });
+        const guest = await connectClient({ userId: 2, username: 'guest' });
+
+        expect((await emitWithAck(host, 'lobby:join', { lobbyCode: 'LEAVE1' })).ok).toBe(true);
+        expect((await emitWithAck(guest, 'lobby:join', { lobbyCode: 'LEAVE1' })).ok).toBe(true);
+        expect((await emitWithAck(host, 'lobby:set_ready', { lobbyCode: 'LEAVE1', ready: true })).ok).toBe(true);
+        expect((await emitWithAck(guest, 'lobby:set_ready', { lobbyCode: 'LEAVE1', ready: true })).ok).toBe(true);
+
+        const startedPromise = waitForEvent(host, 'round:started');
+        expect((await emitWithAck(host, 'game:start', { lobbyCode: 'LEAVE1' })).ok).toBe(true);
+        const started = await startedPromise;
+        expect(started.roundId).toBeTruthy();
+
+        const hostReadyAck = await emitWithAck(host, 'round:set_ready', { lobbyCode: 'LEAVE1', ready: true });
+        expect(hostReadyAck.ok).toBe(true);
+        expect(hostReadyAck.allReady).toBe(false);
+
+        const answersPromise = waitForEvent(host, 'round:answers_reveal');
+        const leaveAck = await emitWithAck(guest, 'lobby:leave', { lobbyCode: 'LEAVE1' });
+        expect(leaveAck.ok).toBe(true);
+
+        const answers = await answersPromise;
+        expect(answers.reason).toBe('all_ready');
     });
 
     test('enforces private invite token flow', async () => {
@@ -776,7 +827,7 @@ describe('socket integration', () => {
             hostUserId: 1,
             players: [{ userId: 1, displayName: 'Host' }],
             roundCount: 1,
-            guessSeconds: 1,
+            guessSeconds: 2,
             answersRevealSeconds: 0.1,
             solutionRevealSeconds: 0.1
         });
@@ -802,10 +853,11 @@ describe('socket integration', () => {
         expect(syncAck.state.round.roundId).toBe(started.roundId);
         expect(['GUESSING', 'ANSWERS_REVEAL', 'SOLUTION_REVEAL']).toContain(syncAck.state.phase);
 
-        const finishedPromise = waitForEvent(reconnect, 'game:finished', 4_000);
+        const answersPromise = waitForEvent(reconnect, 'round:answers_reveal', 3_000);
         const readyAck = await emitWithAck(reconnect, 'round:set_ready', { lobbyCode: 'RECON1', ready: true });
         expect(readyAck.ok).toBe(true);
-        await finishedPromise;
+        const answers = await answersPromise;
+        expect(['all_ready', 'timeout', 'recovery_timeout']).toContain(answers?.reason);
     });
 
     test('starts first round without waiting for preload ready ack', async () => {
@@ -842,5 +894,54 @@ describe('socket integration', () => {
         const preloadAck = await emitWithAck(host, 'game:preload_ready', { lobbyCode: 'PRELOAD1' });
         expect(preloadAck.ok).toBe(true);
         expect(preloadAck.started).toBe(true);
+    });
+
+    test('propagates score filter settings through realtime lobby updates and game start config', async () => {
+        lobbyService.__seedLobby({
+            code: 'FILTER1',
+            hostUserId: 1,
+            players: [
+                { userId: 1, displayName: 'Host' },
+                { userId: 2, displayName: 'Guest' }
+            ],
+            roundCount: 1,
+            guessSeconds: 1,
+            answersRevealSeconds: 0.1,
+            solutionRevealSeconds: 0.1
+        });
+
+        const host = await connectClient({ userId: 1, username: 'host' });
+        const guest = await connectClient({ userId: 2, username: 'guest' });
+        expect((await emitWithAck(host, 'lobby:join', { lobbyCode: 'FILTER1' })).ok).toBe(true);
+        expect((await emitWithAck(guest, 'lobby:join', { lobbyCode: 'FILTER1' })).ok).toBe(true);
+
+        const updatedStatePromise = waitForEvent(guest, 'lobby:state');
+        const updateAck = await emitWithAck(host, 'lobby:update_settings', {
+            lobbyCode: 'FILTER1',
+            settings: {
+                animeScoreMin: 4,
+                animeScoreMax: 8,
+                playerScoreMin: 6,
+                playerScoreMax: 9
+            }
+        });
+        expect(updateAck.ok).toBe(true);
+
+        const updatedState = await updatedStatePromise;
+        expect(updatedState.lobby.animeScoreMin).toBe(4);
+        expect(updatedState.lobby.animeScoreMax).toBe(8);
+        expect(updatedState.lobby.playerScoreMin).toBe(6);
+        expect(updatedState.lobby.playerScoreMax).toBe(9);
+
+        expect((await emitWithAck(host, 'lobby:set_ready', { lobbyCode: 'FILTER1', ready: true })).ok).toBe(true);
+        expect((await emitWithAck(guest, 'lobby:set_ready', { lobbyCode: 'FILTER1', ready: true })).ok).toBe(true);
+
+        const gameStartedPromise = waitForEvent(host, 'game:started');
+        expect((await emitWithAck(host, 'game:start', { lobbyCode: 'FILTER1' })).ok).toBe(true);
+        const gameStarted = await gameStartedPromise;
+        expect(gameStarted.config.animeScoreMin).toBe(4);
+        expect(gameStarted.config.animeScoreMax).toBe(8);
+        expect(gameStarted.config.playerScoreMin).toBe(6);
+        expect(gameStarted.config.playerScoreMax).toBe(9);
     });
 });

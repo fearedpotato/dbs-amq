@@ -4,6 +4,7 @@ const prisma = require('../lib/prisma');
 const { decryptToken } = require('../lib/tokenCipher');
 const { httpError } = require('./errors');
 const { POPULAR_CATALOG } = require('./catalog');
+const { MIN_SCORE_FILTER, MAX_SCORE_FILTER } = require('./constants');
 
 const WATCHED_STATUSES = new Set(['watching', 'completed']);
 const DEFAULT_MAL_API_BASE_URL = 'https://api.myanimelist.net/v2';
@@ -85,7 +86,22 @@ function writeCachedWatched(userId, fingerprint, value, now = Date.now()) {
     pruneCache(now);
 }
 
-function normalizeAnimeSeed(node) {
+function normalizeMalAnimeScore(value) {
+    const parsed = Number.parseFloat(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    const bucket = Math.trunc(parsed);
+    if (bucket < MIN_SCORE_FILTER || bucket > MAX_SCORE_FILTER) return null;
+    return bucket;
+}
+
+function normalizePlayerAnimeScore(value) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > MAX_SCORE_FILTER) return null;
+    return parsed;
+}
+
+function normalizeAnimeSeed(row) {
+    const node = row?.node || {};
     const animeId = Number.parseInt(node?.id, 10);
     if (!Number.isInteger(animeId) || animeId <= 0) return null;
 
@@ -98,7 +114,12 @@ function normalizeAnimeSeed(node) {
     ).trim();
 
     if (!animeTitle) return null;
-    return { animeId, animeTitle };
+    return {
+        animeId,
+        animeTitle,
+        animeScore: normalizeMalAnimeScore(node?.mean),
+        playerScore: normalizePlayerAnimeScore(row?.list_status?.score)
+    };
 }
 
 async function fetchWatchedAnimeFromMal(accessToken) {
@@ -115,7 +136,7 @@ async function fetchWatchedAnimeFromMal(accessToken) {
             params: {
                 limit: pageSize,
                 offset,
-                fields: 'list_status'
+                fields: 'list_status,mean'
             },
             timeout: 12_000
         });
@@ -127,7 +148,7 @@ async function fetchWatchedAnimeFromMal(accessToken) {
             const status = String(row?.list_status?.status || '').toLowerCase();
             if (!WATCHED_STATUSES.has(status)) continue;
 
-            const seed = normalizeAnimeSeed(row?.node);
+            const seed = normalizeAnimeSeed(row);
             if (!seed) continue;
             if (dedup.has(seed.animeId)) continue;
 
@@ -282,6 +303,92 @@ function fillFromPopular({ plan, roundCount, usedAnimeIds, popularCatalog }) {
 
 function failMode(message) {
     throw httpError(400, message);
+}
+
+function clampScoreFilter(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(MIN_SCORE_FILTER, Math.min(MAX_SCORE_FILTER, parsed));
+}
+
+function normalizeSessionScoreFilters(session) {
+    const animeScoreMin = clampScoreFilter(session?.animeScoreMin, MIN_SCORE_FILTER);
+    const animeScoreMax = clampScoreFilter(session?.animeScoreMax, MAX_SCORE_FILTER);
+    const playerScoreMin = clampScoreFilter(session?.playerScoreMin, MIN_SCORE_FILTER);
+    const playerScoreMax = clampScoreFilter(session?.playerScoreMax, MAX_SCORE_FILTER);
+
+    if (animeScoreMin > animeScoreMax) {
+        failMode('animeScoreMin cannot be greater than animeScoreMax');
+    }
+    if (playerScoreMin > playerScoreMax) {
+        failMode('playerScoreMin cannot be greater than playerScoreMax');
+    }
+
+    return {
+        animeScoreMin,
+        animeScoreMax,
+        playerScoreMin,
+        playerScoreMax
+    };
+}
+
+function isFullScoreRange(min, max) {
+    return min <= MIN_SCORE_FILTER && max >= MAX_SCORE_FILTER;
+}
+
+function scoreInRange(score, min, max) {
+    return Number.isInteger(score) && score >= min && score <= max;
+}
+
+function filterMalPoolsByScore({ pools, animeScoreMin, animeScoreMax, playerScoreMin, playerScoreMax }) {
+    const filtered = new Map();
+    const allowUnratedPlayer = isFullScoreRange(playerScoreMin, playerScoreMax);
+    const allowUnknownAnimeScore = isFullScoreRange(animeScoreMin, animeScoreMax);
+
+    for (const [userId, seeds] of pools.entries()) {
+        const next = (Array.isArray(seeds) ? seeds : []).filter((seed) => {
+            const animeScore = normalizeMalAnimeScore(seed?.animeScore);
+            if (Number.isInteger(animeScore)) {
+                if (!scoreInRange(animeScore, animeScoreMin, animeScoreMax)) return false;
+            } else if (!allowUnknownAnimeScore) {
+                return false;
+            }
+
+            const playerScore = normalizePlayerAnimeScore(seed?.playerScore);
+            if (Number.isInteger(playerScore) && playerScore >= MIN_SCORE_FILTER) {
+                return scoreInRange(playerScore, playerScoreMin, playerScoreMax);
+            }
+
+            return allowUnratedPlayer;
+        });
+
+        filtered.set(userId, next);
+    }
+
+    return filtered;
+}
+
+function normalizeCatalogAnimeScore(value) {
+    const parsed = Number.parseFloat(value);
+    if (!Number.isFinite(parsed)) return null;
+    const bucket = Math.trunc(parsed);
+    if (bucket < MIN_SCORE_FILTER || bucket > MAX_SCORE_FILTER) return null;
+    return bucket;
+}
+
+function filterPopularCatalogByAnimeScore(popularCatalog, animeScoreMin, animeScoreMax) {
+    const allowUnknownAnimeScore = isFullScoreRange(animeScoreMin, animeScoreMax);
+    const source = Array.isArray(popularCatalog) && popularCatalog.length > 0
+        ? popularCatalog
+        : POPULAR_CATALOG;
+
+    return source.filter((seed) => {
+        const animeScore = normalizeCatalogAnimeScore(seed?.animeScore);
+        if (Number.isInteger(animeScore)) {
+            return scoreInRange(animeScore, animeScoreMin, animeScoreMax);
+        }
+        return allowUnknownAnimeScore;
+    });
 }
 
 function selectStandard({
@@ -481,8 +588,13 @@ async function buildRoundSeedPlan({ session, lobby }) {
 
     const sourceMode = String(session?.sourceMode || 'HYBRID');
     const selectionMode = String(session?.selectionMode || 'STANDARD');
+    const scoreFilters = normalizeSessionScoreFilters(session);
     const playerIds = (lobby?.players || []).map((player) => player.userId);
-    const popularCatalog = shuffledCopy(POPULAR_CATALOG);
+    const popularCatalog = filterPopularCatalogByAnimeScore(
+        shuffledCopy(POPULAR_CATALOG),
+        scoreFilters.animeScoreMin,
+        scoreFilters.animeScoreMax
+    );
 
     if (sourceMode === 'POPULAR') {
         return selectStandard({
@@ -495,6 +607,13 @@ async function buildRoundSeedPlan({ session, lobby }) {
     }
 
     const { pools, linkedByUserId, errorsByUserId } = await loadPlayerMalPools(playerIds);
+    const filteredPools = filterMalPoolsByScore({
+        pools,
+        animeScoreMin: scoreFilters.animeScoreMin,
+        animeScoreMax: scoreFilters.animeScoreMax,
+        playerScoreMin: scoreFilters.playerScoreMin,
+        playerScoreMax: scoreFilters.playerScoreMax
+    });
     const selectedPlayerIds = sourceMode === 'MAL_ONLY'
         ? playerIds.filter((userId) => linkedByUserId.get(userId))
         : playerIds;
@@ -523,7 +642,7 @@ async function buildRoundSeedPlan({ session, lobby }) {
             sourceMode,
             selectionMode,
             playerIds: selectedPlayerIds,
-            poolByPlayer: pools,
+            poolByPlayer: filteredPools,
             popularCatalog
         });
     }
@@ -532,7 +651,7 @@ async function buildRoundSeedPlan({ session, lobby }) {
         roundCount,
         sourceMode,
         playerIds: selectedPlayerIds,
-        poolByPlayer: pools,
+        poolByPlayer: filteredPools,
         popularCatalog
     });
 }

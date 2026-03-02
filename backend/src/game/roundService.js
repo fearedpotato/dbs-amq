@@ -60,6 +60,29 @@ function resolveRequestedSampleSeconds(session) {
     return guess + answers;
 }
 
+function normalizeMediaUrlForSignature(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+
+    let source = raw;
+    try {
+        const parsed = new URL(raw, 'http://localhost');
+        const encodedSource = parsed.searchParams.get('u');
+        if (encodedSource) {
+            source = Buffer.from(encodedSource, 'base64url').toString('utf8');
+        }
+    } catch (_err) {
+        // Keep original URL when parsing fails.
+    }
+
+    try {
+        const parsed = new URL(source);
+        return `${parsed.origin}${parsed.pathname}`;
+    } catch (_err) {
+        return source;
+    }
+}
+
 function buildRoundMediaSignature(media) {
     if (!media || typeof media !== 'object') return null;
 
@@ -69,7 +92,7 @@ function buildRoundMediaSignature(media) {
     const themeType = String(media.themeType || '').trim().toUpperCase();
     const themeTitle = String(media.themeTitle || '').trim().toLowerCase();
     const songId = Number.parseInt(media.themeSongId, 10);
-    const videoUrl = String(media.solutionVideoUrl || '').trim();
+    const videoUrl = normalizeMediaUrlForSignature(media.solutionVideoUrl);
 
     if (Number.isInteger(songId) && songId > 0) {
         return `${animeId}|song:${songId}|${themeType}`;
@@ -284,6 +307,7 @@ async function ensureRoundForIndex({ session, index, lobbyPlayers }) {
         roundCount: index,
         selectionMode: session.selectionMode
     });
+    let resolvedSourcePlayerId = sourceAssignments[index - 1] || null;
 
     const existingRounds = await prisma.gameRound.findMany({
         where: { sessionId: session.id },
@@ -301,14 +325,43 @@ async function ensureRoundForIndex({ session, index, lobbyPlayers }) {
             .map((row) => buildRoundMediaSignature(row))
             .filter((value) => typeof value === 'string' && value.length > 0)
     );
-    const malOnlyCatalogSeeds = session.sourceMode === 'MAL_ONLY'
-        ? existingRounds
-            .map((row) => ({
-                animeId: Number.parseInt(row.animeId, 10),
-                animeTitle: row.animeTitle
-            }))
-            .filter((row) => Number.isInteger(row.animeId) && row.animeId > 0)
-        : null;
+    let malOnlyCatalogSeeds = null;
+    const sourcePlayerByAnimeId = new Map();
+    if (session.sourceMode === 'MAL_ONLY') {
+        try {
+            const plannedSeeds = await buildRoundSeedPlan({
+                session,
+                lobby: session.lobby
+            });
+            const dedup = new Set();
+            malOnlyCatalogSeeds = [];
+            for (const seed of plannedSeeds || []) {
+                const animeId = Number.parseInt(seed?.animeId, 10);
+                if (!Number.isInteger(animeId) || animeId <= 0) continue;
+                if (dedup.has(animeId)) continue;
+                dedup.add(animeId);
+                malOnlyCatalogSeeds.push({
+                    animeId,
+                    animeTitle: seed?.animeTitle || `Anime ${animeId}`
+                });
+                if (Object.prototype.hasOwnProperty.call(seed, 'sourcePlayerId')) {
+                    sourcePlayerByAnimeId.set(animeId, seed.sourcePlayerId);
+                }
+            }
+        } catch (_err) {
+            // Fallback keeps ongoing sessions playable if MAL planning fails mid-match.
+            malOnlyCatalogSeeds = null;
+        }
+
+        if (!Array.isArray(malOnlyCatalogSeeds) || malOnlyCatalogSeeds.length === 0) {
+            malOnlyCatalogSeeds = existingRounds
+                .map((row) => ({
+                    animeId: Number.parseInt(row.animeId, 10),
+                    animeTitle: row.animeTitle
+                }))
+                .filter((row) => Number.isInteger(row.animeId) && row.animeId > 0);
+        }
+    }
 
     let media = await selectRoundMedia({
         session,
@@ -318,6 +371,9 @@ async function ensureRoundForIndex({ session, index, lobbyPlayers }) {
         allowReuse: false,
         catalogSeeds: malOnlyCatalogSeeds
     });
+    if (media && sourcePlayerByAnimeId.has(media.animeId)) {
+        resolvedSourcePlayerId = sourcePlayerByAnimeId.get(media.animeId);
+    }
 
     if (!media) {
         media = await selectRoundMedia({
@@ -328,6 +384,9 @@ async function ensureRoundForIndex({ session, index, lobbyPlayers }) {
             allowReuse: true,
             catalogSeeds: malOnlyCatalogSeeds
         });
+        if (media && sourcePlayerByAnimeId.has(media.animeId)) {
+            resolvedSourcePlayerId = sourcePlayerByAnimeId.get(media.animeId);
+        }
     }
 
     if (!media) {
@@ -344,7 +403,7 @@ async function ensureRoundForIndex({ session, index, lobbyPlayers }) {
             sessionId: session.id,
             roundIndex: index,
             media,
-            sourcePlayerId: sourceAssignments[index - 1] || null,
+            sourcePlayerId: resolvedSourcePlayerId,
             lobbyCode: session?.lobby?.code || null
         })
     });

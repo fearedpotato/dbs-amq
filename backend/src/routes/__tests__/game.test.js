@@ -73,6 +73,10 @@ function buildLobby({
         sourceMode: 'HYBRID',
         selectionMode,
         themeMode: 'MIXED',
+        animeScoreMin: 1,
+        animeScoreMax: 10,
+        playerScoreMin: 1,
+        playerScoreMax: 10,
         createdAt: new Date(),
         updatedAt: new Date(),
         host: { id: hostId, username: 'host', nickname: 'Host' },
@@ -171,6 +175,74 @@ describe('game routes', () => {
 
         expect(res.status).toBe(400);
         expect(res.body.error).toBe('Balanced selection modes are not allowed for single-player only lobbies');
+    });
+
+    test('POST /api/game/lobbies clamps score filters into 1..10 bounds', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+            id: 1,
+            username: 'demo',
+            nickname: 'Demo'
+        });
+        prisma.lobby.findUnique.mockResolvedValueOnce(null);
+        prisma.lobby.create.mockResolvedValue(buildLobby({ code: 'A1B2C3' }));
+
+        const res = await request(createApp())
+            .post('/api/game/lobbies')
+            .set(authHeader())
+            .send({
+                animeScoreMin: -5,
+                animeScoreMax: 99,
+                playerScoreMin: 0,
+                playerScoreMax: 100
+            });
+
+        expect(res.status).toBe(201);
+        expect(prisma.lobby.create).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({
+                animeScoreMin: 1,
+                animeScoreMax: 10,
+                playerScoreMin: 1,
+                playerScoreMax: 10
+            })
+        }));
+    });
+
+    test('POST /api/game/lobbies rejects inverted score filter ranges', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+            id: 1,
+            username: 'demo',
+            nickname: 'Demo'
+        });
+
+        const res = await request(createApp())
+            .post('/api/game/lobbies')
+            .set(authHeader())
+            .send({
+                animeScoreMin: 9,
+                animeScoreMax: 3
+            });
+
+        expect(res.status).toBe(400);
+        expect(res.body.error).toBe('animeScoreMin cannot be greater than animeScoreMax');
+    });
+
+    test('POST /api/game/lobbies rejects inverted player score filter range', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+            id: 1,
+            username: 'demo',
+            nickname: 'Demo'
+        });
+
+        const res = await request(createApp())
+            .post('/api/game/lobbies')
+            .set(authHeader())
+            .send({
+                playerScoreMin: 10,
+                playerScoreMax: 4
+            });
+
+        expect(res.status).toBe(400);
+        expect(res.body.error).toBe('playerScoreMin cannot be greater than playerScoreMax');
     });
 
     test('POST /api/game/lobbies/:code/join joins existing lobby', async () => {

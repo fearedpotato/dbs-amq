@@ -2,17 +2,28 @@ const roundService = require('../game/roundService');
 const { httpError } = require('../game/errors');
 const {
     buildMediaProxyUrl,
-    evictCacheForMediaUrls,
-    deleteLobbyCache
+    prewarmManifest,
+    evictCacheForMediaUrls
 } = require('../game/mediaProxyService');
 const telemetry = require('../lib/telemetry');
 
 const MAX_SUDDEN_DEATH_ROUNDS = 20;
 const DEFAULT_ZERO_CONNECTED_ROUNDS_TO_KILL = 3;
+const DEFAULT_EVICT_COMPLETED_ROUND_MEDIA = false;
+const ALL_READY_REVEAL_DELAY_MS = 1_000;
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseBoolean(value, fallback) {
+    if (typeof value === 'boolean') return value;
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return fallback;
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
 }
 
 function getZeroConnectedRoundsToKill() {
@@ -22,15 +33,71 @@ function getZeroConnectedRoundsToKill() {
     );
 }
 
+function shouldEvictCompletedRoundMedia() {
+    return parseBoolean(
+        process.env.MEDIA_PROXY_EVICT_COMPLETED_ROUND_MEDIA,
+        DEFAULT_EVICT_COMPLETED_ROUND_MEDIA
+    );
+}
+
 function createRoundEngine(io, options = {}) {
     const stateByLobby = new Map();
+
+    function getReadyRequiredUserIds(players = []) {
+        const list = Array.isArray(players) ? players : [];
+        return list
+            .filter((player) => Number.isInteger(player?.userId) && player?.isConnected !== false)
+            .map((player) => player.userId);
+    }
 
     function clearRoundTimers(state) {
         if (!state) return;
         if (state.timers.guess) clearTimeout(state.timers.guess);
         if (state.timers.answers) clearTimeout(state.timers.answers);
         if (state.timers.solution) clearTimeout(state.timers.solution);
+        if (state.timers.allReady) clearTimeout(state.timers.allReady);
         state.timers = {};
+    }
+
+    function isAllReady(state) {
+        const requiredUserIds = getReadyRequiredUserIds(state?.players);
+        return requiredUserIds.length > 0 && requiredUserIds.every((id) => state.readyUserIds.has(id));
+    }
+
+    function clearAllReadyTransitionTimer(state) {
+        if (!state?.timers?.allReady) return;
+        clearTimeout(state.timers.allReady);
+        state.timers.allReady = null;
+    }
+
+    function scheduleAllReadyTransition(state) {
+        if (!state || state.phase !== 'GUESSING' || !state.currentRound) return;
+        if (state.timers.allReady) return;
+
+        state.timers.allReady = setTimeout(() => {
+            state.timers.allReady = null;
+            if (state.phase !== 'GUESSING' || !isAllReady(state)) return;
+
+            transitionToAnswersReveal(state.lobbyCode, 'all_ready').catch((err) => {
+                telemetry.error('round.transition_failed', err, {
+                    from: 'GUESSING',
+                    to: 'ANSWERS_REVEAL',
+                    lobbyCode: state.lobbyCode,
+                    sessionId: state.sessionId,
+                    roundId: state.currentRound?.id || null,
+                    reason: 'all_ready'
+                });
+            });
+        }, ALL_READY_REVEAL_DELAY_MS);
+    }
+
+    function updateAllReadyTransition(state, allReady) {
+        if (!state || state.phase !== 'GUESSING') return;
+        if (allReady) {
+            scheduleAllReadyTransition(state);
+            return;
+        }
+        clearAllReadyTransitionTimer(state);
     }
 
     function sanitizeLobbyCode(value) {
@@ -53,8 +120,119 @@ function createRoundEngine(io, options = {}) {
             timers: {},
             readyUserIds: new Set(),
             suddenDeathRounds: 0,
-            zeroConnectedRoundStreak: 0
+            zeroConnectedRoundStreak: 0,
+            prewarmingRoundIndexes: new Set()
         };
+    }
+
+    function buildRoundMediaManifestEntry(round) {
+        if (!round) return null;
+        const index = Number.parseInt(round.index, 10);
+        if (!Number.isInteger(index) || index <= 0) return null;
+
+        return {
+            index,
+            sampleStartSec: round.sampleStartSec,
+            sampleDurationSec: round.sampleDurationSec,
+            audioUrl: buildMediaProxyUrl(round.solutionAudioUrl) || null,
+            videoUrl: buildMediaProxyUrl(round.solutionVideoUrl) || null
+        };
+    }
+
+    async function prewarmRoundMedia(state, round, reason = 'round_prefetch') {
+        if (!state || !round) return;
+
+        const manifestEntry = buildRoundMediaManifestEntry(round);
+        if (!manifestEntry) return;
+
+        const summary = await prewarmManifest([manifestEntry], {
+            roundLimit: 1,
+            maxConcurrent: 2
+        });
+        telemetry.info('media.prewarm_round', {
+            lobbyCode: state.lobbyCode,
+            sessionId: state.sessionId,
+            roundId: round.id,
+            index: round.index,
+            reason,
+            ...summary
+        });
+    }
+
+    async function prewarmUpcomingRound(state, nextIndex) {
+        if (!state) return;
+        const index = Number.parseInt(nextIndex, 10);
+        if (!Number.isInteger(index) || index <= 0) return;
+
+        const maxPotentialRoundIndex = state.baseRoundCount + MAX_SUDDEN_DEATH_ROUNDS;
+        if (index > maxPotentialRoundIndex) return;
+        if (state.prewarmingRoundIndexes.has(index)) return;
+        state.prewarmingRoundIndexes.add(index);
+
+        try {
+            const session = await roundService.getSessionById(state.sessionId);
+            if (!session || session.status !== 'IN_PROGRESS') return;
+
+            const upcomingRound = await roundService.ensureRoundForIndex({
+                session,
+                index,
+                lobbyPlayers: session.lobby.players
+            });
+            await prewarmRoundMedia(state, upcomingRound, 'upcoming_round');
+        } catch (err) {
+            telemetry.warn('media.prewarm_upcoming_round_failed', {
+                lobbyCode: state.lobbyCode,
+                sessionId: state.sessionId,
+                index,
+                error: err?.message || String(err)
+            });
+        } finally {
+            state.prewarmingRoundIndexes.delete(index);
+        }
+    }
+
+    function parseScoreValue(value) {
+        const parsed = Number.parseInt(value, 10);
+        return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    async function shouldPrewarmUpcomingRound(state, currentRoundIndex, nextRoundIndex) {
+        if (!state) return false;
+        if (nextRoundIndex <= state.baseRoundCount) return true;
+
+        const scores = await roundService.getScoresForSession({
+            sessionId: state.sessionId,
+            lobbyPlayers: state.players
+        });
+        const sortedScores = Array.isArray(scores) ? scores : [];
+        if (sortedScores.length < 2) {
+            telemetry.info('media.prewarm_sudden_death_skipped', {
+                lobbyCode: state.lobbyCode,
+                sessionId: state.sessionId,
+                currentRoundIndex,
+                nextRoundIndex,
+                reason: 'insufficient_players'
+            });
+            return false;
+        }
+
+        const topScore = parseScoreValue(sortedScores[0]?.score);
+        const secondScore = parseScoreValue(sortedScores[1]?.score);
+        const lead = topScore - secondScore;
+        const shouldPrewarm = lead <= 1;
+
+        telemetry.info('media.prewarm_sudden_death_evaluated', {
+            lobbyCode: state.lobbyCode,
+            sessionId: state.sessionId,
+            currentRoundIndex,
+            nextRoundIndex,
+            topScore,
+            secondScore,
+            lead,
+            shouldPrewarm
+        });
+
+        return shouldPrewarm;
     }
 
     async function emitRoundStarted(state) {
@@ -163,6 +341,7 @@ function createRoundEngine(io, options = {}) {
 
         clearTimeout(state.timers.guess);
         state.timers.guess = null;
+        clearAllReadyTransitionTimer(state);
 
         const endsAt = new Date(Date.now() + state.config.answersRevealSeconds * 1000);
         const transitioned = await roundService.compareAndSetRoundStatus(
@@ -233,6 +412,21 @@ function createRoundEngine(io, options = {}) {
         });
 
         await emitRoundStarted(state);
+
+        (async () => {
+            const nextRoundIndex = index + 1;
+            const shouldPrewarm = await shouldPrewarmUpcomingRound(state, index, nextRoundIndex);
+            if (!shouldPrewarm) return;
+
+            await prewarmUpcomingRound(state, nextRoundIndex);
+        })().catch((err) => {
+            telemetry.warn('media.prewarm_upcoming_round_unhandled', {
+                lobbyCode,
+                sessionId: state.sessionId,
+                nextRoundIndex: index + 1,
+                error: err?.message || String(err)
+            });
+        });
     }
 
     async function finishGame(lobbyCode) {
@@ -247,19 +441,22 @@ function createRoundEngine(io, options = {}) {
         const winner = scores.length > 0 ? scores[0] : null;
 
         await roundService.finishSession(state.sessionId);
-        try {
-            const summary = await deleteLobbyCache(lobbyCode);
-            telemetry.info('media.cache_lobby_deleted', {
-                lobbyCode,
-                sessionId: state.sessionId,
-                ...summary
-            });
-        } catch (err) {
-            telemetry.warn('media.cache_lobby_delete_failed', {
-                lobbyCode,
-                sessionId: state.sessionId,
-                error: err?.message || String(err)
-            });
+        if (typeof options.onSessionFinished === 'function') {
+            try {
+                await options.onSessionFinished({
+                    lobbyCode,
+                    sessionId: state.sessionId,
+                    finalScores: scores,
+                    winner,
+                    suddenDeathRounds: state.suddenDeathRounds
+                });
+            } catch (err) {
+                telemetry.warn('session.finish_callback_failed', {
+                    lobbyCode,
+                    sessionId: state.sessionId,
+                    error: err?.message || String(err)
+                });
+            }
         }
 
         io.to(lobbyCode).emit('game:finished', {
@@ -292,26 +489,28 @@ function createRoundEngine(io, options = {}) {
         if (!transitioned) return;
 
         const completedRound = state.currentRound;
-        evictCacheForMediaUrls([
-            completedRound?.solutionAudioUrl,
-            completedRound?.solutionVideoUrl
-        ]).then((summary) => {
-            telemetry.info('media.cache_evicted_after_round', {
-                lobbyCode,
-                sessionId: state.sessionId,
-                roundId: completedRound?.id || null,
-                index: completedRound?.index || null,
-                ...summary
+        if (shouldEvictCompletedRoundMedia()) {
+            evictCacheForMediaUrls([
+                completedRound?.solutionAudioUrl,
+                completedRound?.solutionVideoUrl
+            ]).then((summary) => {
+                telemetry.info('media.cache_evicted_after_round', {
+                    lobbyCode,
+                    sessionId: state.sessionId,
+                    roundId: completedRound?.id || null,
+                    index: completedRound?.index || null,
+                    ...summary
+                });
+            }).catch((err) => {
+                telemetry.warn('media.cache_evict_failed', {
+                    lobbyCode,
+                    sessionId: state.sessionId,
+                    roundId: completedRound?.id || null,
+                    index: completedRound?.index || null,
+                    error: err?.message || String(err)
+                });
             });
-        }).catch((err) => {
-            telemetry.warn('media.cache_evict_failed', {
-                lobbyCode,
-                sessionId: state.sessionId,
-                roundId: completedRound?.id || null,
-                index: completedRound?.index || null,
-                error: err?.message || String(err)
-            });
-        });
+        }
 
         const sessionSnapshot = await roundService.getSessionById(state.sessionId);
         if (sessionSnapshot?.lobby?.players) {
@@ -468,7 +667,8 @@ function createRoundEngine(io, options = {}) {
         const guesses = await roundService.getGuessesForRound(context.id);
         const readyUserIds = guesses.filter((guess) => guess.isReady).map((guess) => guess.userId);
         state.readyUserIds = new Set(readyUserIds);
-        const allReady = state.players.length > 0 && state.players.every((player) => state.readyUserIds.has(player.userId));
+        const requiredUserIds = getReadyRequiredUserIds(state.players);
+        const allReady = requiredUserIds.length > 0 && requiredUserIds.every((id) => state.readyUserIds.has(id));
 
         const baseRound = {
             roundId: context.id,
@@ -570,7 +770,7 @@ function createRoundEngine(io, options = {}) {
         if (!state) throw httpError(400, 'No active round session');
         if (state.phase !== 'GUESSING') throw httpError(400, 'Round is not currently in guessing phase');
 
-        const userIds = state.players.map((player) => player.userId);
+        const userIds = getReadyRequiredUserIds(state.players);
         if (!userIds.includes(userId)) {
             throw httpError(403, 'Player is not part of this session');
         }
@@ -595,9 +795,7 @@ function createRoundEngine(io, options = {}) {
             allReady
         });
 
-        if (allReady) {
-            await transitionToAnswersReveal(code, 'all_ready');
-        }
+        updateAllReadyTransition(state, allReady);
         telemetry.debug('round.ready_state_changed', {
             lobbyCode: code,
             sessionId: state.sessionId,
@@ -613,6 +811,38 @@ function createRoundEngine(io, options = {}) {
             readyUserIds,
             allReady
         };
+    }
+
+    async function syncLobbyPlayers(lobbyCode, players = []) {
+        const code = sanitizeLobbyCode(lobbyCode);
+        const state = stateByLobby.get(code);
+        if (!state) return;
+
+        state.players = Array.isArray(players) ? players : [];
+        const validUserIds = new Set(state.players
+            .filter((player) => Number.isInteger(player?.userId))
+            .map((player) => player.userId));
+
+        for (const memberUserId of [...state.readyUserIds]) {
+            if (!validUserIds.has(memberUserId)) {
+                state.readyUserIds.delete(memberUserId);
+            }
+        }
+
+        if (state.phase !== 'GUESSING' || !state.currentRound) return;
+
+        const requiredUserIds = getReadyRequiredUserIds(state.players);
+        const readyUserIds = [...state.readyUserIds];
+        const allReady = requiredUserIds.length > 0 && requiredUserIds.every((id) => state.readyUserIds.has(id));
+
+        io.to(code).emit('round:ready_state', {
+            lobbyCode: code,
+            roundId: state.currentRound.id,
+            readyUserIds,
+            allReady
+        });
+
+        updateAllReadyTransition(state, allReady);
     }
 
     async function recoverActiveSessions() {
@@ -697,6 +927,7 @@ function createRoundEngine(io, options = {}) {
 
         if (state.readyUserIds.has(userId)) {
             state.readyUserIds.delete(userId);
+            updateAllReadyTransition(state, false);
             io.to(code).emit('round:ready_state', {
                 lobbyCode: code,
                 roundId: state.currentRound?.id || null,
@@ -746,6 +977,7 @@ function createRoundEngine(io, options = {}) {
         beginSession,
         submitGuess,
         setReady,
+        syncLobbyPlayers,
         getSyncState,
         onPlayerDisconnected,
         hasActiveSession,

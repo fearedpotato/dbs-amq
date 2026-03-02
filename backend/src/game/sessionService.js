@@ -1,5 +1,6 @@
 const { httpError } = require('./errors');
 const prisma = require('../lib/prisma');
+const { MIN_SCORE_FILTER, MAX_SCORE_FILTER } = require('./constants');
 
 function assertSelectionModeAllowedForPlayerCount(selectionMode, playerCount) {
     if (playerCount <= 1 && selectionMode !== 'STANDARD') {
@@ -28,6 +29,10 @@ async function startSessionFromLobby(lobby) {
                 sourceMode: lobby.sourceMode,
                 selectionMode: lobby.selectionMode,
                 themeMode: lobby.themeMode,
+                animeScoreMin: Number.isInteger(lobby.animeScoreMin) ? lobby.animeScoreMin : MIN_SCORE_FILTER,
+                animeScoreMax: Number.isInteger(lobby.animeScoreMax) ? lobby.animeScoreMax : MAX_SCORE_FILTER,
+                playerScoreMin: Number.isInteger(lobby.playerScoreMin) ? lobby.playerScoreMin : MIN_SCORE_FILTER,
+                playerScoreMax: Number.isInteger(lobby.playerScoreMax) ? lobby.playerScoreMax : MAX_SCORE_FILTER,
                 startedAt: new Date()
             }
         });
@@ -51,6 +56,10 @@ async function startSessionFromLobby(lobby) {
         sourceMode: session.sourceMode,
         selectionMode: session.selectionMode,
         themeMode: session.themeMode,
+        animeScoreMin: Number.isInteger(session.animeScoreMin) ? session.animeScoreMin : MIN_SCORE_FILTER,
+        animeScoreMax: Number.isInteger(session.animeScoreMax) ? session.animeScoreMax : MAX_SCORE_FILTER,
+        playerScoreMin: Number.isInteger(session.playerScoreMin) ? session.playerScoreMin : MIN_SCORE_FILTER,
+        playerScoreMax: Number.isInteger(session.playerScoreMax) ? session.playerScoreMax : MAX_SCORE_FILTER,
         startedAt: session.startedAt
     };
 }

@@ -54,14 +54,28 @@ function normalizeUserIds(values) {
 }
 
 const DEFAULT_HOST_OFFLINE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_PREWARM_BLOCKING_START = false;
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseBoolean(value, fallback) {
+    if (typeof value === 'boolean') return value;
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return fallback;
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
+}
+
 function getHostOfflineTimeoutMs() {
     return parsePositiveInt(process.env.LOBBY_HOST_OFFLINE_TIMEOUT_MS, DEFAULT_HOST_OFFLINE_TIMEOUT_MS);
+}
+
+function shouldBlockStartOnFirstRoundPrewarm() {
+    return parseBoolean(process.env.MEDIA_PREWARM_BLOCKING_START, DEFAULT_PREWARM_BLOCKING_START);
 }
 
 function attachRealtime(httpServer, options = {}) {
@@ -182,6 +196,21 @@ function attachRealtime(httpServer, options = {}) {
             io.to(code).emit('lobby:terminated', {
                 lobbyCode: code,
                 reason
+            });
+        }
+
+        try {
+            const summary = await mediaProxyService.deleteLobbyCache(code);
+            telemetry.info('media.cache_lobby_deleted_on_terminate', {
+                lobbyCode: code,
+                reason,
+                ...summary
+            });
+        } catch (err) {
+            telemetry.warn('media.cache_lobby_delete_on_terminate_failed', {
+                lobbyCode: code,
+                reason,
+                error: err?.message || String(err)
             });
         }
 
@@ -390,6 +419,21 @@ function attachRealtime(httpServer, options = {}) {
                 streak,
                 roundIndex
             });
+        },
+        onSessionFinished: async ({ lobbyCode, sessionId, winner, finalScores }) => {
+            const code = normalizeLobbyCode(lobbyCode);
+            const lobby = await broadcastLobbyStateAndReady(code);
+            syncHostOfflineTimeoutFromLobby(lobby, code);
+            broadcastLobbyDirectoryChanged(io, {
+                reason: 'game_finished',
+                lobbyCode: code
+            });
+            telemetry.info('session.finish_state_broadcast', {
+                lobbyCode: code,
+                sessionId,
+                winnerUserId: winner?.userId || null,
+                scoreCount: Array.isArray(finalScores) ? finalScores.length : 0
+            });
         }
     });
 
@@ -505,6 +549,7 @@ function attachRealtime(httpServer, options = {}) {
                     { inviteToken: typeof payload.inviteToken === 'string' ? payload.inviteToken : null }
                 );
                 const lobby = await lobbyService.setPlayerConnection(code, userId, true);
+                await roundEngine.syncLobbyPlayers(code, lobby?.players || []);
 
                 const affectedPreviousLobbies = [...new Set([...removedLobbyCodes, ...staleSocketLobbies])];
                 for (const removedCode of affectedPreviousLobbies) {
@@ -513,8 +558,8 @@ function attachRealtime(httpServer, options = {}) {
                 }
                 for (const removedCode of affectedPreviousLobbies) {
                     removeWaitingReadyUser(removedCode, userId);
-                    await roundEngine.onPlayerDisconnected(removedCode, userId);
                     const previousLobby = await broadcastLobbyStateAndReady(removedCode);
+                    await roundEngine.syncLobbyPlayers(removedCode, previousLobby?.players || []);
                     syncHostOfflineTimeoutFromLobby(previousLobby, removedCode);
                 }
 
@@ -550,6 +595,18 @@ function attachRealtime(httpServer, options = {}) {
                 removeWaitingReadyUser(code, userId);
 
                 const lobby = await lobbyService.leaveLobby(code, userId);
+                await roundEngine.syncLobbyPlayers(code, lobby?.players || []);
+                const lobbyClosed = !lobby || lobby.status === 'CLOSED' || Number(lobby.playerCount || 0) <= 0;
+                if (lobbyClosed) {
+                    await terminateLobby(code, 'all_players_left', { alreadyClosed: true });
+                    telemetry.info('lobby.closed_after_last_leave', {
+                        lobbyCode: code,
+                        userId
+                    });
+                    if (typeof ack === 'function') ack({ ok: true, lobby: null, terminated: true });
+                    return;
+                }
+
                 if (lobby) {
                     io.to(code).emit('lobby:state', { lobby });
                     emitLobbyReadyState(code, (lobby.players || []).map((player) => player.userId));
@@ -683,7 +740,7 @@ function attachRealtime(httpServer, options = {}) {
                 }
 
                 removeWaitingReadyUser(code, targetUserId);
-                await roundEngine.onPlayerDisconnected(code, targetUserId);
+                await roundEngine.syncLobbyPlayers(code, result?.lobby?.players || []);
                 if (result.lobby) {
                     io.to(code).emit('lobby:state', { lobby: result.lobby });
                     emitLobbyReadyState(code, (result.lobby.players || []).map((player) => player.userId));
@@ -757,9 +814,13 @@ function attachRealtime(httpServer, options = {}) {
         });
 
         socket.on('game:start', async (payload = {}, ack) => {
+            let code = '';
+            let broadcastedStarting = false;
+            let session = null;
+            let sessionActivated = false;
             try {
                 await assertEventRateLimit(userId, 'game:start', { windowMs: 30_000, max: 6 });
-                const code = normalizeLobbyCode(payload.lobbyCode);
+                code = normalizeLobbyCode(payload.lobbyCode);
                 if (!code) throw httpError(400, 'Lobby code is required');
 
                 const lobby = await lobbyService.getLobbyByCode(code);
@@ -780,23 +841,35 @@ function attachRealtime(httpServer, options = {}) {
                     requestedByUserId: userId,
                     roundCount: lobby.roundCount
                 });
+                io.to(code).emit('game:starting', {
+                    lobbyCode: code,
+                    requestedByUserId: userId,
+                    at: Date.now()
+                });
+                broadcastedStarting = true;
 
-                const session = await sessionService.startSessionFromLobby(lobby);
+                session = await sessionService.startSessionFromLobby(lobby);
                 let updatedLobby;
                 let preloadManifest = [];
-                try {
-                    updatedLobby = await lobbyService.getLobbyByCode(code);
-                    await roundEngine.startSession({
-                        lobbyCode: code,
-                        session,
-                        lobby: updatedLobby,
-                        deferFirstRound: true
-                    });
-                    preloadManifest = await roundEngine.getSessionMediaManifest(session.id);
+                const blockOnFirstRoundPrewarm = shouldBlockStartOnFirstRoundPrewarm();
+                updatedLobby = await lobbyService.getLobbyByCode(code);
+                await roundEngine.startSession({
+                    lobbyCode: code,
+                    session,
+                    lobby: updatedLobby,
+                    deferFirstRound: true
+                });
+                preloadManifest = await roundEngine.getSessionMediaManifest(session.id);
+                if (blockOnFirstRoundPrewarm) {
                     await prewarmFirstRoundOrThrow(preloadManifest);
-                } catch (engineErr) {
-                    await sessionService.rollbackSessionStart(session.id);
-                    throw engineErr;
+                } else {
+                    prewarmFirstRoundOrThrow(preloadManifest).catch((err) => {
+                        telemetry.warn('media.prewarm_first_round_non_blocking_failed', {
+                            lobbyCode: code,
+                            sessionId: session.id,
+                            error: err?.message || String(err)
+                        });
+                    });
                 }
 
                 const requiredReadyUserIds = (updatedLobby?.players || [])
@@ -831,7 +904,11 @@ function attachRealtime(httpServer, options = {}) {
                     preloadManifestCount: preloadManifest.length
                 });
 
-                await beginSessionAfterPreload(code);
+                const started = await beginSessionAfterPreload(code);
+                if (!started) {
+                    throw httpError(500, 'Could not start the first round');
+                }
+                sessionActivated = true;
 
                 mediaProxyService.prewarmManifest(preloadManifest, {
                     roundLimit: 3,
@@ -846,6 +923,31 @@ function attachRealtime(httpServer, options = {}) {
 
                 if (typeof ack === 'function') ack({ ok: true, session });
             } catch (err) {
+                if (session?.id && !sessionActivated) {
+                    try {
+                        await sessionService.rollbackSessionStart(session.id);
+                        pendingPreloadByLobby.delete(code);
+                        await roundEngine.forceStopLobby(code, 'start_failed');
+                        const restoredLobby = await broadcastLobbyStateAndReady(code);
+                        syncHostOfflineTimeoutFromLobby(restoredLobby, code);
+                        broadcastLobbyDirectoryChanged(io, {
+                            reason: 'game_start_rolled_back',
+                            lobbyCode: code
+                        });
+                    } catch (rollbackErr) {
+                        telemetry.warn('session.rollback_after_start_failure_failed', {
+                            lobbyCode: code,
+                            sessionId: session.id,
+                            error: rollbackErr?.message || String(rollbackErr)
+                        });
+                    }
+                }
+                if (broadcastedStarting && code) {
+                    io.to(code).emit('game:start_cancelled', {
+                        lobbyCode: code,
+                        at: Date.now()
+                    });
+                }
                 emitSocketError(err, 'game_start_failed', ack);
             }
         });
@@ -974,9 +1076,9 @@ function attachRealtime(httpServer, options = {}) {
                         }
                     }
 
-                    await roundEngine.onPlayerDisconnected(code, userId);
                     removeWaitingReadyUser(code, userId);
                     const lobby = await lobbyService.setPlayerConnection(code, userId, false);
+                    await roundEngine.syncLobbyPlayers(code, lobby?.players || []);
                     await broadcastLobbyStateAndReady(code);
                     syncHostOfflineTimeoutFromLobby(lobby);
                     telemetry.info('lobby.player_disconnected', {

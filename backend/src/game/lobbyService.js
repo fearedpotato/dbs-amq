@@ -6,11 +6,14 @@ const {
     MIN_LOBBY_SIZE,
     SOURCE_MODES,
     SELECTION_MODES,
-    THEME_MODES
+    THEME_MODES,
+    MIN_SCORE_FILTER,
+    MAX_SCORE_FILTER
 } = require('./constants');
 const { httpError } = require('./errors');
 
 const kickedLobbyUsers = new Map();
+const leftInGameLobbyUsers = new Set();
 const DEFAULT_KICK_COOLDOWN_MS = 2 * 60 * 1000;
 
 function normalizeLobbyCode(code) {
@@ -18,6 +21,10 @@ function normalizeLobbyCode(code) {
 }
 
 function kickCooldownKey(code, userId) {
+    return `${normalizeLobbyCode(code)}:${userId}`;
+}
+
+function voluntaryLeaveKey(code, userId) {
     return `${normalizeLobbyCode(code)}:${userId}`;
 }
 
@@ -54,6 +61,42 @@ function clearKickCooldownsForLobby(code) {
     }
 }
 
+function setVoluntaryLeaveLock(code, userId) {
+    leftInGameLobbyUsers.add(voluntaryLeaveKey(code, userId));
+}
+
+function clearVoluntaryLeaveLock(code, userId) {
+    leftInGameLobbyUsers.delete(voluntaryLeaveKey(code, userId));
+}
+
+function clearVoluntaryLeaveLocksForLobby(code) {
+    const normalizedCode = normalizeLobbyCode(code);
+    for (const key of leftInGameLobbyUsers) {
+        if (key.startsWith(`${normalizedCode}:`)) {
+            leftInGameLobbyUsers.delete(key);
+        }
+    }
+}
+
+async function assertVoluntaryLeaveLockAllowsJoin(tx, lobby, userId) {
+    const key = voluntaryLeaveKey(lobby.code, userId);
+    if (!leftInGameLobbyUsers.has(key)) return;
+
+    const activeSession = await tx.gameSession.findFirst({
+        where: {
+            lobbyId: lobby.id,
+            status: 'IN_PROGRESS'
+        },
+        select: { id: true }
+    });
+    const isMatchInProgress = lobby.status === 'IN_GAME' || Boolean(activeSession);
+    if (isMatchInProgress) {
+        throw httpError(403, 'You left this lobby during the current match. Rejoin when the match ends');
+    }
+
+    leftInGameLobbyUsers.delete(key);
+}
+
 function assertKickCooldownAllowsJoin(code, userId) {
     const normalizedCode = normalizeLobbyCode(code);
     clearExpiredKickCooldownsForCode(normalizedCode);
@@ -71,6 +114,14 @@ function assertKickCooldownAllowsJoin(code, userId) {
 }
 
 function sanitizeLobbyConfig(input = {}) {
+    const clampScoreFilter = (value, fallback) => {
+        if (!Number.isFinite(value)) return fallback;
+        return Math.max(MIN_SCORE_FILTER, Math.min(MAX_SCORE_FILTER, value));
+    };
+    const rawAnimeScoreMin = Number.parseInt(input.animeScoreMin, 10);
+    const rawAnimeScoreMax = Number.parseInt(input.animeScoreMax, 10);
+    const rawPlayerScoreMin = Number.parseInt(input.playerScoreMin, 10);
+    const rawPlayerScoreMax = Number.parseInt(input.playerScoreMax, 10);
     const config = {
         name: typeof input.name === 'string' ? input.name.trim() : null,
         isPrivate: Boolean(input.isPrivate),
@@ -83,7 +134,11 @@ function sanitizeLobbyConfig(input = {}) {
         solutionRevealSeconds: Number.isInteger(input.solutionRevealSeconds) ? input.solutionRevealSeconds : 8,
         sourceMode: input.sourceMode || 'HYBRID',
         selectionMode: input.selectionMode || 'STANDARD',
-        themeMode: input.themeMode || 'MIXED'
+        themeMode: input.themeMode || 'MIXED',
+        animeScoreMin: clampScoreFilter(rawAnimeScoreMin, MIN_SCORE_FILTER),
+        animeScoreMax: clampScoreFilter(rawAnimeScoreMax, MAX_SCORE_FILTER),
+        playerScoreMin: clampScoreFilter(rawPlayerScoreMin, MIN_SCORE_FILTER),
+        playerScoreMax: clampScoreFilter(rawPlayerScoreMax, MAX_SCORE_FILTER)
     };
 
     if (config.name === '') config.name = null;
@@ -121,6 +176,12 @@ function sanitizeLobbyConfig(input = {}) {
     if (config.solutionRevealSeconds < 1 || config.solutionRevealSeconds > 60) {
         throw httpError(400, 'solutionRevealSeconds must be between 1 and 60');
     }
+    if (config.animeScoreMin > config.animeScoreMax) {
+        throw httpError(400, 'animeScoreMin cannot be greater than animeScoreMax');
+    }
+    if (config.playerScoreMin > config.playerScoreMax) {
+        throw httpError(400, 'playerScoreMin cannot be greater than playerScoreMax');
+    }
 
     // Balanced selection only makes sense when lobby can host more than one player.
     if (config.maxPlayers === 1 && config.selectionMode !== SELECTION_MODES[0]) {
@@ -156,6 +217,10 @@ function mapLobby(lobby) {
         sourceMode: lobby.sourceMode,
         selectionMode: lobby.selectionMode,
         themeMode: lobby.themeMode,
+        animeScoreMin: Number.isInteger(lobby.animeScoreMin) ? lobby.animeScoreMin : MIN_SCORE_FILTER,
+        animeScoreMax: Number.isInteger(lobby.animeScoreMax) ? lobby.animeScoreMax : MAX_SCORE_FILTER,
+        playerScoreMin: Number.isInteger(lobby.playerScoreMin) ? lobby.playerScoreMin : MIN_SCORE_FILTER,
+        playerScoreMax: Number.isInteger(lobby.playerScoreMax) ? lobby.playerScoreMax : MAX_SCORE_FILTER,
         createdAt: lobby.createdAt,
         updatedAt: lobby.updatedAt,
         host: lobby.host ? {
@@ -201,7 +266,22 @@ async function createLobby(hostUser, payload) {
     const lobby = await prisma.lobby.create({
         data: {
             code,
-            ...config,
+            name: config.name,
+            isPrivate: config.isPrivate,
+            minPlayers: config.minPlayers,
+            maxPlayers: config.maxPlayers,
+            roundCount: config.roundCount,
+            guessSeconds: config.guessSeconds,
+            sampleSeconds: config.sampleSeconds,
+            answersRevealSeconds: config.answersRevealSeconds,
+            solutionRevealSeconds: config.solutionRevealSeconds,
+            sourceMode: config.sourceMode,
+            selectionMode: config.selectionMode,
+            themeMode: config.themeMode,
+            animeScoreMin: config.animeScoreMin,
+            animeScoreMax: config.animeScoreMax,
+            playerScoreMin: config.playerScoreMin,
+            playerScoreMax: config.playerScoreMax,
             hostUserId: hostUser.id,
             players: {
                 create: {
@@ -253,6 +333,7 @@ async function joinLobby(code, user, displayName, options = {}) {
                 });
 
                 if (!lobby) throw httpError(404, 'Lobby not found');
+                await assertVoluntaryLeaveLockAllowsJoin(tx, lobby, user.id);
 
                 const existing = lobby.players.find((player) => player.userId === user.id);
                 if (existing) {
@@ -333,9 +414,15 @@ async function leaveLobby(code, userId, options = {}) {
     });
 
     if (!lobby) throw httpError(404, 'Lobby not found');
-    if (!force && lobby.status !== 'WAITING') {
-        throw httpError(400, 'Cannot leave lobby after game has started');
-    }
+
+    const activeSession = await prisma.gameSession.findFirst({
+        where: {
+            lobbyId: lobby.id,
+            status: 'IN_PROGRESS'
+        },
+        select: { id: true }
+    });
+    const isMatchInProgress = lobby.status === 'IN_GAME' || Boolean(activeSession);
 
     const leavingPlayer = lobby.players.find((player) => player.userId === userId);
     if (!leavingPlayer) {
@@ -353,11 +440,24 @@ async function leaveLobby(code, userId, options = {}) {
         });
 
         if (remainingPlayers.length === 0) {
+            if (isMatchInProgress) {
+                await tx.gameSession.updateMany({
+                    where: {
+                        lobbyId: lobby.id,
+                        status: 'IN_PROGRESS'
+                    },
+                    data: {
+                        status: 'CANCELLED',
+                        endedAt: new Date()
+                    }
+                });
+            }
             await tx.lobby.update({
                 where: { id: lobby.id },
                 data: { status: 'CLOSED' }
             });
             clearKickCooldownsForLobby(code);
+            clearVoluntaryLeaveLocksForLobby(code);
             return;
         }
 
@@ -368,6 +468,16 @@ async function leaveLobby(code, userId, options = {}) {
             });
         }
     });
+
+    if (!force) {
+        if (isMatchInProgress) {
+            setVoluntaryLeaveLock(code, userId);
+        } else {
+            clearVoluntaryLeaveLock(code, userId);
+        }
+    } else {
+        clearVoluntaryLeaveLock(code, userId);
+    }
 
     return getLobbyByCode(code);
 }
@@ -409,6 +519,7 @@ async function closeLobby(code, options = {}) {
     });
 
     clearKickCooldownsForLobby(normalizedCode);
+    clearVoluntaryLeaveLocksForLobby(normalizedCode);
     return getLobbyByCode(normalizedCode);
 }
 
@@ -564,7 +675,11 @@ async function updateLobbyConfig(code, actorUserId, patch = {}) {
             solutionRevealSeconds: config.solutionRevealSeconds,
             sourceMode: config.sourceMode,
             selectionMode: config.selectionMode,
-            themeMode: config.themeMode
+            themeMode: config.themeMode,
+            animeScoreMin: config.animeScoreMin,
+            animeScoreMax: config.animeScoreMax,
+            playerScoreMin: config.playerScoreMin,
+            playerScoreMax: config.playerScoreMax
         },
         include: {
             host: { select: { id: true, username: true, nickname: true } },
