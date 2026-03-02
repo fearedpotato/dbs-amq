@@ -212,7 +212,8 @@ Accepted config fields:
 
 Score-filter behavior:
 
-- `animeScore*` applies to all seed sources (`POPULAR`, `MAL_ONLY`, `HYBRID` fallback included).
+- In `POPULAR` source mode, both score filter ranges are ignored.
+- `animeScore*` applies to MAL seed selection (`MAL_ONLY`, and MAL portion of `HYBRID`).
 - `playerScore*` applies only to MAL-list sourced entries (`MAL_ONLY`, and MAL portion of `HYBRID`).
 - MAL overall anime score is bucketed by truncation before filtering (example: `7.21` and `7.89` are both treated as `7`).
 - If a user has not rated an anime in MAL (`list_status.score = 0`), that entry is excluded unless the full player-score range `1..10` is selected.

@@ -183,6 +183,26 @@ describe('mediaProxyService', () => {
         expect(fs.existsSync(created.dataPath)).toBe(false);
     });
 
+    test('removes empty scoped cache folder after evicting last media entry', async () => {
+        const payload = Buffer.from('demo-media-payload');
+        axios.get.mockResolvedValue({
+            headers: { 'content-type': 'audio/mpeg' },
+            data: Readable.from(payload)
+        });
+
+        const sourceUrl = 'https://cdn.example.com/solo-scope.mp3';
+        const created = await getOrCreateCacheEntry(sourceUrl, { lobbyCode: 'ALPHA1' });
+        const scopeDir = path.dirname(created.dataPath);
+        expect(fs.existsSync(scopeDir)).toBe(true);
+
+        const proxied = buildMediaProxyUrl(sourceUrl, { lobbyCode: 'ALPHA1' });
+        const eviction = await evictCacheForMediaUrl(proxied);
+
+        expect(eviction.removed).toBe(true);
+        expect(fs.existsSync(created.dataPath)).toBe(false);
+        expect(fs.existsSync(scopeDir)).toBe(false);
+    });
+
     test('blocks cache download when DNS resolves to private IP', async () => {
         dnsLookupMock.mockResolvedValueOnce([
             { address: '10.0.0.7', family: 4 }

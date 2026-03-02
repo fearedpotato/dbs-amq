@@ -590,10 +590,12 @@ async function buildRoundSeedPlan({ session, lobby }) {
     const selectionMode = String(session?.selectionMode || 'STANDARD');
     const scoreFilters = normalizeSessionScoreFilters(session);
     const playerIds = (lobby?.players || []).map((player) => player.userId);
+    const popularAnimeScoreMin = sourceMode === 'POPULAR' ? MIN_SCORE_FILTER : scoreFilters.animeScoreMin;
+    const popularAnimeScoreMax = sourceMode === 'POPULAR' ? MAX_SCORE_FILTER : scoreFilters.animeScoreMax;
     const popularCatalog = filterPopularCatalogByAnimeScore(
         shuffledCopy(POPULAR_CATALOG),
-        scoreFilters.animeScoreMin,
-        scoreFilters.animeScoreMax
+        popularAnimeScoreMin,
+        popularAnimeScoreMax
     );
 
     if (sourceMode === 'POPULAR') {

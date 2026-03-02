@@ -119,6 +119,7 @@ jest.mock('../../game/lobbyService', () => {
             lobby.status = status;
             return snapshot(lobby);
         },
+        setJoinAbuseCooldown: jest.fn(() => null),
         enforceSingleLobbyMembership: jest.fn(async (userId, options = {}) => {
             const exceptCode = options?.exceptCode ? String(options.exceptCode).toUpperCase() : null;
             const removedLobbyCodes = [];
@@ -531,6 +532,7 @@ jest.mock('../../game/mediaProxyService', () => ({
 const lobbyService = require('../../game/lobbyService');
 const sessionService = require('../../game/sessionService');
 const roundService = require('../../game/roundService');
+const rateLimiterStore = require('../../lib/rateLimiterStore');
 const { attachRealtime } = require('../socket');
 
 function emitWithAck(socket, event, payload) {
@@ -567,6 +569,8 @@ describe('socket integration', () => {
     });
 
     beforeEach(async () => {
+        process.env.LOBBY_DISCONNECT_GRACE_MS = '5';
+        rateLimiterStore.__resetRateLimiterStore();
         clients = [];
         lobbyService.__reset();
         sessionService.__reset();
@@ -582,6 +586,7 @@ describe('socket integration', () => {
     });
 
     afterEach(async () => {
+        delete process.env.LOBBY_DISCONNECT_GRACE_MS;
         for (const client of clients) {
             if (client.connected) client.disconnect();
         }

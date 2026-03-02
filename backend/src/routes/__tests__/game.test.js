@@ -158,12 +158,18 @@ describe('game routes', () => {
         expect(res.body.lobby.playerCount).toBe(1);
     });
 
-    test('POST /api/game/lobbies rejects balanced mode for single-player-only lobby', async () => {
+    test('POST /api/game/lobbies allows balanced mode for single-player-only lobby', async () => {
         prisma.user.findUnique.mockResolvedValue({
             id: 1,
             username: 'demo',
             nickname: 'Demo'
         });
+        prisma.lobby.findUnique.mockResolvedValueOnce(null);
+        prisma.lobby.create.mockResolvedValue(buildLobby({
+            code: 'A1B2C3',
+            maxPlayers: 1,
+            selectionMode: 'BALANCED_RELAXED'
+        }));
 
         const res = await request(createApp())
             .post('/api/game/lobbies')
@@ -173,8 +179,13 @@ describe('game routes', () => {
                 selectionMode: 'BALANCED_STRICT'
             });
 
-        expect(res.status).toBe(400);
-        expect(res.body.error).toBe('Balanced selection modes are not allowed for single-player only lobbies');
+        expect(res.status).toBe(201);
+        expect(prisma.lobby.create).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({
+                maxPlayers: 1,
+                selectionMode: 'BALANCED_RELAXED'
+            })
+        }));
     });
 
     test('POST /api/game/lobbies clamps score filters into 1..10 bounds', async () => {

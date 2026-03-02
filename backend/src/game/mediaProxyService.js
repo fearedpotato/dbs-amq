@@ -301,6 +301,22 @@ async function ensureCacheDir(lobbyCode = null) {
     await fs.promises.mkdir(path.join(getCacheDir(), resolveCacheScope(lobbyCode)), { recursive: true });
 }
 
+async function removeCacheDirIfEmpty(dirPath) {
+    const rootDir = path.resolve(getCacheDir());
+    const targetDir = path.resolve(String(dirPath || ''));
+    if (!targetDir || targetDir === rootDir) return false;
+    if (!(targetDir === rootDir || targetDir.startsWith(`${rootDir}${path.sep}`))) return false;
+
+    try {
+        const entries = await fs.promises.readdir(targetDir);
+        if (entries.length > 0) return false;
+        await fs.promises.rmdir(targetDir);
+        return true;
+    } catch (_err) {
+        return false;
+    }
+}
+
 async function readCacheMeta(metaPath) {
     try {
         const raw = await fs.promises.readFile(metaPath, 'utf8');
@@ -378,6 +394,7 @@ async function pruneCacheIfNeeded() {
         } catch (_err) {
             // If data file is missing, remove stale metadata.
             await fs.promises.unlink(metaPath).catch(() => {});
+            await removeCacheDirIfEmpty(path.dirname(metaPath));
         }
     }
 
@@ -388,6 +405,7 @@ async function pruneCacheIfNeeded() {
         if (totalBytes <= maxBytes) break;
         await fs.promises.unlink(item.dataPath).catch(() => {});
         await fs.promises.unlink(item.metaPath).catch(() => {});
+        await removeCacheDirIfEmpty(path.dirname(item.metaPath));
         totalBytes = Math.max(0, totalBytes - item.size);
     }
 }
@@ -609,7 +627,7 @@ async function evictCacheForMediaUrl(mediaUrl) {
     const sourceUrl = resolved.sourceUrl;
     const lobbyCode = normalizeLobbyCode(resolved.lobbyCode);
     const key = cacheKeyForUrl(sourceUrl);
-    const { dataPath, metaPath } = cachePaths(key, lobbyCode);
+    const { dataPath, metaPath, dir } = cachePaths(key, lobbyCode);
     let removed = false;
 
     try {
@@ -624,6 +642,10 @@ async function evictCacheForMediaUrl(mediaUrl) {
         removed = true;
     } catch (_err) {
         // Ignore missing files.
+    }
+
+    if (removed) {
+        await removeCacheDirIfEmpty(dir);
     }
 
     return {

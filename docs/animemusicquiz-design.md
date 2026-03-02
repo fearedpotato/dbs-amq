@@ -183,7 +183,8 @@ Excluded examples:
 
 Score-range filtering:
 
-- `animeScoreMin..animeScoreMax` applies to all planned seeds (MAL and popular fallback pools).
+- In `POPULAR` source mode, score filters are ignored.
+- `animeScoreMin..animeScoreMax` applies to MAL planned seeds (`MAL_ONLY`, and MAL portion of `HYBRID`).
 - `playerScoreMin..playerScoreMax` applies only to MAL-list sourced seeds.
 - Unrated MAL entries (`list_status.score = 0`) are excluded unless full player-score range `1..10` is selected.
 - MAL overall score (`node.mean`) is truncated to integer before applying `animeScore` filter (example: `7.21`, `7.89` -> `7`).

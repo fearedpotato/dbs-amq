@@ -6,6 +6,8 @@ const { buildMediaProxyUrl } = require('./mediaProxyService');
 const { POPULAR_CATALOG } = require('./catalog');
 const { buildRoundSeedPlan } = require('./malSelectionService');
 
+const INVISIBLE_WHITESPACE_REGEX = /[\u200B-\u200D\u2060\uFEFF]/gu;
+
 function buildSourceAssignments({ lobbyPlayers, roundCount, selectionMode }) {
     const playerIds = lobbyPlayers.map((player) => player.userId);
     if (playerIds.length === 0) return [];
@@ -460,18 +462,27 @@ async function compareAndSetRoundStatus(roundId, expectedStatus, data) {
 }
 
 async function submitGuess({ roundId, userId, guessText, guessAnimeId }) {
+    const normalizedGuessText = String(guessText || '')
+        .normalize('NFKC')
+        .replace(INVISIBLE_WHITESPACE_REGEX, '')
+        .trim();
+    const parsedGuessAnimeId = Number.parseInt(guessAnimeId, 10);
+    const normalizedGuessAnimeId = Number.isInteger(parsedGuessAnimeId) && parsedGuessAnimeId > 0
+        ? parsedGuessAnimeId
+        : null;
+
     return prisma.roundGuess.upsert({
         where: { roundId_userId: { roundId, userId } },
         create: {
             roundId,
             userId,
-            guessText: guessText || null,
-            guessAnimeId: Number.isInteger(guessAnimeId) ? guessAnimeId : null,
+            guessText: normalizedGuessText || null,
+            guessAnimeId: normalizedGuessAnimeId,
             isReady: false
         },
         update: {
-            guessText: guessText || null,
-            guessAnimeId: Number.isInteger(guessAnimeId) ? guessAnimeId : null,
+            guessText: normalizedGuessText || null,
+            guessAnimeId: normalizedGuessAnimeId,
             submittedAt: new Date(),
             isReady: false
         }

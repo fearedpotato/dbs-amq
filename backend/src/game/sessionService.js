@@ -2,14 +2,22 @@ const { httpError } = require('./errors');
 const prisma = require('../lib/prisma');
 const { MIN_SCORE_FILTER, MAX_SCORE_FILTER } = require('./constants');
 
+function normalizeSelectionMode(value) {
+    const raw = String(value || '').trim().toUpperCase();
+    if (raw === 'BALANCED_STRICT') return 'BALANCED_RELAXED';
+    return raw || 'STANDARD';
+}
+
 function assertSelectionModeAllowedForPlayerCount(selectionMode, playerCount) {
     if (playerCount <= 1 && selectionMode !== 'STANDARD') {
-        throw httpError(400, 'Balanced selection modes require at least 2 players');
+        return 'STANDARD';
     }
+    return selectionMode;
 }
 
 async function startSessionFromLobby(lobby) {
-    assertSelectionModeAllowedForPlayerCount(lobby.selectionMode, lobby.playerCount);
+    const normalizedSelectionMode = normalizeSelectionMode(lobby.selectionMode);
+    const selectionMode = assertSelectionModeAllowedForPlayerCount(normalizedSelectionMode, lobby.playerCount);
 
     if (lobby.playerCount < lobby.minPlayers) {
         throw httpError(400, 'Not enough players to start');
@@ -27,7 +35,7 @@ async function startSessionFromLobby(lobby) {
                 answersRevealSeconds: lobby.answersRevealSeconds,
                 solutionRevealSeconds: lobby.solutionRevealSeconds,
                 sourceMode: lobby.sourceMode,
-                selectionMode: lobby.selectionMode,
+                selectionMode,
                 themeMode: lobby.themeMode,
                 animeScoreMin: Number.isInteger(lobby.animeScoreMin) ? lobby.animeScoreMin : MIN_SCORE_FILTER,
                 animeScoreMax: Number.isInteger(lobby.animeScoreMax) ? lobby.animeScoreMax : MAX_SCORE_FILTER,
@@ -54,7 +62,7 @@ async function startSessionFromLobby(lobby) {
         answersRevealSeconds: session.answersRevealSeconds,
         solutionRevealSeconds: session.solutionRevealSeconds,
         sourceMode: session.sourceMode,
-        selectionMode: session.selectionMode,
+        selectionMode: normalizeSelectionMode(session.selectionMode),
         themeMode: session.themeMode,
         animeScoreMin: Number.isInteger(session.animeScoreMin) ? session.animeScoreMin : MIN_SCORE_FILTER,
         animeScoreMax: Number.isInteger(session.animeScoreMax) ? session.animeScoreMax : MAX_SCORE_FILTER,

@@ -41,4 +41,16 @@ describe('scoringService', () => {
 
         expect(isCorrect).toBe(true);
     });
+
+    test('ignores leading whitespace and invisible spacing chars in text guesses', () => {
+        const isCorrect = isGuessCorrect({
+            guessAnimeId: null,
+            expectedAnimeId: 100,
+            acceptedAnimeIds: [100],
+            guessText: ' \u200BAttack on Titan ',
+            expectedTitle: 'Attack on Titan'
+        });
+
+        expect(isCorrect).toBe(true);
+    });
 });

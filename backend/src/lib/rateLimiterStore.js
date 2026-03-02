@@ -68,6 +68,12 @@ async function consumeRateLimitBucket(key, windowMs) {
     }
 }
 
+function resetRateLimiterStore() {
+    memoryStore.clear();
+    lastMemoryPruneAt = 0;
+}
+
 module.exports = {
-    consumeRateLimitBucket
+    consumeRateLimitBucket,
+    __resetRateLimiterStore: resetRateLimiterStore
 };

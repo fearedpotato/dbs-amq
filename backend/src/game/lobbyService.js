@@ -14,7 +14,10 @@ const { httpError } = require('./errors');
 
 const kickedLobbyUsers = new Map();
 const leftInGameLobbyUsers = new Set();
+const lobbyLastMatchResultByCode = new Map();
 const DEFAULT_KICK_COOLDOWN_MS = 2 * 60 * 1000;
+const LEGACY_BALANCED_STRICT = 'BALANCED_STRICT';
+const BALANCED_MODE = 'BALANCED_RELAXED';
 
 function normalizeLobbyCode(code) {
     return String(code || '').toUpperCase();
@@ -50,6 +53,10 @@ function setKickCooldown(code, userId, ttlMs = parseKickCooldownMs()) {
     const expiresAt = Date.now() + Math.max(1, Number.parseInt(ttlMs, 10) || DEFAULT_KICK_COOLDOWN_MS);
     kickedLobbyUsers.set(kickCooldownKey(normalizedCode, userId), expiresAt);
     return expiresAt;
+}
+
+function setJoinAbuseCooldown(code, userId, ttlMs = parseKickCooldownMs()) {
+    return setKickCooldown(code, userId, ttlMs);
 }
 
 function clearKickCooldownsForLobby(code) {
@@ -113,6 +120,73 @@ function assertKickCooldownAllowsJoin(code, userId) {
     throw httpError(403, `You were kicked from this lobby. Try again in ${remainingSec}s`);
 }
 
+function normalizeSelectionMode(value) {
+    const raw = String(value || '').trim().toUpperCase();
+    if (raw === LEGACY_BALANCED_STRICT) return BALANCED_MODE;
+    return raw;
+}
+
+function normalizeFinalScores(scores = []) {
+    if (!Array.isArray(scores)) return [];
+    return scores
+        .map((row) => ({
+            userId: Number.parseInt(row?.userId, 10),
+            displayName: String(row?.displayName || '').trim(),
+            score: Number.parseInt(row?.score, 10) || 0
+        }))
+        .filter((row) => Number.isInteger(row.userId) && row.userId > 0 && row.displayName.length > 0)
+        .sort((a, b) => b.score - a.score || a.displayName.localeCompare(b.displayName));
+}
+
+function setLobbyLastMatchResult(code, result = null) {
+    const normalizedCode = normalizeLobbyCode(code);
+    if (!normalizedCode) return;
+
+    if (!result || typeof result !== 'object') {
+        lobbyLastMatchResultByCode.delete(normalizedCode);
+        return;
+    }
+
+    const finalScores = normalizeFinalScores(result.finalScores);
+    if (finalScores.length === 0) {
+        lobbyLastMatchResultByCode.delete(normalizedCode);
+        return;
+    }
+
+    const winnerUserId = Number.parseInt(result?.winner?.userId, 10);
+    const winnerName = String(result?.winner?.displayName || '').trim();
+
+    lobbyLastMatchResultByCode.set(normalizedCode, {
+        winner: Number.isInteger(winnerUserId) && winnerUserId > 0
+            ? {
+                userId: winnerUserId,
+                displayName: winnerName || (finalScores.find((row) => row.userId === winnerUserId)?.displayName || '')
+            }
+            : {
+                userId: finalScores[0].userId,
+                displayName: finalScores[0].displayName
+            },
+        finalScores,
+        finishedAt: typeof result.finishedAt === 'string' && result.finishedAt.trim()
+            ? result.finishedAt
+            : new Date().toISOString()
+    });
+}
+
+function getLobbyLastMatchResult(code) {
+    const normalizedCode = normalizeLobbyCode(code);
+    if (!normalizedCode) return null;
+    const result = lobbyLastMatchResultByCode.get(normalizedCode);
+    if (!result) return null;
+    return {
+        winner: result.winner ? { ...result.winner } : null,
+        finalScores: Array.isArray(result.finalScores)
+            ? result.finalScores.map((row) => ({ ...row }))
+            : [],
+        finishedAt: result.finishedAt || null
+    };
+}
+
 function sanitizeLobbyConfig(input = {}) {
     const clampScoreFilter = (value, fallback) => {
         if (!Number.isFinite(value)) return fallback;
@@ -132,9 +206,9 @@ function sanitizeLobbyConfig(input = {}) {
         sampleSeconds: Number.isInteger(input.sampleSeconds) ? input.sampleSeconds : 10,
         answersRevealSeconds: Number.isInteger(input.answersRevealSeconds) ? input.answersRevealSeconds : 3,
         solutionRevealSeconds: Number.isInteger(input.solutionRevealSeconds) ? input.solutionRevealSeconds : 8,
-        sourceMode: input.sourceMode || 'HYBRID',
-        selectionMode: input.selectionMode || 'STANDARD',
-        themeMode: input.themeMode || 'MIXED',
+        sourceMode: input.sourceMode || 'MAL_ONLY',
+        selectionMode: normalizeSelectionMode(input.selectionMode || 'BALANCED_RELAXED'),
+        themeMode: input.themeMode || 'OP_ONLY',
         animeScoreMin: clampScoreFilter(rawAnimeScoreMin, MIN_SCORE_FILTER),
         animeScoreMax: clampScoreFilter(rawAnimeScoreMax, MAX_SCORE_FILTER),
         playerScoreMin: clampScoreFilter(rawPlayerScoreMin, MIN_SCORE_FILTER),
@@ -183,11 +257,6 @@ function sanitizeLobbyConfig(input = {}) {
         throw httpError(400, 'playerScoreMin cannot be greater than playerScoreMax');
     }
 
-    // Balanced selection only makes sense when lobby can host more than one player.
-    if (config.maxPlayers === 1 && config.selectionMode !== SELECTION_MODES[0]) {
-        throw httpError(400, 'Balanced selection modes are not allowed for single-player only lobbies');
-    }
-
     return config;
 }
 
@@ -197,10 +266,12 @@ function mapLobby(lobby) {
         id: player.id,
         userId: player.userId,
         displayName: player.displayName,
+        hasMalConnected: Boolean(player?.user?.malUsername),
         isConnected: player.isConnected,
         joinedAt: player.joinedAt
     }));
 
+    const selectionMode = normalizeSelectionMode(lobby.selectionMode);
     return {
         id: lobby.id,
         code: lobby.code,
@@ -215,7 +286,7 @@ function mapLobby(lobby) {
         answersRevealSeconds: lobby.answersRevealSeconds,
         solutionRevealSeconds: lobby.solutionRevealSeconds,
         sourceMode: lobby.sourceMode,
-        selectionMode: lobby.selectionMode,
+        selectionMode,
         themeMode: lobby.themeMode,
         animeScoreMin: Number.isInteger(lobby.animeScoreMin) ? lobby.animeScoreMin : MIN_SCORE_FILTER,
         animeScoreMax: Number.isInteger(lobby.animeScoreMax) ? lobby.animeScoreMax : MAX_SCORE_FILTER,
@@ -230,7 +301,8 @@ function mapLobby(lobby) {
         } : null,
         players,
         playerCount: players.length,
-        canStart: players.length >= lobby.minPlayers
+        canStart: players.length >= lobby.minPlayers,
+        lastMatchResult: getLobbyLastMatchResult(lobby.code)
     };
 }
 
@@ -292,7 +364,11 @@ async function createLobby(hostUser, payload) {
         },
         include: {
             host: { select: { id: true, username: true, nickname: true } },
-            players: true
+            players: {
+                include: {
+                    user: { select: { malUsername: true } }
+                }
+            }
         }
     });
 
@@ -304,7 +380,12 @@ async function getLobbyByCode(code) {
         where: { code },
         include: {
             host: { select: { id: true, username: true, nickname: true } },
-            players: { orderBy: { joinedAt: 'asc' } }
+            players: {
+                orderBy: { joinedAt: 'asc' },
+                include: {
+                    user: { select: { malUsername: true } }
+                }
+            }
         }
     });
 
@@ -406,6 +487,7 @@ async function setPlayerConnection(code, userId, isConnected) {
 
 async function leaveLobby(code, userId, options = {}) {
     const force = Boolean(options.force);
+    let lobbyClosed = false;
     const lobby = await prisma.lobby.findUnique({
         where: { code },
         include: {
@@ -456,8 +538,10 @@ async function leaveLobby(code, userId, options = {}) {
                 where: { id: lobby.id },
                 data: { status: 'CLOSED' }
             });
+            lobbyClosed = true;
             clearKickCooldownsForLobby(code);
             clearVoluntaryLeaveLocksForLobby(code);
+            lobbyLastMatchResultByCode.delete(normalizeLobbyCode(code));
             return;
         }
 
@@ -520,6 +604,7 @@ async function closeLobby(code, options = {}) {
 
     clearKickCooldownsForLobby(normalizedCode);
     clearVoluntaryLeaveLocksForLobby(normalizedCode);
+    lobbyLastMatchResultByCode.delete(normalizedCode);
     return getLobbyByCode(normalizedCode);
 }
 
@@ -528,7 +613,12 @@ async function resolveOfflineHostTimeout(code) {
     const lobby = await prisma.lobby.findUnique({
         where: { code: normalizedCode },
         include: {
-            players: { orderBy: { joinedAt: 'asc' } },
+            players: {
+                orderBy: { joinedAt: 'asc' },
+                include: {
+                    user: { select: { malUsername: true } }
+                }
+            },
             host: { select: { id: true, username: true, nickname: true } }
         }
     });
@@ -645,7 +735,11 @@ async function updateLobbyConfig(code, actorUserId, patch = {}) {
         where: { code },
         include: {
             host: { select: { id: true, username: true, nickname: true } },
-            players: true
+            players: {
+                include: {
+                    user: { select: { malUsername: true } }
+                }
+            }
         }
     });
 
@@ -683,7 +777,12 @@ async function updateLobbyConfig(code, actorUserId, patch = {}) {
         },
         include: {
             host: { select: { id: true, username: true, nickname: true } },
-            players: { orderBy: { joinedAt: 'asc' } }
+            players: {
+                orderBy: { joinedAt: 'asc' },
+                include: {
+                    user: { select: { malUsername: true } }
+                }
+            }
         }
     });
 
@@ -736,7 +835,11 @@ async function listJoinableLobbies({ q, limit = 20, offset = 0 }) {
         },
         include: {
             host: { select: { id: true, username: true, nickname: true } },
-            players: true
+            players: {
+                include: {
+                    user: { select: { malUsername: true } }
+                }
+            }
         },
         orderBy: { createdAt: 'desc' },
         skip: offset,
@@ -754,6 +857,8 @@ module.exports = {
     buildInviteLink,
     generateInviteToken,
     parseKickCooldownMs,
+    setJoinAbuseCooldown,
+    setLobbyLastMatchResult,
     createLobby,
     getLobbyByCode,
     joinLobby,

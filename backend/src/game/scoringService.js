@@ -1,5 +1,9 @@
+const INVISIBLE_WHITESPACE_REGEX = /[\u200B-\u200D\u2060\uFEFF]/gu;
+
 function normalizeGuess(value) {
-    return (value || '')
+    return String(value || '')
+        .normalize('NFKC')
+        .replace(INVISIBLE_WHITESPACE_REGEX, '')
         .toLowerCase()
         .trim()
         .replace(/[^\p{L}\p{N}\s]/gu, '')

@@ -125,9 +125,9 @@ router.get('/media/proxy', mediaProxyRateLimit, async (req, res) => {
 router.post('/lobbies', authMiddleware, async (req, res) => {
     try {
         const {
-            sourceMode = 'HYBRID',
-            selectionMode = 'STANDARD',
-            themeMode = 'MIXED'
+            sourceMode = 'MAL_ONLY',
+            selectionMode = 'BALANCED_RELAXED',
+            themeMode = 'OP_ONLY'
         } = req.body || {};
 
         assertEnum(sourceMode, SOURCE_MODES, 'sourceMode');

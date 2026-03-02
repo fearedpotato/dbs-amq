@@ -299,19 +299,22 @@ describe('malSelectionService.buildRoundSeedPlan', () => {
         expect(ids).toEqual([10, 20]);
     });
 
-    test('applies anime score filter in POPULAR mode', async () => {
+    test('POPULAR mode ignores score filters', async () => {
         const plan = await buildRoundSeedPlan({
             session: baseSession({
-                roundCount: 2,
+                roundCount: 10,
                 sourceMode: 'POPULAR',
                 selectionMode: 'STANDARD',
-                animeScoreMin: 9,
-                animeScoreMax: 10
+                animeScoreMin: 10,
+                animeScoreMax: 10,
+                playerScoreMin: 10,
+                playerScoreMax: 10
             }),
             lobby: baseLobby([1])
         });
 
-        expect(plan).toHaveLength(2);
+        expect(plan).toHaveLength(10);
+        expect(new Set(plan.map((item) => item.animeId)).size).toBe(10);
         expect(plan.every((item) => item.sourcePlayerId === null)).toBe(true);
     });
 

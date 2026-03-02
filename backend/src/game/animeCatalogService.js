@@ -305,6 +305,33 @@ async function searchCatalog(query, { limit = 10 } = {}) {
         .slice(0, resolvedLimit);
 }
 
+async function getCatalogTitleByMalId(malId) {
+    const parsedMalId = Number.parseInt(malId, 10);
+    if (!Number.isInteger(parsedMalId) || parsedMalId <= 0) return null;
+
+    try {
+        const rows = await prisma.$queryRaw`
+            SELECT
+                "title",
+                NULLIF("titleEnglish", '') AS "titleEnglish",
+                NULLIF("titleJapanese", '') AS "titleJapanese"
+            FROM "AnimeCatalogEntry"
+            WHERE "malId" = ${parsedMalId}
+            LIMIT 1;
+        `;
+        const row = Array.isArray(rows) ? rows[0] : null;
+        if (!row) return null;
+        return {
+            title: row.title ? String(row.title).trim() : null,
+            titleEnglish: row.titleEnglish ? String(row.titleEnglish).trim() : null,
+            titleJapanese: row.titleJapanese ? String(row.titleJapanese).trim() : null
+        };
+    } catch (_err) {
+        // Catalog table may be unavailable in some environments; treat as optional enrichment.
+        return null;
+    }
+}
+
 async function upsertCatalogEntries(rawRows = [], { source = 'unknown' } = {}) {
     const rows = (Array.isArray(rawRows) ? rawRows : []).map(toCatalogRow).filter(Boolean);
     if (rows.length === 0) {
@@ -572,6 +599,7 @@ async function syncCatalogFull(options = {}) {
 module.exports = {
     ensureCatalogTables,
     searchCatalog,
+    getCatalogTitleByMalId,
     upsertCatalogEntries,
     syncCatalogIncremental,
     syncCatalogFull

@@ -1,4 +1,5 @@
 const roundService = require('../game/roundService');
+const animeCatalogService = require('../game/animeCatalogService');
 const { httpError } = require('../game/errors');
 const {
     buildMediaProxyUrl,
@@ -11,6 +12,7 @@ const MAX_SUDDEN_DEATH_ROUNDS = 20;
 const DEFAULT_ZERO_CONNECTED_ROUNDS_TO_KILL = 3;
 const DEFAULT_EVICT_COMPLETED_ROUND_MEDIA = false;
 const ALL_READY_REVEAL_DELAY_MS = 1_000;
+const INVISIBLE_WHITESPACE_REGEX = /[\u200B-\u200D\u2060\uFEFF]/gu;
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
@@ -42,6 +44,29 @@ function shouldEvictCompletedRoundMedia() {
 
 function createRoundEngine(io, options = {}) {
     const stateByLobby = new Map();
+    const englishTitleByAnimeId = new Map();
+
+    async function getEnglishAnimeTitle(animeId) {
+        if (process.env.NODE_ENV === 'test') return null;
+
+        const parsedAnimeId = Number.parseInt(animeId, 10);
+        if (!Number.isInteger(parsedAnimeId) || parsedAnimeId <= 0) return null;
+
+        if (englishTitleByAnimeId.has(parsedAnimeId)) {
+            return englishTitleByAnimeId.get(parsedAnimeId);
+        }
+
+        let titleEnglish = null;
+        try {
+            const titleInfo = await animeCatalogService.getCatalogTitleByMalId(parsedAnimeId);
+            titleEnglish = titleInfo?.titleEnglish || null;
+        } catch (_err) {
+            titleEnglish = null;
+        }
+
+        englishTitleByAnimeId.set(parsedAnimeId, titleEnglish);
+        return titleEnglish;
+    }
 
     function getReadyRequiredUserIds(players = []) {
         const list = Array.isArray(players) ? players : [];
@@ -102,6 +127,19 @@ function createRoundEngine(io, options = {}) {
 
     function sanitizeLobbyCode(value) {
         return String(value || '').toUpperCase();
+    }
+
+    function sanitizeGuessText(value) {
+        return String(value || '')
+            .normalize('NFKC')
+            .replace(INVISIBLE_WHITESPACE_REGEX, '')
+            .trim();
+    }
+
+    function parseGuessAnimeId(value) {
+        const parsed = Number.parseInt(value, 10);
+        if (!Number.isInteger(parsed) || parsed <= 0) return null;
+        return parsed;
     }
 
     function buildState(lobbyCode, session, players) {
@@ -297,6 +335,7 @@ function createRoundEngine(io, options = {}) {
         if (!transitioned) return;
 
         state.phase = 'SOLUTION_REVEAL';
+        const animeTitleEnglish = await getEnglishAnimeTitle(state.currentRound.animeId);
         const scores = await roundService.getScoresForSession({
             sessionId: state.sessionId,
             lobbyPlayers: state.players
@@ -307,6 +346,7 @@ function createRoundEngine(io, options = {}) {
             correctAnime: {
                 animeId: state.currentRound.animeId,
                 animeTitle: state.currentRound.animeTitle,
+                animeTitleEnglish,
                 themeType: state.currentRound.themeType,
                 themeTitle: state.currentRound.themeTitle
             },
@@ -712,6 +752,7 @@ function createRoundEngine(io, options = {}) {
         }
 
         if (context.status === 'SOLUTION_REVEAL') {
+            const animeTitleEnglish = await getEnglishAnimeTitle(context.animeId);
             const scores = await roundService.getScoresForSession({
                 sessionId: state.sessionId,
                 lobbyPlayers: state.players
@@ -723,6 +764,7 @@ function createRoundEngine(io, options = {}) {
                 correctAnime: {
                     animeId: context.animeId,
                     animeTitle: context.animeTitle,
+                    animeTitleEnglish,
                     themeType: context.themeType,
                     themeTitle: context.themeTitle
                 },
@@ -755,8 +797,8 @@ function createRoundEngine(io, options = {}) {
         await roundService.submitGuess({
             roundId: state.currentRound.id,
             userId,
-            guessText: typeof payload.guessText === 'string' ? payload.guessText.trim() : '',
-            guessAnimeId: Number.isInteger(payload.guessAnimeId) ? payload.guessAnimeId : null
+            guessText: sanitizeGuessText(payload.guessText),
+            guessAnimeId: parseGuessAnimeId(payload.guessAnimeId)
         });
 
         return {

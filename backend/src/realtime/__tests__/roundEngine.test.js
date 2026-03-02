@@ -144,10 +144,15 @@ describe('round engine', () => {
         const submitted = await engine.submitGuess({
             lobbyCode: 'ABC123',
             userId: 1,
-            payload: { guessText: 'Anime 1' }
+            payload: { guessText: '  Anime 1  ', guessAnimeId: '501' }
         });
         expect(submitted.roundId).toBe(501);
-        expect(roundService.submitGuess).toHaveBeenCalled();
+        expect(roundService.submitGuess).toHaveBeenCalledWith(expect.objectContaining({
+            roundId: 501,
+            userId: 1,
+            guessText: 'Anime 1',
+            guessAnimeId: 501
+        }));
 
         await engine.setReady({ lobbyCode: 'ABC123', userId: 1, ready: true });
         await expect(engine.submitGuess({

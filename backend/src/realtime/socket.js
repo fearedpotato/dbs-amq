@@ -54,11 +54,20 @@ function normalizeUserIds(values) {
 }
 
 const DEFAULT_HOST_OFFLINE_TIMEOUT_MS = 5 * 60 * 1000;
-const DEFAULT_PREWARM_BLOCKING_START = false;
+const DEFAULT_PREWARM_BLOCKING_START = true;
+const DEFAULT_DISCONNECT_GRACE_MS = 1_200;
+const DEFAULT_LOBBY_JOIN_BURST_WINDOW_MS = 5_000;
+const DEFAULT_LOBBY_JOIN_BURST_MAX = 4;
+const DEFAULT_LOBBY_JOIN_BLOCK_MS = 15_000;
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeInt(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function parseBoolean(value, fallback) {
@@ -72,6 +81,22 @@ function parseBoolean(value, fallback) {
 
 function getHostOfflineTimeoutMs() {
     return parsePositiveInt(process.env.LOBBY_HOST_OFFLINE_TIMEOUT_MS, DEFAULT_HOST_OFFLINE_TIMEOUT_MS);
+}
+
+function getDisconnectGraceMs() {
+    return parseNonNegativeInt(process.env.LOBBY_DISCONNECT_GRACE_MS, DEFAULT_DISCONNECT_GRACE_MS);
+}
+
+function getLobbyJoinBurstWindowMs() {
+    return parsePositiveInt(process.env.LOBBY_JOIN_BURST_WINDOW_MS, DEFAULT_LOBBY_JOIN_BURST_WINDOW_MS);
+}
+
+function getLobbyJoinBurstMax() {
+    return parsePositiveInt(process.env.LOBBY_JOIN_BURST_MAX, DEFAULT_LOBBY_JOIN_BURST_MAX);
+}
+
+function getLobbyJoinBlockMs() {
+    return parseNonNegativeInt(process.env.LOBBY_JOIN_BLOCK_MS, DEFAULT_LOBBY_JOIN_BLOCK_MS);
 }
 
 function shouldBlockStartOnFirstRoundPrewarm() {
@@ -91,6 +116,8 @@ function attachRealtime(httpServer, options = {}) {
     const waitingReadyByLobby = new Map();
     const hostOfflineTimersByLobby = new Map();
     const socketIdsByUserId = new Map();
+    const pendingDisconnectCleanupTimersByKey = new Map();
+    const blockedLobbyJoinByUserId = new Map();
     const mediaStatusBroadcastEnabled = options.mediaStatusBroadcast !== false;
     let mediaStatusBroadcastTimer = null;
     let lastMediaSourceStatus = null;
@@ -154,6 +181,11 @@ function attachRealtime(httpServer, options = {}) {
             clearTimeout(timer);
         }
         hostOfflineTimersByLobby.clear();
+        for (const timer of pendingDisconnectCleanupTimersByKey.values()) {
+            clearTimeout(timer);
+        }
+        pendingDisconnectCleanupTimersByKey.clear();
+        blockedLobbyJoinByUserId.clear();
         return originalClose(...args);
     };
 
@@ -163,6 +195,129 @@ function attachRealtime(httpServer, options = {}) {
         if (!timer) return;
         clearTimeout(timer);
         hostOfflineTimersByLobby.delete(code);
+    }
+
+    function disconnectCleanupKey(lobbyCode, memberUserId) {
+        return `${normalizeLobbyCode(lobbyCode)}:${memberUserId}`;
+    }
+
+    function getLobbyJoinBlockRemainingMs(userId) {
+        const expiresAt = blockedLobbyJoinByUserId.get(userId);
+        if (!Number.isFinite(expiresAt)) return 0;
+        const remainingMs = expiresAt - Date.now();
+        if (remainingMs <= 0) {
+            blockedLobbyJoinByUserId.delete(userId);
+            return 0;
+        }
+        return remainingMs;
+    }
+
+    function assertLobbyJoinNotBlocked(userId) {
+        const remainingMs = getLobbyJoinBlockRemainingMs(userId);
+        if (remainingMs <= 0) return;
+        const remainingSec = Math.max(1, Math.ceil(remainingMs / 1000));
+        throw httpError(429, `Too many lobby reconnect attempts, try again in ${remainingSec}s`);
+    }
+
+    function setLobbyJoinBlocked(userId, lobbyCode = '', blockMs = getLobbyJoinBlockMs()) {
+        const ttlMs = Math.max(0, Number.parseInt(blockMs, 10) || 0);
+        if (ttlMs <= 0) return;
+        blockedLobbyJoinByUserId.set(userId, Date.now() + ttlMs);
+        const code = normalizeLobbyCode(lobbyCode);
+        if (code) {
+            lobbyService.setJoinAbuseCooldown(code, userId, ttlMs);
+        }
+    }
+
+    function waitMs(ms) {
+        return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+    }
+
+    function clearPendingDisconnectCleanup(lobbyCode, memberUserId) {
+        const key = disconnectCleanupKey(lobbyCode, memberUserId);
+        const timer = pendingDisconnectCleanupTimersByKey.get(key);
+        if (!timer) return;
+        clearTimeout(timer);
+        pendingDisconnectCleanupTimersByKey.delete(key);
+    }
+
+    function clearPendingDisconnectCleanupForLobby(lobbyCode) {
+        const prefix = `${normalizeLobbyCode(lobbyCode)}:`;
+        for (const [key, timer] of pendingDisconnectCleanupTimersByKey.entries()) {
+            if (!key.startsWith(prefix)) continue;
+            clearTimeout(timer);
+            pendingDisconnectCleanupTimersByKey.delete(key);
+        }
+    }
+
+    function userHasSocketInLobby(memberUserId, lobbyCode) {
+        const code = normalizeLobbyCode(lobbyCode);
+        const socketIds = socketIdsByUserId.get(memberUserId);
+        if (!socketIds || socketIds.size === 0) return false;
+
+        for (const socketId of socketIds) {
+            const memberSocket = io.sockets.sockets.get(socketId);
+            if (!memberSocket) continue;
+            if (memberSocket.data?.lobbies?.has?.(code)) return true;
+        }
+        return false;
+    }
+
+    async function runDisconnectCleanup(lobbyCode, memberUserId) {
+        const code = normalizeLobbyCode(lobbyCode);
+        if (!code || !Number.isInteger(memberUserId)) return;
+        if (userHasSocketInLobby(memberUserId, code)) return;
+
+        try {
+            const pending = pendingPreloadByLobby.get(code);
+            if (pending) {
+                pending.requiredReadyUserIds.delete(memberUserId);
+                pending.readyUserIds.delete(memberUserId);
+                const allReady = [...pending.requiredReadyUserIds].every((id) => pending.readyUserIds.has(id));
+                if (allReady) {
+                    await beginSessionAfterPreload(code);
+                }
+            }
+
+            removeWaitingReadyUser(code, memberUserId);
+            const lobby = await lobbyService.setPlayerConnection(code, memberUserId, false);
+            await roundEngine.syncLobbyPlayers(code, lobby?.players || []);
+            await broadcastLobbyStateAndReady(code);
+            syncHostOfflineTimeoutFromLobby(lobby);
+            telemetry.info('lobby.player_disconnected', {
+                lobbyCode: code,
+                userId: memberUserId
+            });
+        } catch (err) {
+            // Ignore disconnect cleanup errors; state will reconcile on reconnect.
+            telemetry.warn('lobby.disconnect_cleanup_failed', {
+                lobbyCode: code,
+                userId: memberUserId,
+                error: err?.message || String(err)
+            });
+        }
+    }
+
+    function scheduleDisconnectCleanup(lobbyCode, memberUserId) {
+        const code = normalizeLobbyCode(lobbyCode);
+        if (!code || !Number.isInteger(memberUserId)) return;
+        clearPendingDisconnectCleanup(code, memberUserId);
+
+        const delayMs = getDisconnectGraceMs();
+        if (delayMs <= 0) {
+            runDisconnectCleanup(code, memberUserId).catch(() => {});
+            return;
+        }
+
+        const key = disconnectCleanupKey(code, memberUserId);
+        const timer = setTimeout(() => {
+            pendingDisconnectCleanupTimersByKey.delete(key);
+            runDisconnectCleanup(code, memberUserId).catch(() => {});
+        }, delayMs);
+        if (typeof timer?.unref === 'function') {
+            timer.unref();
+        }
+        pendingDisconnectCleanupTimersByKey.set(key, timer);
     }
 
     async function removeUserFromLobbyRoom(lobbyCode, memberUserId) {
@@ -179,6 +334,72 @@ function attachRealtime(httpServer, options = {}) {
         }
     }
 
+    async function evictUserForJoinAbuse(lobbyCode, memberUserId) {
+        const code = normalizeLobbyCode(lobbyCode);
+        if (!code || !Number.isInteger(memberUserId)) return;
+
+        const targetSocketIds = socketIdsByUserId.get(memberUserId)
+            ? [...socketIdsByUserId.get(memberUserId)]
+            : [];
+        for (const socketId of targetSocketIds) {
+            const targetSocket = io.sockets.sockets.get(socketId);
+            if (!targetSocket) continue;
+            const wasInLobby = targetSocket.data?.lobbies?.has?.(code);
+            targetSocket.leave(code);
+            targetSocket.data?.lobbies?.delete?.(code);
+            if (wasInLobby) {
+                targetSocket.emit('lobby:kicked', {
+                    lobbyCode: code,
+                    kickedUserId: memberUserId,
+                    reason: 'join_abuse'
+                });
+            }
+        }
+
+        clearPendingDisconnectCleanup(code, memberUserId);
+        removeWaitingReadyUser(code, memberUserId);
+
+        let lobby = null;
+        for (let attempt = 1; attempt <= 6; attempt += 1) {
+            lobby = await lobbyService.leaveLobby(code, memberUserId, { force: true });
+            const stillPresent = Boolean(
+                lobby
+                && Array.isArray(lobby.players)
+                && lobby.players.some((player) => player.userId === memberUserId)
+            );
+            if (!stillPresent) break;
+            telemetry.warn('lobby.join_abuse_eviction_retry', {
+                lobbyCode: code,
+                userId: memberUserId,
+                attempt
+            });
+            await waitMs(25);
+        }
+        await roundEngine.syncLobbyPlayers(code, lobby?.players || []);
+        const lobbyClosed = !lobby || lobby.status === 'CLOSED' || Number(lobby.playerCount || 0) <= 0;
+        if (lobbyClosed) {
+            await terminateLobby(code, 'abuse_kick', { alreadyClosed: true });
+            telemetry.info('lobby.closed_after_join_abuse_kick', {
+                lobbyCode: code,
+                userId: memberUserId
+            });
+            return;
+        }
+
+        io.to(code).emit('lobby:state', { lobby });
+        emitLobbyReadyState(code, (lobby.players || []).map((player) => player.userId));
+        syncHostOfflineTimeoutFromLobby(lobby, code);
+        broadcastLobbyDirectoryChanged(io, {
+            reason: 'abuse_kick',
+            lobbyCode: code
+        });
+        telemetry.info('lobby.player_evicted_join_abuse', {
+            lobbyCode: code,
+            userId: memberUserId,
+            remainingPlayers: lobby?.playerCount || null
+        });
+    }
+
     async function terminateLobby(lobbyCode, reason, options = {}) {
         const code = normalizeLobbyCode(lobbyCode);
         const alreadyClosed = options.alreadyClosed === true;
@@ -186,6 +407,7 @@ function attachRealtime(httpServer, options = {}) {
         clearHostOfflineTimer(code);
         pendingPreloadByLobby.delete(code);
         clearWaitingReady(code);
+        clearPendingDisconnectCleanupForLobby(code);
 
         if (!alreadyClosed) {
             await lobbyService.closeLobby(code, { cancelActiveSession: true });
@@ -422,6 +644,11 @@ function attachRealtime(httpServer, options = {}) {
         },
         onSessionFinished: async ({ lobbyCode, sessionId, winner, finalScores }) => {
             const code = normalizeLobbyCode(lobbyCode);
+            lobbyService.setLobbyLastMatchResult(code, {
+                winner: winner || null,
+                finalScores: Array.isArray(finalScores) ? finalScores : [],
+                finishedAt: new Date().toISOString()
+            });
             const lobby = await broadcastLobbyStateAndReady(code);
             syncHostOfflineTimeoutFromLobby(lobby, code);
             broadcastLobbyDirectoryChanged(io, {
@@ -442,6 +669,27 @@ function attachRealtime(httpServer, options = {}) {
         const bucket = await consumeRateLimitBucket(`socket:${key}`, windowMs);
         if (bucket.count > max) {
             throw httpError(429, 'Too many realtime actions, slow down');
+        }
+    }
+
+    async function assertLobbyJoinBurstRateLimit(userId, lobbyCode) {
+        if (
+            process.env.NODE_ENV === 'test'
+            && process.env.LOBBY_JOIN_BURST_MAX == null
+            && process.env.LOBBY_JOIN_BURST_WINDOW_MS == null
+        ) {
+            return;
+        }
+
+        const code = normalizeLobbyCode(lobbyCode);
+        const windowMs = getLobbyJoinBurstWindowMs();
+        const max = getLobbyJoinBurstMax();
+        const bucket = await consumeRateLimitBucket(`socket:${userId}:lobby_join:${code}`, windowMs);
+        if (bucket.count > max) {
+            setLobbyJoinBlocked(userId, code);
+            const err = httpError(429, 'Too many lobby reconnect attempts, please wait a moment');
+            err.joinBurstAbuse = true;
+            throw err;
         }
     }
 
@@ -478,6 +726,9 @@ function attachRealtime(httpServer, options = {}) {
                 return next(new Error('Unauthorized'));
             }
             const decoded = verifyAuthToken(token);
+            if (getLobbyJoinBlockRemainingMs(decoded.userId) > 0) {
+                return next(new Error('Rate limited'));
+            }
             socket.data.user = { userId: decoded.userId, username: decoded.username };
             socket.data.lobbies = new Set();
             return next();
@@ -510,7 +761,13 @@ function attachRealtime(httpServer, options = {}) {
 
         const emitSocketError = (err, fallbackCode, ack) => {
             const payload = toErrorPayload(err, fallbackCode);
-            if (Number.isInteger(err?.status) && err.status < 500) {
+            if (Number.isInteger(err?.status) && err.status === 429) {
+                telemetry.debug('socket.event_rate_limited', {
+                    fallbackCode,
+                    payload,
+                    userId
+                });
+            } else if (Number.isInteger(err?.status) && err.status < 500) {
                 telemetry.warn('socket.event_failed', {
                     fallbackCode,
                     payload,
@@ -530,10 +787,14 @@ function attachRealtime(httpServer, options = {}) {
         };
 
         socket.on('lobby:join', async (payload = {}, ack) => {
+            let code = '';
             try {
-                await assertEventRateLimit(userId, 'lobby:join', { windowMs: 10_000, max: 20 });
-                const code = normalizeLobbyCode(payload.lobbyCode);
+                code = normalizeLobbyCode(payload.lobbyCode);
                 if (!code) throw httpError(400, 'Lobby code is required');
+                assertLobbyJoinNotBlocked(userId);
+                await assertEventRateLimit(userId, 'lobby:join', { windowMs: 10_000, max: 20 });
+                await assertLobbyJoinBurstRateLimit(userId, code);
+                clearPendingDisconnectCleanup(code, userId);
 
                 const staleSocketLobbies = [...socket.data.lobbies].filter((joinedCode) => joinedCode !== code);
                 for (const staleCode of staleSocketLobbies) {
@@ -548,6 +809,8 @@ function attachRealtime(httpServer, options = {}) {
                     payload.displayName,
                     { inviteToken: typeof payload.inviteToken === 'string' ? payload.inviteToken : null }
                 );
+                // Handle concurrent in-flight joins that started before abuse-block was set.
+                assertLobbyJoinNotBlocked(userId);
                 const lobby = await lobbyService.setPlayerConnection(code, userId, true);
                 await roundEngine.syncLobbyPlayers(code, lobby?.players || []);
 
@@ -580,6 +843,17 @@ function attachRealtime(httpServer, options = {}) {
 
                 if (typeof ack === 'function') ack({ ok: true, lobby });
             } catch (err) {
+                if ((err?.joinBurstAbuse || (err?.status === 429 && code && getLobbyJoinBlockRemainingMs(userId) > 0)) && code) {
+                    try {
+                        await evictUserForJoinAbuse(code, userId);
+                    } catch (evictErr) {
+                        telemetry.warn('lobby.join_abuse_eviction_failed', {
+                            lobbyCode: code,
+                            userId,
+                            error: evictErr?.message || String(evictErr)
+                        });
+                    }
+                }
                 emitSocketError(err, 'lobby_join_failed', ack);
             }
         });
@@ -589,6 +863,7 @@ function attachRealtime(httpServer, options = {}) {
                 await assertEventRateLimit(userId, 'lobby:leave', { windowMs: 10_000, max: 20 });
                 const code = normalizeLobbyCode(payload.lobbyCode);
                 if (!code) throw httpError(400, 'Lobby code is required');
+                clearPendingDisconnectCleanup(code, userId);
 
                 socket.leave(code);
                 socket.data.lobbies.delete(code);
@@ -1065,34 +1340,7 @@ function attachRealtime(httpServer, options = {}) {
                 return;
             }
             for (const code of socket.data.lobbies) {
-                try {
-                    const pending = pendingPreloadByLobby.get(code);
-                    if (pending) {
-                        pending.requiredReadyUserIds.delete(userId);
-                        pending.readyUserIds.delete(userId);
-                        const allReady = [...pending.requiredReadyUserIds].every((id) => pending.readyUserIds.has(id));
-                        if (allReady) {
-                            await beginSessionAfterPreload(code);
-                        }
-                    }
-
-                    removeWaitingReadyUser(code, userId);
-                    const lobby = await lobbyService.setPlayerConnection(code, userId, false);
-                    await roundEngine.syncLobbyPlayers(code, lobby?.players || []);
-                    await broadcastLobbyStateAndReady(code);
-                    syncHostOfflineTimeoutFromLobby(lobby);
-                    telemetry.info('lobby.player_disconnected', {
-                        lobbyCode: code,
-                        userId
-                    });
-                } catch (err) {
-                    // Ignore disconnect cleanup errors; state will reconcile on reconnect.
-                    telemetry.warn('lobby.disconnect_cleanup_failed', {
-                        lobbyCode: code,
-                        userId,
-                        error: err?.message || String(err)
-                    });
-                }
+                scheduleDisconnectCleanup(code, userId);
             }
         });
     });

@@ -6,6 +6,7 @@ const { io: Client } = require('socket.io-client');
 jest.mock('../../game/lobbyService', () => ({
     enforceSingleLobbyMembership: jest.fn().mockResolvedValue({ removedLobbyCodes: [] }),
     joinLobby: jest.fn(),
+    setJoinAbuseCooldown: jest.fn(),
     setPlayerConnection: jest.fn(),
     getLobbyByCode: jest.fn(),
     leaveLobby: jest.fn(),
@@ -40,6 +41,7 @@ const sessionService = require('../../game/sessionService');
 const mediaProxyService = require('../../game/mediaProxyService');
 const { createRoundEngine } = require('../roundEngine');
 const { attachRealtime } = require('../socket');
+const rateLimiterStore = require('../../lib/rateLimiterStore');
 
 function buildLobby({ code = 'ABC123', hostId = 1, playerIds = [1, 2] } = {}) {
     return {
@@ -85,6 +87,8 @@ describe('socket gateway', () => {
 
     beforeEach(async () => {
         delete process.env.MEDIA_PREWARM_BLOCKING_START;
+        process.env.LOBBY_DISCONNECT_GRACE_MS = '5';
+        rateLimiterStore.__resetRateLimiterStore();
         clients = [];
         const app = express();
         server = http.createServer(app);
@@ -116,6 +120,9 @@ describe('socket gateway', () => {
 
     afterEach(async () => {
         delete process.env.MEDIA_PREWARM_BLOCKING_START;
+        delete process.env.LOBBY_DISCONNECT_GRACE_MS;
+        delete process.env.LOBBY_JOIN_BURST_WINDOW_MS;
+        delete process.env.LOBBY_JOIN_BURST_MAX;
         for (const client of clients) {
             if (client.connected) client.disconnect();
         }
@@ -352,6 +359,51 @@ describe('socket gateway', () => {
         expect(lobbyService.setPlayerConnection).toHaveBeenCalledWith('ABC123', 1, false);
     });
 
+    test('cancels disconnect cleanup when user quickly rejoins after refresh', async () => {
+        process.env.LOBBY_DISCONNECT_GRACE_MS = '100';
+        const lobby = buildLobby({ code: 'ABC123', playerIds: [1] });
+        lobbyService.joinLobby.mockResolvedValue(lobby);
+        lobbyService.setPlayerConnection.mockResolvedValue(lobby);
+        lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+
+        const first = await connectClient({ userId: 1, username: 'u1' });
+        await emitWithAck(first, 'lobby:join', { lobbyCode: 'ABC123' });
+        first.disconnect();
+
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const second = await connectClient({ userId: 1, username: 'u1' });
+        await emitWithAck(second, 'lobby:join', { lobbyCode: 'ABC123' });
+        await new Promise((resolve) => setTimeout(resolve, 140));
+
+        const disconnectCalls = lobbyService.setPlayerConnection.mock.calls
+            .filter((call) => call[0] === 'ABC123' && call[1] === 1 && call[2] === false);
+        expect(disconnectCalls).toHaveLength(0);
+    });
+
+    test('rate limits repeated lobby joins for same user and lobby', async () => {
+        process.env.LOBBY_JOIN_BURST_WINDOW_MS = '5000';
+        process.env.LOBBY_JOIN_BURST_MAX = '3';
+
+        const lobby = buildLobby({ code: 'ABC123', playerIds: [1, 2] });
+        const lobbyAfterEviction = buildLobby({ code: 'ABC123', playerIds: [2], hostId: 2 });
+        lobbyService.joinLobby.mockResolvedValue(lobby);
+        lobbyService.setPlayerConnection.mockResolvedValue(lobby);
+        lobbyService.getLobbyByCode.mockResolvedValue(lobby);
+        lobbyService.leaveLobby.mockResolvedValue(lobbyAfterEviction);
+
+        const client = await connectClient({ userId: 1, username: 'u1' });
+        expect((await emitWithAck(client, 'lobby:join', { lobbyCode: 'ABC123' })).ok).toBe(true);
+        expect((await emitWithAck(client, 'lobby:join', { lobbyCode: 'ABC123' })).ok).toBe(true);
+        expect((await emitWithAck(client, 'lobby:join', { lobbyCode: 'ABC123' })).ok).toBe(true);
+
+        const denied = await emitWithAck(client, 'lobby:join', { lobbyCode: 'ABC123' });
+        expect(denied.ok).toBe(false);
+        expect(denied.code).toBe('rate_limited');
+        expect(String(denied.error || '').toLowerCase()).toContain('reconnect');
+        expect(lobbyService.setJoinAbuseCooldown).toHaveBeenCalledWith('ABC123', 1, expect.any(Number));
+        expect(lobbyService.leaveLobby).toHaveBeenCalledWith('ABC123', 1, { force: true });
+    });
+
     test('terminates lobby when last player leaves and clears cache', async () => {
         const activeLobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1] });
         const closedLobby = {
@@ -403,6 +455,8 @@ describe('socket gateway', () => {
     });
 
     test('does not fail game start when first media warmup cannot cache any media in non-blocking mode', async () => {
+        process.env.MEDIA_PREWARM_BLOCKING_START = 'false';
+
         const lobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1] });
         const session = { id: 51, roundCount: 1 };
         lobbyService.getLobbyByCode.mockResolvedValue(lobby);

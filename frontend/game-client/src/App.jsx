@@ -3,7 +3,7 @@ import { apiFetch, getAuthToken, redirectToLogin } from './apiClient';
 import { closeGameSocket, getGameSocket } from './socketClient';
 
 const SOURCE_MODES = ['POPULAR', 'MAL_ONLY', 'HYBRID'];
-const SELECTION_MODES = ['STANDARD', 'BALANCED_STRICT', 'BALANCED_RELAXED'];
+const SELECTION_MODES = ['STANDARD', 'BALANCED_RELAXED'];
 const THEME_MODES = ['OP_ONLY', 'ED_ONLY', 'MIXED'];
 const SOURCE_MODE_COPY = {
     POPULAR: {
@@ -24,12 +24,8 @@ const SELECTION_MODE_COPY = {
         label: 'Standard',
         help: 'Simple rotation; no strict player balancing.'
     },
-    BALANCED_STRICT: {
-        label: 'Balanced Strict',
-        help: 'Equal per-player distribution; can fail if MAL pools are too small.'
-    },
     BALANCED_RELAXED: {
-        label: 'Balanced Relaxed',
+        label: 'Balanced',
         help: 'Try to balance players, then relax constraints when needed.'
     }
 };
@@ -50,6 +46,7 @@ const THEME_MODE_COPY = {
 const INITIAL_REQUIRED_ROUNDS = 2;
 const PRELOAD_WINDOW_ROUNDS = 3; // current round + next 2
 const MAX_CONCURRENT_PRELOADS = 2;
+const SCORE_RANGE_TICKS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 const CREATE_DEFAULTS = {
     name: '',
@@ -57,9 +54,9 @@ const CREATE_DEFAULTS = {
     maxPlayers: 8,
     roundCount: 10,
     guessSeconds: 20,
-    sourceMode: 'HYBRID',
-    selectionMode: 'STANDARD',
-    themeMode: 'MIXED',
+    sourceMode: 'MAL_ONLY',
+    selectionMode: 'BALANCED_RELAXED',
+    themeMode: 'OP_ONLY',
     animeScoreMin: 1,
     animeScoreMax: 10,
     playerScoreMin: 1,
@@ -187,10 +184,74 @@ function ScoreRangeSlider({
     onMaxChange,
     hint = ''
 }) {
+    const railRef = useRef(null);
     const clampedMin = clampInteger(minValue, 1, 10);
     const clampedMax = clampInteger(maxValue, 1, 10);
     const startPercent = ((clampedMin - 1) / 9) * 100;
     const endPercent = ((clampedMax - 1) / 9) * 100;
+    const selectedWidthPercent = Math.max(0, endPercent - startPercent);
+    const minRef = useRef(clampedMin);
+    const maxRef = useRef(clampedMax);
+
+    useEffect(() => {
+        minRef.current = clampedMin;
+        maxRef.current = clampedMax;
+    }, [clampedMax, clampedMin]);
+
+    const valueFromClientX = useCallback((clientX) => {
+        const rail = railRef.current;
+        if (!rail) return null;
+        const rect = rail.getBoundingClientRect();
+        if (!Number.isFinite(rect.width) || rect.width <= 0) return null;
+
+        const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+        return Math.max(1, Math.min(10, Math.round(ratio * 9) + 1));
+    }, []);
+
+    const applyBoundaryValue = useCallback((boundary, rawValue) => {
+        const next = clampInteger(rawValue, 1, 10);
+        if (boundary === 'min') {
+            const resolved = Math.min(next, maxRef.current);
+            minRef.current = resolved;
+            onMinChange(String(resolved));
+            return;
+        }
+        const resolved = Math.max(next, minRef.current);
+        maxRef.current = resolved;
+        onMaxChange(String(resolved));
+    }, [onMaxChange, onMinChange]);
+
+    const startBoundaryDrag = useCallback((boundary, event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        const initial = valueFromClientX(event.clientX);
+        if (initial != null) {
+            applyBoundaryValue(boundary, initial);
+        }
+
+        const onMove = (moveEvent) => {
+            const next = valueFromClientX(moveEvent.clientX);
+            if (next == null) return;
+            applyBoundaryValue(boundary, next);
+        };
+        const onUp = () => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+        };
+
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+    }, [applyBoundaryValue, valueFromClientX]);
+
+    const handleRailPointerDown = useCallback((event) => {
+        if (event.button !== 0) return;
+        const next = valueFromClientX(event.clientX);
+        if (next == null) return;
+        const toMin = Math.abs(next - minRef.current);
+        const toMax = Math.abs(next - maxRef.current);
+        const boundary = toMin <= toMax ? 'min' : 'max';
+        startBoundaryDrag(boundary, event);
+    }, [startBoundaryDrag, valueFromClientX]);
 
     return (
         <div className="gmq-field-card gmq-score-range-card">
@@ -205,28 +266,43 @@ function ScoreRangeSlider({
                     '--range-end': `${endPercent}%`
                 }}
             >
-                <input
-                    type="range"
-                    min="1"
-                    max="10"
-                    step="1"
-                    value={clampedMin}
-                    onChange={(event) => onMinChange(event.target.value)}
-                    aria-label={`${label} minimum`}
-                />
-                <input
-                    type="range"
-                    min="1"
-                    max="10"
-                    step="1"
-                    value={clampedMax}
-                    onChange={(event) => onMaxChange(event.target.value)}
-                    aria-label={`${label} maximum`}
-                />
-            </div>
-            <div className="gmq-score-range-foot">
-                <span>1</span>
-                <span>10</span>
+                <div className="gmq-score-range-rail" ref={railRef} onPointerDown={handleRailPointerDown}>
+                    <div
+                        className="gmq-score-range-selected"
+                        style={{ left: `${startPercent}%`, width: `${selectedWidthPercent}%` }}
+                    >
+                        <button
+                            type="button"
+                            className="gmq-score-range-handle gmq-score-range-handle-min"
+                            aria-label={`${label} minimum`}
+                            onPointerDown={(event) => {
+                                event.stopPropagation();
+                                startBoundaryDrag('min', event);
+                            }}
+                        />
+                        <button
+                            type="button"
+                            className="gmq-score-range-handle gmq-score-range-handle-max"
+                            aria-label={`${label} maximum`}
+                            onPointerDown={(event) => {
+                                event.stopPropagation();
+                                startBoundaryDrag('max', event);
+                            }}
+                        />
+                    </div>
+                </div>
+                <div className="gmq-score-range-scale" aria-hidden="true">
+                    {SCORE_RANGE_TICKS.map((tick) => (
+                        <span
+                            key={tick}
+                            className={`gmq-score-range-scale-tick${tick >= clampedMin && tick <= clampedMax ? ' is-selected' : ''}`}
+                            style={{ '--tick-pos': `${((tick - 1) / 9) * 100}%` }}
+                        >
+                            <span className="gmq-score-range-scale-dot" />
+                            <span className="gmq-score-range-scale-label">{tick}</span>
+                        </span>
+                    ))}
+                </div>
             </div>
             {hint ? <p className="gmq-field-help gmq-muted">{hint}</p> : null}
         </div>
@@ -263,13 +339,22 @@ function normalizeErrorMessage(message) {
     return String(message || '').trim();
 }
 
+function normalizeGuessComparable(value) {
+    return String(value || '')
+        .normalize('NFKC')
+        .toLowerCase()
+        .trim()
+        .replace(/[^\p{L}\p{N}\s]/gu, '')
+        .replace(/\s+/g, ' ');
+}
+
 function toStartErrorMessage(message) {
     const raw = normalizeErrorMessage(message).toLowerCase();
     if (!raw) return 'Could not start the game right now. Please try again.';
     if (raw.includes('only host')) return 'Only the host can start the game.';
     if (raw.includes('all players must be ready')) return 'All players must click Ready before the host can start.';
     if (raw.includes('not enough players')) return 'Not enough players to start. Invite more players or lower the minimum players setting.';
-    if (raw.includes('balanced strict')) return 'Balanced strict could not build fair rounds from MAL lists. Try BALANCED_RELAXED or HYBRID.';
+    if (raw.includes('balanced strict')) return 'Balanced mode could not build fair rounds from MAL lists. Try Standard or Hybrid.';
     if (raw.includes('mal_only')) return 'MAL_ONLY could not build enough rounds from linked MAL lists. Try HYBRID or POPULAR.';
     if (raw.includes('playable round media') || raw.includes('round seeds') || raw.includes('media provider')) {
         return 'Could not prepare enough playable songs for this match. Try fewer rounds or different source/theme settings.';
@@ -375,6 +460,7 @@ export default function App() {
     const sampleVideoRef = useRef(null);
     const solutionVideoRef = useRef(null);
     const guessInputRef = useRef(null);
+    const searchResultButtonsRef = useRef([]);
     const sampleActiveMediaRef = useRef(null);
     const sampleStopTimerRef = useRef(null);
     const sampleVolumeRef = useRef(0.25);
@@ -397,7 +483,6 @@ export default function App() {
     const autoSubmitTimerRef = useRef(null);
     const deadlineSubmitTimerRef = useRef(null);
     const lastSubmittedGuessRef = useRef({ roundId: null, key: '' });
-    const postGameDisplayTimerRef = useRef(null);
     const guessTextRef = useRef('');
     const guessAnimeIdRef = useRef(null);
 
@@ -432,7 +517,6 @@ export default function App() {
     const [answers, setAnswers] = useState([]);
     const [solution, setSolution] = useState(null);
     const [finalResult, setFinalResult] = useState(null);
-    const [showPostGameResults, setShowPostGameResults] = useState(false);
     const [scoreboard, setScoreboard] = useState([]);
     const [readyUserIds, setReadyUserIds] = useState([]);
     const [lobbyReadyUserIds, setLobbyReadyUserIds] = useState([]);
@@ -442,6 +526,7 @@ export default function App() {
     const [guessAnimeId, setGuessAnimeId] = useState(null);
     const [searchResults, setSearchResults] = useState([]);
     const [searchMenuOpen, setSearchMenuOpen] = useState(false);
+    const [searchActiveIndex, setSearchActiveIndex] = useState(-1);
     const [sampleAutoplayBlocked, setSampleAutoplayBlocked] = useState(false);
     const [samplePlaying, setSamplePlaying] = useState(false);
     const [samplePlaybackSource, setSamplePlaybackSource] = useState(null);
@@ -458,6 +543,29 @@ export default function App() {
     const [mediaSourceStatus, setMediaSourceStatus] = useState(null);
     const [mediaSourceError, setMediaSourceError] = useState('');
     const [gameStartPending, setGameStartPending] = useState(false);
+    const [floatingTooltip, setFloatingTooltip] = useState({
+        visible: false,
+        x: 0,
+        y: 0,
+        text: ''
+    });
+
+    const showMalBadgeTooltipAtCursor = useCallback((event) => {
+        setFloatingTooltip({
+            visible: true,
+            x: Number.isFinite(event?.clientX) ? event.clientX : 0,
+            y: Number.isFinite(event?.clientY) ? event.clientY : 0,
+            text: 'User has connected a MAL account.'
+        });
+    }, []);
+
+    const hideFloatingTooltip = useCallback(() => {
+        setFloatingTooltip((previous) => (
+            previous.visible
+                ? { ...previous, visible: false }
+                : previous
+        ));
+    }, []);
 
     const handleCreateMaxPlayersChange = useCallback((rawValue) => {
         const nextInput = normalizeMaxPlayersInput(rawValue);
@@ -530,12 +638,6 @@ export default function App() {
         setEditMaxPlayersInput(String(committed));
         return committed;
     }, [editConfig.maxPlayers, editMaxPlayersInput]);
-
-    const clearPostGameDisplayTimer = useCallback(() => {
-        if (!postGameDisplayTimerRef.current) return;
-        window.clearTimeout(postGameDisplayTimerRef.current);
-        postGameDisplayTimerRef.current = null;
-    }, []);
 
     useEffect(() => {
         lobbyRef.current = lobby;
@@ -624,28 +726,6 @@ export default function App() {
         return () => window.clearTimeout(timer);
     }, [info]);
 
-    useEffect(() => () => {
-        clearPostGameDisplayTimer();
-    }, [clearPostGameDisplayTimer]);
-
-    useEffect(() => {
-        clearPostGameDisplayTimer();
-        if (phase !== 'FINISHED' || !finalResult) {
-            setShowPostGameResults(false);
-            return undefined;
-        }
-
-        setShowPostGameResults(true);
-        postGameDisplayTimerRef.current = window.setTimeout(() => {
-            postGameDisplayTimerRef.current = null;
-            setShowPostGameResults(false);
-        }, 7000);
-
-        return () => {
-            clearPostGameDisplayTimer();
-        };
-    }, [clearPostGameDisplayTimer, finalResult, phase]);
-
     useEffect(() => {
         if (!searchMenuOpen || phase !== 'GUESSING') return undefined;
 
@@ -665,7 +745,29 @@ export default function App() {
     useEffect(() => {
         if (phase === 'GUESSING') return;
         setSearchMenuOpen(false);
+        setSearchActiveIndex(-1);
     }, [phase]);
+
+    useEffect(() => {
+        searchResultButtonsRef.current = searchResultButtonsRef.current.slice(0, searchResults.length);
+    }, [searchResults.length]);
+
+    useEffect(() => {
+        if (!searchMenuOpen || phase !== 'GUESSING' || searchResults.length <= 0) {
+            setSearchActiveIndex(-1);
+            return;
+        }
+        setSearchActiveIndex((previous) => {
+            if (previous >= 0 && previous < searchResults.length) return previous;
+            return 0;
+        });
+    }, [phase, searchMenuOpen, searchResults]);
+
+    useEffect(() => {
+        if (searchActiveIndex < 0) return;
+        const node = searchResultButtonsRef.current[searchActiveIndex];
+        node?.scrollIntoView?.({ block: 'nearest' });
+    }, [searchActiveIndex]);
 
     const playerNameById = useMemo(() => {
         const map = new Map();
@@ -1105,38 +1207,6 @@ export default function App() {
         return (hash >>> 0) / 4294967295;
     }, []);
 
-    const waitForMediaDurationSec = useCallback(async (mediaEl) => {
-        if (!mediaEl) return null;
-
-        const current = Number(mediaEl.duration);
-        if (Number.isFinite(current) && current > 0) return current;
-
-        await new Promise((resolve) => {
-            let done = false;
-            const finish = () => {
-                if (done) return;
-                done = true;
-                cleanup();
-                resolve();
-            };
-            const cleanup = () => {
-                mediaEl.removeEventListener('loadedmetadata', finish);
-                mediaEl.removeEventListener('durationchange', finish);
-                mediaEl.removeEventListener('loadeddata', finish);
-                mediaEl.removeEventListener('error', finish);
-            };
-
-            mediaEl.addEventListener('loadedmetadata', finish);
-            mediaEl.addEventListener('durationchange', finish);
-            mediaEl.addEventListener('loadeddata', finish);
-            mediaEl.addEventListener('error', finish);
-            window.setTimeout(finish, 2000);
-        });
-
-        const next = Number(mediaEl.duration);
-        return Number.isFinite(next) && next > 0 ? next : null;
-    }, []);
-
     const resolveSampleStartSec = useCallback(async (mediaEl, sample) => {
         const cached = sampleResolvedStartSecRef.current;
         if (Number.isFinite(cached) && cached >= 0) return cached;
@@ -1151,7 +1221,8 @@ export default function App() {
         }
 
         const sampleDurationSec = Number.isFinite(sample?.sampleDurationSec) ? Math.max(1, sample.sampleDurationSec) : 10;
-        const mediaDurationSec = await waitForMediaDurationSec(mediaEl);
+        const immediateDuration = Number(mediaEl?.duration);
+        const mediaDurationSec = Number.isFinite(immediateDuration) && immediateDuration > 0 ? immediateDuration : null;
         if (!Number.isFinite(mediaDurationSec) || mediaDurationSec <= 0) {
             sampleResolvedStartSecRef.current = configuredStart;
             return configuredStart;
@@ -1168,7 +1239,7 @@ export default function App() {
         const randomStartSec = Math.floor(randomUnit * (maxStart + 1));
         sampleResolvedStartSecRef.current = randomStartSec;
         return randomStartSec;
-    }, [round?.roundId, seededUnitInterval, waitForMediaDurationSec]);
+    }, [round?.roundId, seededUnitInterval]);
 
     const playSolutionVideo = useCallback(async () => {
         const video = solutionVideoRef.current;
@@ -1275,7 +1346,6 @@ export default function App() {
     }, [clearSampleStopTimer, phase, resolveSampleStartSec, round, stopSamplePlayback]);
 
     const clearRoundState = useCallback(() => {
-        clearPostGameDisplayTimer();
         if (autoSubmitTimerRef.current) {
             window.clearTimeout(autoSubmitTimerRef.current);
             autoSubmitTimerRef.current = null;
@@ -1295,7 +1365,6 @@ export default function App() {
         setAnswers([]);
         setSolution(null);
         setFinalResult(null);
-        setShowPostGameResults(false);
         setScoreboard([]);
         setReadyUserIds([]);
         setLobbyReadyUserIds([]);
@@ -1313,7 +1382,7 @@ export default function App() {
         setSolutionVideoAutoplayBlocked(false);
         setSuddenDeathState(null);
         setGameStartPending(false);
-    }, [clearPostGameDisplayTimer, resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback]);
+    }, [resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback]);
 
     const applySyncState = useCallback((syncState) => {
         const state = syncState || {};
@@ -1541,7 +1610,17 @@ export default function App() {
         const rawGuessText = typeof guessTextOverride === 'string' ? guessTextOverride : guessTextRef.current;
         const rawGuessAnimeId = guessAnimeIdOverride !== undefined ? guessAnimeIdOverride : guessAnimeIdRef.current;
         const normalizedGuessText = String(rawGuessText || '').trim();
-        const normalizedGuessAnimeId = Number.isInteger(rawGuessAnimeId) ? rawGuessAnimeId : null;
+        let normalizedGuessAnimeId = Number.isInteger(rawGuessAnimeId) ? rawGuessAnimeId : null;
+        if (!Number.isInteger(normalizedGuessAnimeId) && normalizedGuessText) {
+            const normalizedGuess = normalizeGuessComparable(normalizedGuessText);
+            const matchedResult = (searchResults || []).find((item) => (
+                normalizeGuessComparable(item?.title) === normalizedGuess
+            ));
+            const parsedMatchedAnimeId = Number.parseInt(matchedResult?.id, 10);
+            if (Number.isInteger(parsedMatchedAnimeId) && parsedMatchedAnimeId > 0) {
+                normalizedGuessAnimeId = parsedMatchedAnimeId;
+            }
+        }
         const submissionKey = `${normalizedGuessText.toLowerCase()}|${normalizedGuessAnimeId ?? ''}`;
         const previousSubmission = lastSubmittedGuessRef.current;
         if (
@@ -1566,7 +1645,25 @@ export default function App() {
         } catch (err) {
             // Auto-submit is best-effort; deadline force submit still runs separately.
         }
-    }, [lobby, readyUserIds, round, user]);
+    }, [lobby, readyUserIds, round, searchResults, user]);
+
+    const commitSearchResult = useCallback((item) => {
+        const nextGuessText = String(item?.title || '');
+        const parsedAnimeId = Number.parseInt(item?.id, 10);
+        const nextGuessAnimeId = Number.isInteger(parsedAnimeId) ? parsedAnimeId : null;
+        guessTextRef.current = nextGuessText;
+        guessAnimeIdRef.current = nextGuessAnimeId;
+        setGuessText(nextGuessText);
+        setGuessAnimeId(nextGuessAnimeId);
+        setSearchResults([]);
+        setSearchMenuOpen(false);
+        setSearchActiveIndex(-1);
+        submitGuess({
+            force: true,
+            guessTextOverride: nextGuessText,
+            guessAnimeIdOverride: nextGuessAnimeId
+        }).catch(() => {});
+    }, [submitGuess]);
 
     const toggleReady = useCallback(async () => {
         if (!lobby?.code || !socketRef.current || !user) return;
@@ -1586,7 +1683,7 @@ export default function App() {
     }, [lobby, readyUserIds, submitGuess, user]);
 
     const toggleLobbyReady = useCallback(async () => {
-        if (!lobby?.code || !socketRef.current || !user) return;
+        if (!lobby?.code || !socketRef.current || !user || gameStartPending) return;
         setBusy('lobby-ready');
         setError('');
         try {
@@ -1600,7 +1697,7 @@ export default function App() {
         } finally {
             setBusy('');
         }
-    }, [lobby, lobbyReadyUserIds, user]);
+    }, [gameStartPending, lobby, lobbyReadyUserIds, user]);
 
     const kickPlayer = useCallback((player) => {
         if (!lobby?.code) return;
@@ -1844,7 +1941,6 @@ export default function App() {
             setSolutionVideoAutoplayBlocked(false);
         };
         const onFinished = (payload) => {
-            clearPostGameDisplayTimer();
             resetPreloadManager();
             stopSamplePlayback();
             stopSolutionVideoPlayback();
@@ -1854,7 +1950,6 @@ export default function App() {
             setMediaError('');
             setSolutionMediaError('');
             setFinalResult(payload || null);
-            setShowPostGameResults(true);
             setLobby((prev) => (prev ? { ...prev, status: 'WAITING' } : prev));
             if (Array.isArray(payload?.finalScores)) {
                 setScoreboard(payload.finalScores.slice().sort(byScoreDesc));
@@ -1992,7 +2087,7 @@ export default function App() {
             }
             closeGameSocket();
         };
-    }, [beginSessionPreload, clearPostGameDisplayTimer, clearRoundState, fetchLobbies, preloadRollingWindow, requestRoundSync, resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback, token]);
+    }, [beginSessionPreload, clearRoundState, fetchLobbies, preloadRollingWindow, requestRoundSync, resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback, token]);
 
     useEffect(() => {
         if (!token) return;
@@ -2042,6 +2137,7 @@ export default function App() {
         if (phase !== 'GUESSING') {
             searchRequestSeqRef.current += 1;
             setSearchResults([]);
+            setSearchActiveIndex(-1);
             setSearchError('');
             return;
         }
@@ -2049,6 +2145,7 @@ export default function App() {
         if (q.length < 2) {
             searchRequestSeqRef.current += 1;
             setSearchResults([]);
+            setSearchActiveIndex(-1);
             setSearchError('');
             return;
         }
@@ -2308,30 +2405,39 @@ export default function App() {
         }
         return details;
     }, [mediaSourceCheckedLabel, mediaSourceError, mediaSourceHealth.label, mediaSourceLatencyLabel, mediaSourceStatus]);
+    const latestMatchResult = useMemo(() => {
+        if (finalResult && Array.isArray(finalResult.finalScores) && finalResult.finalScores.length > 0) {
+            return finalResult;
+        }
+        if (lobby?.lastMatchResult && Array.isArray(lobby.lastMatchResult.finalScores) && lobby.lastMatchResult.finalScores.length > 0) {
+            return lobby.lastMatchResult;
+        }
+        return null;
+    }, [finalResult, lobby?.lastMatchResult]);
     const postGameRows = useMemo(() => {
-        const rawRows = Array.isArray(finalResult?.finalScores) && finalResult.finalScores.length > 0
-            ? finalResult.finalScores
+        const rawRows = Array.isArray(latestMatchResult?.finalScores) && latestMatchResult.finalScores.length > 0
+            ? latestMatchResult.finalScores
             : scoreboard;
         return rawRows.slice().sort(byScoreDesc);
-    }, [finalResult?.finalScores, scoreboard]);
+    }, [latestMatchResult?.finalScores, scoreboard]);
     const postGameWinnerName = useMemo(() => {
-        const winnerUserId = Number.parseInt(finalResult?.winner?.userId, 10);
+        const winnerUserId = Number.parseInt(latestMatchResult?.winner?.userId, 10);
         if (Number.isInteger(winnerUserId)) {
             return resolvePlayerName(winnerUserId);
         }
         return postGameRows[0]?.displayName || '';
-    }, [finalResult?.winner?.userId, postGameRows, resolvePlayerName]);
-    const showPostGameCard = useMemo(
-        () => Boolean(lobby) && phase === 'FINISHED' && showPostGameResults,
-        [lobby, phase, showPostGameResults]
+    }, [latestMatchResult?.winner?.userId, postGameRows, resolvePlayerName]);
+    const showFinalStandingsCard = useMemo(
+        () => Boolean(lobby) && postGameRows.length > 0 && (phase === 'WAITING' || phase === 'FINISHED'),
+        [lobby, phase, postGameRows.length]
     );
     const showRoundCard = useMemo(
         () => Boolean(lobby) && phase !== 'WAITING' && phase !== 'FINISHED',
         [lobby, phase]
     );
     const showLobbyCard = useMemo(
-        () => Boolean(lobby) && (phase === 'WAITING' || (phase === 'FINISHED' && !showPostGameResults)),
-        [lobby, phase, showPostGameResults]
+        () => Boolean(lobby) && (phase === 'WAITING' || phase === 'FINISHED'),
+        [lobby, phase]
     );
     const answerByUserId = useMemo(() => {
         const map = new Map();
@@ -2379,18 +2485,29 @@ export default function App() {
             return code.includes(q) || name.includes(q);
         });
     }, [lobbies, lobbyQuery]);
+    const createUsesScoreFilters = useMemo(
+        () => createConfig.sourceMode !== 'POPULAR',
+        [createConfig.sourceMode]
+    );
+    const editUsesScoreFilters = useMemo(
+        () => editConfig.sourceMode !== 'POPULAR',
+        [editConfig.sourceMode]
+    );
     const lobbySettingsSummary = useMemo(() => {
         if (!lobby) return [];
-        return [
+        const base = [
             `Max ${lobby.maxPlayers} players`,
             `${lobby.roundCount} rounds`,
             `${lobby.guessSeconds}s guess`,
             SOURCE_MODE_COPY[lobby.sourceMode]?.label || lobby.sourceMode,
             SELECTION_MODE_COPY[lobby.selectionMode]?.label || lobby.selectionMode,
-            THEME_MODE_COPY[lobby.themeMode]?.label || lobby.themeMode,
-            `Anime score ${lobby.animeScoreMin ?? 1}-${lobby.animeScoreMax ?? 10}`,
-            `Player score ${lobby.playerScoreMin ?? 1}-${lobby.playerScoreMax ?? 10}`
+            THEME_MODE_COPY[lobby.themeMode]?.label || lobby.themeMode
         ];
+        if (lobby.sourceMode !== 'POPULAR') {
+            base.push(`Anime score ${lobby.animeScoreMin ?? 1}-${lobby.animeScoreMax ?? 10}`);
+            base.push(`Player score ${lobby.playerScoreMin ?? 1}-${lobby.playerScoreMax ?? 10}`);
+        }
+        return base;
     }, [lobby]);
 
     if (loading) return <section className="gmq-shell">Loading game...</section>;
@@ -2597,23 +2714,25 @@ export default function App() {
                                 </select>
                             </div>
                         </div>
-                        <div className="gmq-field-grid gmq-field-grid-2">
-                            <ScoreRangeSlider
-                                label="Anime MAL Score"
-                                minValue={editConfig.animeScoreMin}
-                                maxValue={editConfig.animeScoreMax}
-                                onMinChange={handleEditAnimeScoreMinChange}
-                                onMaxChange={handleEditAnimeScoreMaxChange}
-                            />
-                            <ScoreRangeSlider
-                                label="Player MAL Score"
-                                minValue={editConfig.playerScoreMin}
-                                maxValue={editConfig.playerScoreMax}
-                                onMinChange={handleEditPlayerScoreMinChange}
-                                onMaxChange={handleEditPlayerScoreMaxChange}
-                                hint="Used for MAL-list entries (MAL_ONLY, and MAL portion of HYBRID)."
-                            />
-                        </div>
+                        {editUsesScoreFilters ? (
+                            <div className="gmq-field-grid gmq-field-grid-2">
+                                <ScoreRangeSlider
+                                    label="Anime MAL Score"
+                                    minValue={editConfig.animeScoreMin}
+                                    maxValue={editConfig.animeScoreMax}
+                                    onMinChange={handleEditAnimeScoreMinChange}
+                                    onMaxChange={handleEditAnimeScoreMaxChange}
+                                />
+                                <ScoreRangeSlider
+                                    label="Player MAL Score"
+                                    minValue={editConfig.playerScoreMin}
+                                    maxValue={editConfig.playerScoreMax}
+                                    onMinChange={handleEditPlayerScoreMinChange}
+                                    onMaxChange={handleEditPlayerScoreMaxChange}
+                                    hint="Used for MAL-list entries (MAL_ONLY, and MAL portion of HYBRID)."
+                                />
+                            </div>
+                        ) : null}
                         <button
                             type="button"
                             className="gmq-btn gmq-btn-primary"
@@ -2750,23 +2869,25 @@ export default function App() {
                                         </select>
                                     </div>
                                 </div>
-                                <div className="gmq-field-grid gmq-field-grid-2">
-                                    <ScoreRangeSlider
-                                        label="Anime MAL Score"
-                                        minValue={createConfig.animeScoreMin}
-                                        maxValue={createConfig.animeScoreMax}
-                                        onMinChange={handleCreateAnimeScoreMinChange}
-                                        onMaxChange={handleCreateAnimeScoreMaxChange}
-                                    />
-                                    <ScoreRangeSlider
-                                        label="Player MAL Score"
-                                        minValue={createConfig.playerScoreMin}
-                                        maxValue={createConfig.playerScoreMax}
-                                        onMinChange={handleCreatePlayerScoreMinChange}
-                                        onMaxChange={handleCreatePlayerScoreMaxChange}
-                                        hint="Used for MAL-list entries (MAL_ONLY, and MAL portion of HYBRID)."
-                                    />
-                                </div>
+                                {createUsesScoreFilters ? (
+                                    <div className="gmq-field-grid gmq-field-grid-2">
+                                        <ScoreRangeSlider
+                                            label="Anime MAL Score"
+                                            minValue={createConfig.animeScoreMin}
+                                            maxValue={createConfig.animeScoreMax}
+                                            onMinChange={handleCreateAnimeScoreMinChange}
+                                            onMaxChange={handleCreateAnimeScoreMaxChange}
+                                        />
+                                        <ScoreRangeSlider
+                                            label="Player MAL Score"
+                                            minValue={createConfig.playerScoreMin}
+                                            maxValue={createConfig.playerScoreMax}
+                                            onMinChange={handleCreatePlayerScoreMinChange}
+                                            onMaxChange={handleCreatePlayerScoreMaxChange}
+                                            hint="Used for MAL-list entries (MAL_ONLY, and MAL portion of HYBRID)."
+                                        />
+                                    </div>
+                                ) : null}
                                 <button type="button" className="gmq-btn gmq-btn-primary" onClick={createLobby} disabled={busy === 'create'}>
                                     {busy === 'create' ? 'Hosting...' : 'Host Lobby'}
                                 </button>
@@ -2775,7 +2896,7 @@ export default function App() {
                     ) : null}
                 </div>
             ) : (
-                <div className={`gmq-grid gmq-grid-match ${showRoundCard ? 'gmq-grid-match-live' : 'gmq-grid-match-idle'} ${showRoundCard && !showLobbyCard ? 'gmq-grid-match-round-only' : ''}`}>
+                <div className={`gmq-grid gmq-grid-match ${showRoundCard ? 'gmq-grid-match-live' : 'gmq-grid-match-idle'} ${showRoundCard && !showLobbyCard ? 'gmq-grid-match-round-only' : ''} ${!showRoundCard && showLobbyCard && showFinalStandingsCard ? 'gmq-grid-match-idle-with-standings' : ''}`}>
                     {showLobbyCard ? (
                     <article className="gmq-card gmq-card-lobby">
                         <h2>
@@ -2796,7 +2917,19 @@ export default function App() {
                         <ul className="gmq-player-list">
                             {(lobby.players || []).map((player) => (
                                 <li key={player.userId}>
-                                    <span>{player.displayName}{player.userId === lobby.host?.id ? ' (Host)' : ''}{!player.isConnected ? ' (offline)' : ''}</span>
+                                    <span className="gmq-player-name">
+                                        <span>{player.displayName}{player.userId === lobby.host?.id ? ' (Host)' : ''}{!player.isConnected ? ' (offline)' : ''}</span>
+                                        {player.hasMalConnected ? (
+                                            <span
+                                                className="gmq-mal-badge"
+                                                onMouseEnter={showMalBadgeTooltipAtCursor}
+                                                onMouseMove={showMalBadgeTooltipAtCursor}
+                                                onMouseLeave={hideFloatingTooltip}
+                                            >
+                                                MAL
+                                            </span>
+                                        ) : null}
+                                    </span>
                                     {lobby.status === 'WAITING' ? (
                                         <span className="gmq-player-row-actions">
                                             {isHost && user && player.userId !== user.id && !gameStartPending ? (
@@ -2829,14 +2962,16 @@ export default function App() {
                         {lobby.status === 'WAITING' ? (
                             <div className="gmq-stack">
                                 <div className="gmq-actions">
-                                    <button
-                                        type="button"
-                                        className="gmq-btn gmq-btn-secondary"
-                                        onClick={toggleLobbyReady}
-                                        disabled={busy === 'lobby-ready'}
-                                    >
-                                        {myLobbyReady ? 'Not Ready' : 'Ready Up'}
-                                    </button>
+                                    {!gameStartPending ? (
+                                        <button
+                                            type="button"
+                                            className="gmq-btn gmq-btn-secondary"
+                                            onClick={toggleLobbyReady}
+                                            disabled={busy === 'lobby-ready'}
+                                        >
+                                            {myLobbyReady ? 'Not Ready' : 'Ready Up'}
+                                        </button>
+                                    ) : null}
                                     <p className="gmq-muted">
                                         Ready {waitingLobbyReadyUserIds.length}/{waitingLobbyRequiredUserIds.length}
                                     </p>
@@ -2872,11 +3007,10 @@ export default function App() {
                         ) : null}
                     </article>
                     ) : null}
-
-                    {showPostGameCard ? (
-                        <article className="gmq-card gmq-card-round gmq-postgame-shell">
+                    {showFinalStandingsCard ? (
+                        <article className="gmq-card gmq-card-standings-latest">
                             <div className="gmq-postgame-header">
-                                <h2>Match Results</h2>
+                                <h2>Latest Standings</h2>
                                 {postGameWinnerName ? (
                                     <p className="gmq-postgame-winner">Winner: {postGameWinnerName}</p>
                                 ) : null}
@@ -3042,39 +3176,60 @@ export default function App() {
                                                         setGuessAnimeId(null);
                                                         setSearchMenuOpen(true);
                                                     }}
+                                                    onKeyDown={(event) => {
+                                                        if (!isGuessingPhase) return;
+
+                                                        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                                                            if (searchResults.length <= 0) return;
+                                                            event.preventDefault();
+                                                            setSearchMenuOpen(true);
+                                                            setSearchActiveIndex((previous) => {
+                                                                if (previous < 0 || previous >= searchResults.length) {
+                                                                    return event.key === 'ArrowDown' ? 0 : searchResults.length - 1;
+                                                                }
+                                                                const delta = event.key === 'ArrowDown' ? 1 : -1;
+                                                                return (previous + delta + searchResults.length) % searchResults.length;
+                                                            });
+                                                            return;
+                                                        }
+
+                                                        if (event.key === 'Enter') {
+                                                            if (!searchMenuOpen || searchResults.length <= 0) return;
+                                                            event.preventDefault();
+                                                            const nextIndex = (searchActiveIndex >= 0 && searchActiveIndex < searchResults.length)
+                                                                ? searchActiveIndex
+                                                                : 0;
+                                                            const item = searchResults[nextIndex];
+                                                            if (!item) return;
+                                                            commitSearchResult(item);
+                                                        }
+                                                    }}
                                                     onFocus={() => {
                                                         if (isGuessingPhase) setSearchMenuOpen(true);
                                                     }}
                                                     onBlur={() => {
                                                         window.setTimeout(() => {
                                                             setSearchMenuOpen(false);
+                                                            setSearchActiveIndex(-1);
                                                         }, 100);
                                                     }}
                                                     placeholder={isGuessingPhase ? 'Type anime name' : 'Waiting for guessing phase'}
                                                 />
                                                 {(searchMenuOpen && searchResults.length > 0 && isGuessingPhase) ? (
-                                                    <ul className="gmq-search-results">
-                                                        {searchResults.map((item) => (
+                                                    <ul className="gmq-search-results" role="listbox">
+                                                        {searchResults.map((item, index) => (
                                                             <li key={`${item.id}-${item.title}`}>
                                                                 <button
                                                                     type="button"
-                                                                    onMouseDown={(event) => event.preventDefault()}
-                                                                    onClick={() => {
-                                                                        const nextGuessText = String(item?.title || '');
-                                                                        const parsedAnimeId = Number.parseInt(item?.id, 10);
-                                                                        const nextGuessAnimeId = Number.isInteger(parsedAnimeId) ? parsedAnimeId : null;
-                                                                        guessTextRef.current = nextGuessText;
-                                                                        guessAnimeIdRef.current = nextGuessAnimeId;
-                                                                        setGuessText(nextGuessText);
-                                                                        setGuessAnimeId(nextGuessAnimeId);
-                                                                        setSearchResults([]);
-                                                                        setSearchMenuOpen(false);
-                                                                        submitGuess({
-                                                                            force: true,
-                                                                            guessTextOverride: nextGuessText,
-                                                                            guessAnimeIdOverride: nextGuessAnimeId
-                                                                        }).catch(() => {});
+                                                                    role="option"
+                                                                    aria-selected={index === searchActiveIndex}
+                                                                    className={index === searchActiveIndex ? 'is-active' : ''}
+                                                                    ref={(node) => {
+                                                                        searchResultButtonsRef.current[index] = node;
                                                                     }}
+                                                                    onMouseDown={(event) => event.preventDefault()}
+                                                                    onMouseEnter={() => setSearchActiveIndex(index)}
+                                                                    onClick={() => commitSearchResult(item)}
                                                                 >
                                                                     {item.title}
                                                                 </button>
@@ -3101,7 +3256,13 @@ export default function App() {
                                     {showRevealContent ? (
                                         <div className="gmq-stack">
                                             <p>{solution.correctAnime?.animeTitle} ({solution.correctAnime?.themeType})</p>
-                                            <p className="gmq-muted">{solution.correctAnime?.themeTitle || ''}</p>
+                                            {(solution.correctAnime?.animeTitleEnglish
+                                                && String(solution.correctAnime.animeTitleEnglish).trim().toLowerCase() !== String(solution.correctAnime?.animeTitle || '').trim().toLowerCase()) ? (
+                                                    <p className="gmq-muted">{solution.correctAnime.animeTitleEnglish}</p>
+                                                ) : null}
+                                            {solution.correctAnime?.themeTitle ? (
+                                                <p className="gmq-muted">Artist: {solution.correctAnime.themeTitle}</p>
+                                            ) : null}
                                         </div>
                                     ) : (
                                         <p className="gmq-muted">Music info hidden until solution reveal.</p>
@@ -3141,6 +3302,17 @@ export default function App() {
                     ) : null}
                 </div>
             )}
+            {floatingTooltip.visible ? (
+                <div
+                    className="gmq-floating-tooltip"
+                    style={{
+                        left: `${floatingTooltip.x}px`,
+                        top: `${floatingTooltip.y}px`
+                    }}
+                >
+                    {floatingTooltip.text}
+                </div>
+            ) : null}
         </section>
     );
 }
