@@ -12,8 +12,9 @@ const DEFAULT_URL_TTL_SEC = 15 * 60;
 const DEFAULT_CACHE_DIR = path.resolve(__dirname, '../../.cache/media');
 const DEFAULT_FETCH_TIMEOUT_MS = 20_000;
 const DEFAULT_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB
+const DEFAULT_LAST_USED_TOUCH_INTERVAL_MS = 60 * 1000;
 const DEFAULT_ALLOWED_HOSTS = '';
-const DEFAULT_CACHE_SCOPE = '_shared';
+const GLOBAL_CACHE_SCOPE = 'GLOBAL';
 
 const inflightDownloads = new Map();
 
@@ -26,10 +27,6 @@ function normalizeLobbyCode(value) {
     const code = String(value || '').trim().toUpperCase();
     if (!code) return null;
     return /^[A-Z0-9_-]{2,20}$/.test(code) ? code : null;
-}
-
-function resolveCacheScope(lobbyCode) {
-    return normalizeLobbyCode(lobbyCode) || DEFAULT_CACHE_SCOPE;
 }
 
 function normalizeHost(value) {
@@ -195,6 +192,45 @@ function getCacheMaxBytes() {
     return parsePositiveInt(process.env.MEDIA_PROXY_CACHE_MAX_BYTES, DEFAULT_CACHE_MAX_BYTES);
 }
 
+function getLastUsedTouchIntervalMs() {
+    return parsePositiveInt(
+        process.env.MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS,
+        DEFAULT_LAST_USED_TOUCH_INTERVAL_MS
+    );
+}
+
+function toIsoTimestamp(value, fallback = null) {
+    const timestamp = new Date(value);
+    if (Number.isNaN(timestamp.getTime())) return fallback;
+    return timestamp.toISOString();
+}
+
+function nowIsoTimestamp() {
+    return new Date().toISOString();
+}
+
+function buildCacheMetaRecord({
+    key,
+    scope,
+    sourceUrl,
+    contentType,
+    size,
+    cachedAt,
+    lastUsedAt
+}) {
+    const resolvedCachedAt = toIsoTimestamp(cachedAt, nowIsoTimestamp());
+    const resolvedLastUsedAt = toIsoTimestamp(lastUsedAt, resolvedCachedAt);
+    return {
+        key,
+        scope,
+        sourceUrl,
+        contentType,
+        size: Number.isFinite(size) ? size : 0,
+        cachedAt: resolvedCachedAt,
+        lastUsedAt: resolvedLastUsedAt
+    };
+}
+
 function base64UrlEncode(value) {
     return Buffer.from(String(value), 'utf8').toString('base64url');
 }
@@ -287,8 +323,8 @@ function cacheKeyForUrl(url) {
     return crypto.createHash('sha256').update(String(url)).digest('hex');
 }
 
-function cachePaths(cacheKey, lobbyCode = null) {
-    const dir = path.join(getCacheDir(), resolveCacheScope(lobbyCode));
+function cachePaths(cacheKey) {
+    const dir = getCacheDir();
     return {
         dir,
         dataPath: path.join(dir, `${cacheKey}.bin`),
@@ -297,8 +333,8 @@ function cachePaths(cacheKey, lobbyCode = null) {
     };
 }
 
-async function ensureCacheDir(lobbyCode = null) {
-    await fs.promises.mkdir(path.join(getCacheDir(), resolveCacheScope(lobbyCode)), { recursive: true });
+async function ensureCacheDir() {
+    await fs.promises.mkdir(getCacheDir(), { recursive: true });
 }
 
 async function removeCacheDirIfEmpty(dirPath) {
@@ -326,22 +362,57 @@ async function readCacheMeta(metaPath) {
     }
 }
 
-async function getCacheEntry(sourceUrl, options = {}) {
-    const lobbyCode = normalizeLobbyCode(options.lobbyCode);
+function resolveMetaLastUsedAt(meta = {}) {
+    return toIsoTimestamp(meta.lastUsedAt || meta.cachedAt, null);
+}
+
+async function maybeTouchCacheMetaLastUsed(metaPath, meta, nowMs = Date.now()) {
+    const touchIntervalMs = getLastUsedTouchIntervalMs();
+    const lastUsedAt = resolveMetaLastUsedAt(meta);
+    const lastUsedMs = lastUsedAt ? new Date(lastUsedAt).getTime() : 0;
+    if (lastUsedMs > 0 && nowMs - lastUsedMs < touchIntervalMs) {
+        return {
+            touched: false,
+            lastUsedAt
+        };
+    }
+
+    const nextLastUsedAt = new Date(nowMs).toISOString();
+    try {
+        const record = (meta && typeof meta === 'object') ? meta : {};
+        await fs.promises.writeFile(metaPath, JSON.stringify({
+            ...record,
+            lastUsedAt: nextLastUsedAt
+        }), 'utf8');
+        return {
+            touched: true,
+            lastUsedAt: nextLastUsedAt
+        };
+    } catch (_err) {
+        return {
+            touched: false,
+            lastUsedAt
+        };
+    }
+}
+
+async function getCacheEntry(sourceUrl) {
     const key = cacheKeyForUrl(sourceUrl);
-    const paths = cachePaths(key, lobbyCode);
+    const paths = cachePaths(key);
     const meta = await readCacheMeta(paths.metaPath);
     if (!meta) return null;
 
     try {
         const stat = await fs.promises.stat(paths.dataPath);
+        const touch = await maybeTouchCacheMetaLastUsed(paths.metaPath, meta);
         return {
             key,
             dataPath: paths.dataPath,
             metaPath: paths.metaPath,
             contentType: typeof meta.contentType === 'string' ? meta.contentType : 'application/octet-stream',
             size: Number.isFinite(stat.size) ? stat.size : Number(meta.size || 0),
-            cachedAt: meta.cachedAt || null
+            cachedAt: meta.cachedAt || null,
+            lastUsedAt: touch.lastUsedAt || meta.lastUsedAt || meta.cachedAt || null
         };
     } catch (_err) {
         return null;
@@ -384,12 +455,15 @@ async function pruneCacheIfNeeded() {
             const stat = await fs.promises.stat(dataPath);
             const size = Number.isFinite(stat.size) ? stat.size : 0;
             totalBytes += size;
+            const lastUsedAt = resolveMetaLastUsedAt(meta);
+            const lastUsedMs = lastUsedAt ? new Date(lastUsedAt).getTime() : 0;
             metas.push({
                 key: meta.key,
                 size,
                 dataPath,
                 metaPath,
-                cachedAt: new Date(meta.cachedAt || 0).getTime() || 0
+                lastUsedMs,
+                cachedAtMs: new Date(meta.cachedAt || 0).getTime() || 0
             });
         } catch (_err) {
             // If data file is missing, remove stale metadata.
@@ -400,7 +474,11 @@ async function pruneCacheIfNeeded() {
 
     if (totalBytes <= maxBytes) return;
 
-    metas.sort((a, b) => a.cachedAt - b.cachedAt);
+    metas.sort((a, b) => (
+        (a.lastUsedMs - b.lastUsedMs)
+        || (a.cachedAtMs - b.cachedAtMs)
+        || String(a.key).localeCompare(String(b.key))
+    ));
     for (const item of metas) {
         if (totalBytes <= maxBytes) break;
         await fs.promises.unlink(item.dataPath).catch(() => {});
@@ -410,22 +488,20 @@ async function pruneCacheIfNeeded() {
     }
 }
 
-function inflightKeyFor(scope, cacheKey) {
-    return `${scope}:${cacheKey}`;
+function inflightKeyFor(cacheKey) {
+    return cacheKey;
 }
 
-async function downloadToCache(sourceUrl, options = {}) {
-    const lobbyCode = normalizeLobbyCode(options.lobbyCode);
-    const scope = resolveCacheScope(lobbyCode);
-    await ensureCacheDir(scope);
+async function downloadToCache(sourceUrl) {
+    await ensureCacheDir();
     const key = cacheKeyForUrl(sourceUrl);
-    const inflightKey = inflightKeyFor(scope, key);
+    const inflightKey = inflightKeyFor(key);
     if (inflightDownloads.has(inflightKey)) {
         return inflightDownloads.get(inflightKey);
     }
 
     const promise = (async () => {
-        const paths = cachePaths(key, scope);
+        const paths = cachePaths(key);
         const response = await axios.get(sourceUrl, {
             responseType: 'stream',
             timeout: getFetchTimeoutMs(),
@@ -437,27 +513,30 @@ async function downloadToCache(sourceUrl, options = {}) {
         await fs.promises.rename(paths.tmpPath, paths.dataPath);
 
         const stat = await fs.promises.stat(paths.dataPath);
-        const meta = {
+        const now = nowIsoTimestamp();
+        const meta = buildCacheMetaRecord({
             key,
-            scope,
+            scope: GLOBAL_CACHE_SCOPE,
             sourceUrl,
             contentType: typeof response.headers?.['content-type'] === 'string'
                 ? response.headers['content-type']
                 : 'application/octet-stream',
             size: Number.isFinite(stat.size) ? stat.size : 0,
-            cachedAt: new Date().toISOString()
-        };
+            cachedAt: now,
+            lastUsedAt: now
+        });
         await fs.promises.writeFile(paths.metaPath, JSON.stringify(meta), 'utf8');
         await pruneCacheIfNeeded();
 
         return {
             key,
-            scope,
+            scope: GLOBAL_CACHE_SCOPE,
             dataPath: paths.dataPath,
             metaPath: paths.metaPath,
             contentType: meta.contentType,
             size: meta.size,
-            cachedAt: meta.cachedAt
+            cachedAt: meta.cachedAt,
+            lastUsedAt: meta.lastUsedAt
         };
     })();
 
@@ -465,7 +544,7 @@ async function downloadToCache(sourceUrl, options = {}) {
     try {
         return await promise;
     } catch (err) {
-        const paths = cachePaths(key, scope);
+        const paths = cachePaths(key);
         await fs.promises.unlink(paths.tmpPath).catch(() => {});
         throw err;
     } finally {
@@ -474,7 +553,6 @@ async function downloadToCache(sourceUrl, options = {}) {
 }
 
 async function getOrCreateCacheEntry(sourceUrl, options = {}) {
-    const lobbyCode = normalizeLobbyCode(options.lobbyCode);
     const safety = await validateSourceUrl(sourceUrl);
     if (!safety.ok) {
         telemetry.warn('media.cache_request_blocked', {
@@ -487,10 +565,10 @@ async function getOrCreateCacheEntry(sourceUrl, options = {}) {
         throw err;
     }
 
-    const existing = await getCacheEntry(sourceUrl, { lobbyCode });
+    const existing = await getCacheEntry(sourceUrl);
     if (existing) return { ...existing, cacheStatus: 'HIT' };
 
-    const downloaded = await downloadToCache(sourceUrl, { lobbyCode });
+    const downloaded = await downloadToCache(sourceUrl);
     return { ...downloaded, cacheStatus: 'MISS' };
 }
 
@@ -625,9 +703,8 @@ async function evictCacheForMediaUrl(mediaUrl) {
     }
 
     const sourceUrl = resolved.sourceUrl;
-    const lobbyCode = normalizeLobbyCode(resolved.lobbyCode);
     const key = cacheKeyForUrl(sourceUrl);
-    const { dataPath, metaPath, dir } = cachePaths(key, lobbyCode);
+    const { dataPath, metaPath, dir } = cachePaths(key);
     let removed = false;
 
     try {
@@ -652,7 +729,7 @@ async function evictCacheForMediaUrl(mediaUrl) {
         removed,
         key,
         sourceUrl,
-        lobbyCode: resolveCacheScope(lobbyCode)
+        scope: GLOBAL_CACHE_SCOPE
     };
 }
 
@@ -675,40 +752,6 @@ async function evictCacheForMediaUrls(mediaUrls = []) {
         attempted: results.length,
         removed,
         skipped
-    };
-}
-
-async function deleteLobbyCache(lobbyCode) {
-    const normalized = normalizeLobbyCode(lobbyCode);
-    if (!normalized) {
-        return {
-            removed: false,
-            lobbyCode: null,
-            reason: 'invalid_lobby_code'
-        };
-    }
-
-    const dir = path.join(getCacheDir(), normalized);
-    try {
-        await fs.promises.rm(dir, { recursive: true, force: true });
-    } catch (_err) {
-        return {
-            removed: false,
-            lobbyCode: normalized,
-            reason: 'delete_failed'
-        };
-    }
-
-    const prefix = `${normalized}:`;
-    for (const key of inflightDownloads.keys()) {
-        if (key.startsWith(prefix)) {
-            inflightDownloads.delete(key);
-        }
-    }
-
-    return {
-        removed: true,
-        lobbyCode: normalized
     };
 }
 
@@ -808,6 +851,5 @@ module.exports = {
     prewarmProxyUrl,
     prewarmManifest,
     evictCacheForMediaUrl,
-    evictCacheForMediaUrls,
-    deleteLobbyCache
+    evictCacheForMediaUrls
 };

@@ -228,6 +228,51 @@ describe('mediaService.resolveRoundMedia', () => {
         expect(axios.get).toHaveBeenCalledTimes(1);
     });
 
+    test('captures provider status from regular media requests without extra probe calls', async () => {
+        mockProviderSuccess();
+
+        await resolveRoundMedia({
+            animeId: 223,
+            themeMode: 'OP_ONLY',
+            sampleSeconds: 10,
+            roundIndex: 1
+        });
+        const status = await getMediaProviderStatus({ ensureMaxAgeMs: 30_000 });
+
+        expect(status.cached).toBe(true);
+        expect(status.ok).toBe(true);
+        expect(status.latencyMs).toBeGreaterThanOrEqual(0);
+        expect(axios.get).toHaveBeenCalledTimes(2);
+    });
+
+    test('re-probes provider status when stale beyond ensureMaxAgeMs', async () => {
+        jest.useFakeTimers();
+        jest.setSystemTime(new Date('2026-03-02T00:00:00.000Z'));
+
+        try {
+            axios.get.mockResolvedValue({
+                status: 200,
+                data: {
+                    anime: []
+                }
+            });
+
+            const first = await getMediaProviderStatus({ forceRefresh: true });
+            expect(first.cached).toBe(false);
+
+            jest.setSystemTime(new Date('2026-03-02T00:00:20.000Z'));
+            const withinAge = await getMediaProviderStatus({ ensureMaxAgeMs: 30_000 });
+            expect(withinAge.cached).toBe(true);
+
+            jest.setSystemTime(new Date('2026-03-02T00:00:31.000Z'));
+            const stale = await getMediaProviderStatus({ ensureMaxAgeMs: 30_000 });
+            expect(stale.cached).toBe(false);
+            expect(axios.get).toHaveBeenCalledTimes(2);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
     test('marks provider status as down on timeout', async () => {
         axios.get.mockRejectedValue({
             code: 'ECONNABORTED',

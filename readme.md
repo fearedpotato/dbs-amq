@@ -1,6 +1,6 @@
 # DJABUSite (Anime Music Quiz)
 
-Last updated: 2026-02-27
+Last updated: 2026-03-03
 
 Anime music quiz app with:
 
@@ -79,6 +79,7 @@ Fail-fast startup validation currently checks:
   - `MEDIA_PROXY_URL_TTL_SEC`
   - `MEDIA_PROXY_RATE_LIMIT_WINDOW_MS`
   - `MEDIA_PROXY_RATE_LIMIT_MAX`
+  - `MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS`
 
 Common production additions:
 
@@ -100,6 +101,13 @@ Common tuning:
 - `MAL_WATCHED_*`
 - `ANIME_CATALOG_SYNC_*`
 - `TELEMETRY_ENABLED`, `TELEMETRY_LEVEL`
+
+Media cache behavior:
+
+- Shared global cache directory (default `backend/.cache/media`) reused across lobbies/sessions.
+- Cache entries track `cachedAt` + `lastUsedAt`.
+- `lastUsedAt` is updated on cache hits with throttling via `MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS` (default `60000`).
+- Eviction is size-based (`MEDIA_PROXY_CACHE_MAX_BYTES`) and removes oldest-by-`lastUsedAt`.
 
 ## Frontend Build Flow
 

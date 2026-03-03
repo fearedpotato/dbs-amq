@@ -501,15 +501,6 @@ jest.mock('../../game/roundService', () => {
 });
 jest.mock('../../game/mediaProxyService', () => ({
     buildMediaProxyUrl: jest.fn((url) => url),
-    evictCacheForMediaUrls: jest.fn().mockResolvedValue({
-        attempted: 0,
-        removed: 0,
-        skipped: 0
-    }),
-    deleteLobbyCache: jest.fn().mockResolvedValue({
-        removed: true,
-        lobbyCode: 'MATCH1'
-    }),
     prewarmManifest: jest.fn(async (_manifest, options = {}) => {
         const roundLimit = Number.parseInt(options?.roundLimit, 10) || 3;
         if (roundLimit <= 1) {

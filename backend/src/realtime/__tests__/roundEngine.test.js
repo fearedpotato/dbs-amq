@@ -21,15 +21,6 @@ jest.mock('../../game/mediaProxyService', () => ({
         warmed: 0,
         failed: 0,
         skipped: 0
-    }),
-    evictCacheForMediaUrls: jest.fn().mockResolvedValue({
-        attempted: 0,
-        removed: 0,
-        skipped: 0
-    }),
-    deleteLobbyCache: jest.fn().mockResolvedValue({
-        removed: true,
-        lobbyCode: 'ABC123'
     })
 }));
 
@@ -269,7 +260,6 @@ describe('round engine', () => {
             lobbyCode: 'ABC123',
             sessionId: 100
         }));
-        expect(mediaProxyService.evictCacheForMediaUrls).not.toHaveBeenCalled();
     });
 
     test('does not prewarm sudden death when last-round lead is 2 or more', async () => {

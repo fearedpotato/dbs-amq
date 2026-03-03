@@ -14,8 +14,7 @@ const {
     parseAndVerifyProxyRequest,
     getOrCreateCacheEntry,
     prewarmManifest,
-    evictCacheForMediaUrl,
-    deleteLobbyCache
+    evictCacheForMediaUrl
 } = require('../mediaProxyService');
 
 describe('mediaProxyService', () => {
@@ -110,6 +109,106 @@ describe('mediaProxyService', () => {
         expect(axios.get).toHaveBeenCalledTimes(1);
     });
 
+    test('updates lastUsedAt on cache hit when touch interval elapsed', async () => {
+        process.env.MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS = '1';
+        const payload = Buffer.from('demo-media-payload');
+        axios.get.mockResolvedValue({
+            headers: { 'content-type': 'audio/mpeg' },
+            data: Readable.from(payload)
+        });
+
+        const sourceUrl = 'https://cdn.example.com/touch-elapsed.mp3';
+        const first = await getOrCreateCacheEntry(sourceUrl);
+        const firstMeta = JSON.parse(await fs.promises.readFile(first.metaPath, 'utf8'));
+        const firstLastUsedAt = firstMeta.lastUsedAt;
+
+        await new Promise((resolve) => setTimeout(resolve, 5));
+
+        const second = await getOrCreateCacheEntry(sourceUrl);
+        const secondMeta = JSON.parse(await fs.promises.readFile(first.metaPath, 'utf8'));
+
+        expect(second.cacheStatus).toBe('HIT');
+        expect(new Date(secondMeta.lastUsedAt).getTime()).toBeGreaterThan(new Date(firstLastUsedAt).getTime());
+        expect(second.lastUsedAt).toBe(secondMeta.lastUsedAt);
+    });
+
+    test('does not update lastUsedAt on cache hit when touch interval not elapsed', async () => {
+        process.env.MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS = '60000';
+        const payload = Buffer.from('demo-media-payload');
+        axios.get.mockResolvedValue({
+            headers: { 'content-type': 'audio/mpeg' },
+            data: Readable.from(payload)
+        });
+
+        const sourceUrl = 'https://cdn.example.com/touch-throttled.mp3';
+        const first = await getOrCreateCacheEntry(sourceUrl);
+        const firstMeta = JSON.parse(await fs.promises.readFile(first.metaPath, 'utf8'));
+
+        const second = await getOrCreateCacheEntry(sourceUrl);
+        const secondMeta = JSON.parse(await fs.promises.readFile(first.metaPath, 'utf8'));
+
+        expect(second.cacheStatus).toBe('HIT');
+        expect(secondMeta.lastUsedAt).toBe(firstMeta.lastUsedAt);
+        expect(second.lastUsedAt).toBe(firstMeta.lastUsedAt);
+    });
+
+    test('uses cachedAt as fallback when legacy metadata has no lastUsedAt', async () => {
+        process.env.MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS = '60000';
+        const payload = Buffer.from('demo-media-payload');
+        axios.get.mockResolvedValue({
+            headers: { 'content-type': 'audio/mpeg' },
+            data: Readable.from(payload)
+        });
+
+        const sourceUrl = 'https://cdn.example.com/legacy-meta.mp3';
+        const first = await getOrCreateCacheEntry(sourceUrl);
+        const firstMeta = JSON.parse(await fs.promises.readFile(first.metaPath, 'utf8'));
+
+        await fs.promises.writeFile(first.metaPath, JSON.stringify({
+            ...firstMeta,
+            lastUsedAt: undefined
+        }), 'utf8');
+
+        const second = await getOrCreateCacheEntry(sourceUrl);
+        const secondMeta = JSON.parse(await fs.promises.readFile(first.metaPath, 'utf8'));
+
+        expect(second.cacheStatus).toBe('HIT');
+        expect(second.lastUsedAt).toBe(firstMeta.cachedAt);
+        expect(secondMeta.lastUsedAt).toBeUndefined();
+    });
+
+    test('prunes oldest lastUsedAt entry when cache exceeds max bytes', async () => {
+        process.env.MEDIA_PROXY_CACHE_MAX_BYTES = '20';
+        process.env.MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS = '1';
+        axios.get.mockImplementation(async (url) => {
+            const token = String(url).split('/').pop().replace('.mp3', '');
+            const payload = Buffer.from(token.repeat(10).slice(0, 10), 'utf8');
+            return {
+                headers: { 'content-type': 'audio/mpeg' },
+                data: Readable.from(payload)
+            };
+        });
+
+        const aUrl = 'https://cdn.example.com/a.mp3';
+        const bUrl = 'https://cdn.example.com/b.mp3';
+        const cUrl = 'https://cdn.example.com/c.mp3';
+
+        const a = await getOrCreateCacheEntry(aUrl);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const b = await getOrCreateCacheEntry(bUrl);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const aHit = await getOrCreateCacheEntry(aUrl);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const c = await getOrCreateCacheEntry(cUrl);
+
+        expect(aHit.cacheStatus).toBe('HIT');
+        expect(c.cacheStatus).toBe('MISS');
+        expect(fs.existsSync(a.dataPath)).toBe(true);
+        expect(fs.existsSync(b.dataPath)).toBe(false);
+        expect(fs.existsSync(c.dataPath)).toBe(true);
+        expect(axios.get).toHaveBeenCalledTimes(3);
+    });
+
     test('rejects signed proxy URL when host is not allowed', () => {
         const proxied = buildMediaProxyUrl('https://evil.example.net/audio.mp3');
         const parsed = new URL(`http://localhost${proxied}`);
@@ -183,7 +282,7 @@ describe('mediaProxyService', () => {
         expect(fs.existsSync(created.dataPath)).toBe(false);
     });
 
-    test('removes empty scoped cache folder after evicting last media entry', async () => {
+    test('evicts cached media from shared cache while keeping root cache folder', async () => {
         const payload = Buffer.from('demo-media-payload');
         axios.get.mockResolvedValue({
             headers: { 'content-type': 'audio/mpeg' },
@@ -192,15 +291,16 @@ describe('mediaProxyService', () => {
 
         const sourceUrl = 'https://cdn.example.com/solo-scope.mp3';
         const created = await getOrCreateCacheEntry(sourceUrl, { lobbyCode: 'ALPHA1' });
-        const scopeDir = path.dirname(created.dataPath);
-        expect(fs.existsSync(scopeDir)).toBe(true);
+        const rootCacheDir = path.dirname(created.dataPath);
+        expect(rootCacheDir).toBe(cacheDir);
+        expect(fs.existsSync(rootCacheDir)).toBe(true);
 
         const proxied = buildMediaProxyUrl(sourceUrl, { lobbyCode: 'ALPHA1' });
         const eviction = await evictCacheForMediaUrl(proxied);
 
         expect(eviction.removed).toBe(true);
         expect(fs.existsSync(created.dataPath)).toBe(false);
-        expect(fs.existsSync(scopeDir)).toBe(false);
+        expect(fs.existsSync(rootCacheDir)).toBe(true);
     });
 
     test('blocks cache download when DNS resolves to private IP', async () => {
@@ -214,7 +314,7 @@ describe('mediaProxyService', () => {
         expect(axios.get).not.toHaveBeenCalled();
     });
 
-    test('stores cache in per-lobby folders and deletes only targeted lobby folder', async () => {
+    test('reuses shared cache file across different lobby codes', async () => {
         const payload = Buffer.from('demo-media-payload');
         axios.get.mockResolvedValue({
             headers: { 'content-type': 'audio/mpeg' },
@@ -225,16 +325,12 @@ describe('mediaProxyService', () => {
         const alpha = await getOrCreateCacheEntry(sourceUrl, { lobbyCode: 'ALPHA1' });
         const beta = await getOrCreateCacheEntry(sourceUrl, { lobbyCode: 'BETA2' });
 
-        expect(alpha.dataPath).toContain(path.join('ALPHA1', `${alpha.key}.bin`));
-        expect(beta.dataPath).toContain(path.join('BETA2', `${beta.key}.bin`));
+        expect(alpha.dataPath).toBe(path.join(cacheDir, `${alpha.key}.bin`));
+        expect(beta.dataPath).toBe(path.join(cacheDir, `${beta.key}.bin`));
+        expect(beta.dataPath).toBe(alpha.dataPath);
         expect(fs.existsSync(alpha.dataPath)).toBe(true);
         expect(fs.existsSync(beta.dataPath)).toBe(true);
-
-        const deletion = await deleteLobbyCache('ALPHA1');
-        expect(deletion.removed).toBe(true);
-        expect(deletion.lobbyCode).toBe('ALPHA1');
-
-        expect(fs.existsSync(alpha.dataPath)).toBe(false);
-        expect(fs.existsSync(beta.dataPath)).toBe(true);
+        expect(axios.get).toHaveBeenCalledTimes(1);
     });
+
 });

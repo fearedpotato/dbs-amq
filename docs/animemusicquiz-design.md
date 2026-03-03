@@ -1,6 +1,6 @@
 # Anime Music Quiz Design (Current Implementation)
 
-Last updated: 2026-02-28
+Last updated: 2026-03-03
 
 ## 1. Purpose
 
@@ -220,9 +220,11 @@ Score-range filtering:
 
 - Client-facing links are signed URLs under `/api/game/media/proxy`
 - Signature + TTL + host allowlist + SSRF protections enforced
-- Cache is lobby-scoped under `backend/.cache/media/<LOBBY_CODE>` by default (overridable via `MEDIA_PROXY_CACHE_DIR`)
-- Round media is evicted after round finalize
-- Lobby cache directory is deleted when session finishes
+- Cache is shared globally under `backend/.cache/media` by default (overridable via `MEDIA_PROXY_CACHE_DIR`)
+- Cache entries store `cachedAt` and `lastUsedAt`
+- `lastUsedAt` is refreshed on cache hit (including prewarm hits), throttled by `MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS` (default 60s)
+- Cache is retained across lobbies/sessions and reused when later rounds resolve the same source media URL
+- When `MEDIA_PROXY_CACHE_MAX_BYTES` is exceeded, eviction removes oldest entries by `lastUsedAt` (fallback `cachedAt` for legacy metadata)
 
 ## 11. Search and Catalog
 

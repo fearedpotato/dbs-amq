@@ -150,6 +150,23 @@ function validateStartupEnv({ env = process.env, skipInTest = true } = {}) {
         } else if (mediaProxyRateLimitMax > 10_000) {
             pushIssue(issues, 'MEDIA_PROXY_RATE_LIMIT_MAX', 'MEDIA_PROXY_RATE_LIMIT_MAX must be less than or equal to 10000');
         }
+
+        const mediaProxyLastUsedTouchIntervalMs = parsePositiveInt(
+            env.MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS || 60_000
+        );
+        if (!mediaProxyLastUsedTouchIntervalMs) {
+            pushIssue(
+                issues,
+                'MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS',
+                'MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS must be a positive integer'
+            );
+        } else if (mediaProxyLastUsedTouchIntervalMs < 1_000 || mediaProxyLastUsedTouchIntervalMs > 3_600_000) {
+            pushIssue(
+                issues,
+                'MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS',
+                'MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS must be between 1000 and 3600000'
+            );
+        }
     }
 
     if (issues.length > 0) {
@@ -175,7 +192,8 @@ function validateStartupEnv({ env = process.env, skipInTest = true } = {}) {
             'MEDIA_PROXY_ALLOWED_HOSTS',
             'MEDIA_PROXY_URL_TTL_SEC',
             'MEDIA_PROXY_RATE_LIMIT_WINDOW_MS',
-            'MEDIA_PROXY_RATE_LIMIT_MAX'
+            'MEDIA_PROXY_RATE_LIMIT_MAX',
+            'MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS'
         ]
     });
 

@@ -7,6 +7,8 @@ const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_CACHE_MAX_ENTRIES = 400;
 const DEFAULT_BLACKLIST_TTL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_PROVIDER_STATUS_CACHE_MS = 15_000;
+const DEFAULT_PROVIDER_STATUS_OPPORTUNISTIC_MS = 20_000;
+const DEFAULT_PROVIDER_STATUS_AUTOMATED_STALE_MS = 30_000;
 const PROVIDER_PROBE_TIMEOUT_CAP_MS = 5_000;
 const SONG_EQUIVALENTS_FETCH_BATCH_SIZE = 40;
 
@@ -47,8 +49,133 @@ function getProviderStatusCacheMs() {
     return parsePositiveInt(process.env.ANIMETHEMES_STATUS_CACHE_MS, DEFAULT_PROVIDER_STATUS_CACHE_MS);
 }
 
+function getProviderStatusOpportunisticMs() {
+    return parsePositiveInt(
+        process.env.ANIMETHEMES_STATUS_OPPORTUNISTIC_MS,
+        DEFAULT_PROVIDER_STATUS_OPPORTUNISTIC_MS
+    );
+}
+
+function getProviderStatusAutomatedStaleMs() {
+    return parsePositiveInt(
+        process.env.ANIMETHEMES_STATUS_AUTOMATED_STALE_MS,
+        DEFAULT_PROVIDER_STATUS_AUTOMATED_STALE_MS
+    );
+}
+
 function getProbeTimeoutMs() {
     return Math.max(500, Math.min(getTimeoutMs(), PROVIDER_PROBE_TIMEOUT_CAP_MS));
+}
+
+function getCacheSnapshot() {
+    return {
+        animeEntries: animeCache.size,
+        blacklistEntries: unplayableBlacklist.size
+    };
+}
+
+function toProviderErrorMessage(err, timeoutMs) {
+    const timedOut = err?.code === 'ECONNABORTED';
+    if (timedOut) {
+        return `Timed out after ${timeoutMs}ms`;
+    }
+    return sanitizeTitle(err?.response?.statusText, sanitizeTitle(err?.message, 'Request failed'));
+}
+
+function buildProviderStatusSnapshot({
+    baseUrl,
+    timeoutMs,
+    ok,
+    statusCode,
+    latencyMs,
+    error = null,
+    checkedAtMs = Date.now()
+}) {
+    return {
+        provider: 'AnimeThemes',
+        baseUrl,
+        timeoutMs,
+        ok: Boolean(ok),
+        statusCode: Number.isInteger(statusCode) ? statusCode : null,
+        latencyMs: Number.isFinite(latencyMs) ? Math.max(0, latencyMs) : null,
+        error: ok ? null : sanitizeTitle(error, 'Request failed'),
+        checkedAt: new Date(checkedAtMs).toISOString(),
+        cache: getCacheSnapshot()
+    };
+}
+
+function setProviderStatusCache(status, now = Date.now()) {
+    providerStatusCache.value = status;
+    providerStatusCache.expiresAt = now + getProviderStatusCacheMs();
+}
+
+function getProviderStatusCheckedAtMs(status = providerStatusCache.value) {
+    const checkedAt = status?.checkedAt;
+    if (typeof checkedAt !== 'string') return null;
+    const parsed = Date.parse(checkedAt);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getProviderStatusAgeMs(now = Date.now()) {
+    const checkedAtMs = getProviderStatusCheckedAtMs(providerStatusCache.value);
+    if (!Number.isFinite(checkedAtMs)) return Number.POSITIVE_INFINITY;
+    return Math.max(0, now - checkedAtMs);
+}
+
+function hasProviderStatusWithinAge(maxAgeMs, now = Date.now()) {
+    const parsedMaxAgeMs = parsePositiveInt(maxAgeMs, 0);
+    if (parsedMaxAgeMs <= 0) return false;
+    return getProviderStatusAgeMs(now) <= parsedMaxAgeMs;
+}
+
+function shouldRunOpportunisticProviderStatusCheck(now = Date.now()) {
+    return getProviderStatusAgeMs(now) >= getProviderStatusOpportunisticMs();
+}
+
+function maybeCaptureProviderStatusFromRequest({ startedAt, baseUrl, timeoutMs, response, err }) {
+    const now = Date.now();
+    if (!shouldRunOpportunisticProviderStatusCheck(now)) return;
+
+    const statusCode = Number.parseInt(response?.status ?? err?.response?.status, 10);
+    const hasResponseStatus = Number.isInteger(statusCode);
+    const ok = response
+        ? true
+        : (hasResponseStatus ? statusCode < 500 : false);
+
+    const status = buildProviderStatusSnapshot({
+        baseUrl,
+        timeoutMs,
+        ok,
+        statusCode: hasResponseStatus ? statusCode : null,
+        latencyMs: now - startedAt,
+        error: ok ? null : toProviderErrorMessage(err, timeoutMs),
+        checkedAtMs: now
+    });
+    setProviderStatusCache(status, now);
+}
+
+async function requestProvider(pathname, { timeout = getTimeoutMs(), params } = {}) {
+    const startedAt = Date.now();
+    const baseUrl = getBaseUrl();
+
+    try {
+        const response = await axios.get(`${baseUrl}${pathname}`, { timeout, params });
+        maybeCaptureProviderStatusFromRequest({
+            startedAt,
+            baseUrl,
+            timeoutMs: timeout,
+            response
+        });
+        return response;
+    } catch (err) {
+        maybeCaptureProviderStatusFromRequest({
+            startedAt,
+            baseUrl,
+            timeoutMs: timeout,
+            err
+        });
+        throw err;
+    }
 }
 
 function toPositiveInt(value) {
@@ -288,7 +415,7 @@ function extractThemeCandidates(animeEntry, malAnimeId, fallbackTitle) {
 async function fetchAnimeThemesIdByMalId(malAnimeId) {
     const sites = ['myanimelist', 'MyAnimeList'];
     for (const site of sites) {
-        const response = await axios.get(`${getBaseUrl()}/resource`, {
+        const response = await requestProvider('/resource', {
             timeout: getTimeoutMs(),
             params: {
                 'filter[external_id]': malAnimeId,
@@ -313,7 +440,7 @@ async function fetchAnimeThemesIdByMalId(malAnimeId) {
 }
 
 async function fetchAnimeThemesEntryByInternalId(animeThemesAnimeId) {
-    const response = await axios.get(`${getBaseUrl()}/anime`, {
+    const response = await requestProvider('/anime', {
         timeout: getTimeoutMs(),
         params: {
             'filter[anime][id]': animeThemesAnimeId,
@@ -324,7 +451,7 @@ async function fetchAnimeThemesEntryByInternalId(animeThemesAnimeId) {
     const animeRows = listFromResponse(response.data, ['anime']);
     if (animeRows[0]) return animeRows[0];
 
-    const fallback = await axios.get(`${getBaseUrl()}/anime/${animeThemesAnimeId}`, {
+    const fallback = await requestProvider(`/anime/${animeThemesAnimeId}`, {
         timeout: getTimeoutMs(),
         params: {
             include: 'animethemes.animethemeentries.videos,animethemes.song'
@@ -412,7 +539,7 @@ async function fetchMalAnimeIdsForAnimeThemesIds(animeThemesAnimeIds = []) {
 
     const malAnimeIds = new Set();
     for (const chunk of chunkValues(ids)) {
-        const response = await axios.get(`${getBaseUrl()}/anime`, {
+        const response = await requestProvider('/anime', {
             timeout: getTimeoutMs(),
             params: {
                 'filter[anime][id]': chunk.join(','),
@@ -443,7 +570,7 @@ async function resolveAcceptedAnimeIdsForSong({ songId, fallbackAnimeId }) {
     }
 
     try {
-        const response = await axios.get(`${getBaseUrl()}/song/${resolvedSongId}`, {
+        const response = await requestProvider(`/song/${resolvedSongId}`, {
             timeout: getTimeoutMs(),
             params: {
                 include: 'animethemes.anime'
@@ -527,61 +654,49 @@ async function probeMediaProvider() {
         });
 
         return {
-            provider: 'AnimeThemes',
-            baseUrl,
-            timeoutMs,
-            ok: true,
-            statusCode: Number.isInteger(response?.status) ? response.status : 200,
-            latencyMs: Math.max(0, Date.now() - startedAt),
-            error: null,
-            checkedAt: new Date().toISOString(),
-            cache: {
-                animeEntries: animeCache.size,
-                blacklistEntries: unplayableBlacklist.size
-            }
+            ...buildProviderStatusSnapshot({
+                baseUrl,
+                timeoutMs,
+                ok: true,
+                statusCode: Number.isInteger(response?.status) ? response.status : 200,
+                latencyMs: Date.now() - startedAt
+            }),
+            checkedAt: new Date().toISOString()
         };
     } catch (err) {
         const statusCode = Number.parseInt(err?.response?.status, 10);
-        const timedOut = err?.code === 'ECONNABORTED';
-        const message = timedOut
-            ? `Timed out after ${timeoutMs}ms`
-            : sanitizeTitle(err?.response?.statusText, sanitizeTitle(err?.message, 'Request failed'));
-
         return {
-            provider: 'AnimeThemes',
-            baseUrl,
-            timeoutMs,
-            ok: false,
-            statusCode: Number.isInteger(statusCode) ? statusCode : null,
-            latencyMs: Math.max(0, Date.now() - startedAt),
-            error: message,
-            checkedAt: new Date().toISOString(),
-            cache: {
-                animeEntries: animeCache.size,
-                blacklistEntries: unplayableBlacklist.size
-            }
+            ...buildProviderStatusSnapshot({
+                baseUrl,
+                timeoutMs,
+                ok: false,
+                statusCode: Number.isInteger(statusCode) ? statusCode : null,
+                latencyMs: Date.now() - startedAt,
+                error: toProviderErrorMessage(err, timeoutMs)
+            }),
+            checkedAt: new Date().toISOString()
         };
     }
 }
 
-async function getMediaProviderStatus({ forceRefresh = false } = {}) {
+async function getMediaProviderStatus({ forceRefresh = false, ensureMaxAgeMs = null } = {}) {
     const now = Date.now();
-    const ttlMs = getProviderStatusCacheMs();
+    const hasFreshStatusByAge = hasProviderStatusWithinAge(ensureMaxAgeMs, now);
 
-    if (!forceRefresh && providerStatusCache.value && now < providerStatusCache.expiresAt) {
+    if (
+        !forceRefresh
+        && providerStatusCache.value
+        && (hasFreshStatusByAge || now < providerStatusCache.expiresAt)
+    ) {
         return {
             ...providerStatusCache.value,
             cached: true,
-            cache: {
-                animeEntries: animeCache.size,
-                blacklistEntries: unplayableBlacklist.size
-            }
+            cache: getCacheSnapshot()
         };
     }
 
     const status = await probeMediaProvider();
-    providerStatusCache.value = status;
-    providerStatusCache.expiresAt = now + ttlMs;
+    setProviderStatusCache(status, now);
 
     return {
         ...status,
@@ -592,5 +707,6 @@ async function getMediaProviderStatus({ forceRefresh = false } = {}) {
 module.exports = {
     resolveRoundMedia,
     getMediaProviderStatus,
+    getProviderStatusAutomatedStaleMs,
     __clearMediaCache
 };

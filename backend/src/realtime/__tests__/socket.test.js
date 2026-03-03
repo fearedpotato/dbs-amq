@@ -29,10 +29,6 @@ jest.mock('../../game/mediaProxyService', () => ({
         warmed: 0,
         failed: 0,
         skipped: 0
-    }),
-    deleteLobbyCache: jest.fn().mockResolvedValue({
-        removed: true,
-        lobbyCode: 'ABC123'
     })
 }));
 
@@ -404,7 +400,7 @@ describe('socket gateway', () => {
         expect(lobbyService.leaveLobby).toHaveBeenCalledWith('ABC123', 1, { force: true });
     });
 
-    test('terminates lobby when last player leaves and clears cache', async () => {
+    test('terminates lobby when last player leaves', async () => {
         const activeLobby = buildLobby({ code: 'ABC123', hostId: 1, playerIds: [1] });
         const closedLobby = {
             ...buildLobby({ code: 'ABC123', hostId: 1, playerIds: [] }),
@@ -425,7 +421,6 @@ describe('socket gateway', () => {
         expect(ack.terminated).toBe(true);
         expect(ack.lobby).toBeNull();
         expect(roundEngineMock.forceStopLobby).toHaveBeenCalledWith('ABC123', 'all_players_left');
-        expect(mediaProxyService.deleteLobbyCache).toHaveBeenCalledWith('ABC123');
     });
 
     test('triggers media prewarm when game starts', async () => {

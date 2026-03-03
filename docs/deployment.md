@@ -1,6 +1,6 @@
 # Deployment Guide
 
-Last updated: 2026-02-27
+Last updated: 2026-03-03
 
 This app deploys as one Node backend serving both API + Socket.IO + static frontend assets.
 
@@ -62,6 +62,7 @@ Fail-fast startup validation currently checks:
   - `MEDIA_PROXY_URL_TTL_SEC`
   - `MEDIA_PROXY_RATE_LIMIT_WINDOW_MS`
   - `MEDIA_PROXY_RATE_LIMIT_MAX`
+  - `MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS`
 
 Use `backend/.env.example` as baseline.
 
@@ -96,6 +97,14 @@ Media proxy:
 - `MEDIA_PROXY_CACHE_MAX_BYTES`
 - `MEDIA_PROXY_RATE_LIMIT_WINDOW_MS`
 - `MEDIA_PROXY_RATE_LIMIT_MAX`
+- `MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS`
+
+Cache behavior:
+
+- Media cache is shared globally (not lobby-scoped) under `MEDIA_PROXY_CACHE_DIR`.
+- Entries are reused across lobbies/sessions when the same source URL is requested.
+- `lastUsedAt` is touched on cache hits (throttled by `MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS`).
+- Eviction is size-based only (`MEDIA_PROXY_CACHE_MAX_BYTES`), removing oldest-by-`lastUsedAt`.
 
 Provider/search/catalog tuning:
 

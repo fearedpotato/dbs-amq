@@ -3,14 +3,12 @@ const animeCatalogService = require('../game/animeCatalogService');
 const { httpError } = require('../game/errors');
 const {
     buildMediaProxyUrl,
-    prewarmManifest,
-    evictCacheForMediaUrls
+    prewarmManifest
 } = require('../game/mediaProxyService');
 const telemetry = require('../lib/telemetry');
 
 const MAX_SUDDEN_DEATH_ROUNDS = 20;
 const DEFAULT_ZERO_CONNECTED_ROUNDS_TO_KILL = 3;
-const DEFAULT_EVICT_COMPLETED_ROUND_MEDIA = false;
 const ALL_READY_REVEAL_DELAY_MS = 1_000;
 const INVISIBLE_WHITESPACE_REGEX = /[\u200B-\u200D\u2060\uFEFF]/gu;
 
@@ -19,26 +17,10 @@ function parsePositiveInt(value, fallback) {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function parseBoolean(value, fallback) {
-    if (typeof value === 'boolean') return value;
-    const normalized = String(value || '').trim().toLowerCase();
-    if (!normalized) return fallback;
-    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
-    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
-    return fallback;
-}
-
 function getZeroConnectedRoundsToKill() {
     return parsePositiveInt(
         process.env.LOBBY_ZERO_CONNECTED_ROUNDS_TO_KILL,
         DEFAULT_ZERO_CONNECTED_ROUNDS_TO_KILL
-    );
-}
-
-function shouldEvictCompletedRoundMedia() {
-    return parseBoolean(
-        process.env.MEDIA_PROXY_EVICT_COMPLETED_ROUND_MEDIA,
-        DEFAULT_EVICT_COMPLETED_ROUND_MEDIA
     );
 }
 
@@ -527,30 +509,6 @@ function createRoundEngine(io, options = {}) {
             }
         );
         if (!transitioned) return;
-
-        const completedRound = state.currentRound;
-        if (shouldEvictCompletedRoundMedia()) {
-            evictCacheForMediaUrls([
-                completedRound?.solutionAudioUrl,
-                completedRound?.solutionVideoUrl
-            ]).then((summary) => {
-                telemetry.info('media.cache_evicted_after_round', {
-                    lobbyCode,
-                    sessionId: state.sessionId,
-                    roundId: completedRound?.id || null,
-                    index: completedRound?.index || null,
-                    ...summary
-                });
-            }).catch((err) => {
-                telemetry.warn('media.cache_evict_failed', {
-                    lobbyCode,
-                    sessionId: state.sessionId,
-                    roundId: completedRound?.id || null,
-                    index: completedRound?.index || null,
-                    error: err?.message || String(err)
-                });
-            });
-        }
 
         const sessionSnapshot = await roundService.getSessionById(state.sessionId);
         if (sessionSnapshot?.lobby?.players) {

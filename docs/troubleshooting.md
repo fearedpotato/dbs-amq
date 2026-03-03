@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Last updated: 2026-02-27
+Last updated: 2026-03-03
 
 ## Server exits with startup validation error
 
@@ -22,6 +22,7 @@ Checks:
    - `MEDIA_PROXY_URL_TTL_SEC`
    - `MEDIA_PROXY_RATE_LIMIT_WINDOW_MS`
    - `MEDIA_PROXY_RATE_LIMIT_MAX`
+   - `MEDIA_PROXY_LAST_USED_TOUCH_INTERVAL_MS`
 
 Fix:
 

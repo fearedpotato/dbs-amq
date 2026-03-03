@@ -59,6 +59,7 @@ const DEFAULT_DISCONNECT_GRACE_MS = 1_200;
 const DEFAULT_LOBBY_JOIN_BURST_WINDOW_MS = 5_000;
 const DEFAULT_LOBBY_JOIN_BURST_MAX = 4;
 const DEFAULT_LOBBY_JOIN_BLOCK_MS = 15_000;
+const DEFAULT_MEDIA_STATUS_AUTOMATED_CHECK_MS = 30_000;
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
@@ -103,6 +104,13 @@ function shouldBlockStartOnFirstRoundPrewarm() {
     return parseBoolean(process.env.MEDIA_PREWARM_BLOCKING_START, DEFAULT_PREWARM_BLOCKING_START);
 }
 
+function getMediaStatusAutomatedCheckMs() {
+    const fallback = typeof mediaService.getProviderStatusAutomatedStaleMs === 'function'
+        ? mediaService.getProviderStatusAutomatedStaleMs()
+        : DEFAULT_MEDIA_STATUS_AUTOMATED_CHECK_MS;
+    return parsePositiveInt(process.env.MEDIA_STATUS_AUTOMATED_CHECK_MS, fallback);
+}
+
 function attachRealtime(httpServer, options = {}) {
     const io = new Server(httpServer, {
         cors: {
@@ -122,9 +130,9 @@ function attachRealtime(httpServer, options = {}) {
     let mediaStatusBroadcastTimer = null;
     let lastMediaSourceStatus = null;
 
-    async function fetchLatestMediaSourceStatus({ forceRefresh = false } = {}) {
+    async function fetchLatestMediaSourceStatus({ forceRefresh = false, ensureMaxAgeMs = null } = {}) {
         try {
-            const status = await mediaService.getMediaProviderStatus({ forceRefresh });
+            const status = await mediaService.getMediaProviderStatus({ forceRefresh, ensureMaxAgeMs });
             lastMediaSourceStatus = status;
             return status;
         } catch (err) {
@@ -151,9 +159,9 @@ function attachRealtime(httpServer, options = {}) {
         }
     }
 
-    async function publishMediaSourceStatus({ forceRefresh = false } = {}) {
+    async function publishMediaSourceStatus({ forceRefresh = false, ensureMaxAgeMs = null } = {}) {
         if (!mediaStatusBroadcastEnabled) return null;
-        const status = await fetchLatestMediaSourceStatus({ forceRefresh });
+        const status = await fetchLatestMediaSourceStatus({ forceRefresh, ensureMaxAgeMs });
         io.emit('media:source_status', {
             status,
             at: Date.now()
@@ -162,10 +170,11 @@ function attachRealtime(httpServer, options = {}) {
     }
 
     if (mediaStatusBroadcastEnabled) {
-        publishMediaSourceStatus({ forceRefresh: true }).catch(() => {});
+        const automatedMediaStatusCheckMs = getMediaStatusAutomatedCheckMs();
+        publishMediaSourceStatus({ ensureMaxAgeMs: automatedMediaStatusCheckMs }).catch(() => {});
         mediaStatusBroadcastTimer = setInterval(() => {
-            publishMediaSourceStatus({ forceRefresh: true }).catch(() => {});
-        }, 10_000);
+            publishMediaSourceStatus({ ensureMaxAgeMs: automatedMediaStatusCheckMs }).catch(() => {});
+        }, automatedMediaStatusCheckMs);
         if (typeof mediaStatusBroadcastTimer?.unref === 'function') {
             mediaStatusBroadcastTimer.unref();
         }
@@ -418,21 +427,6 @@ function attachRealtime(httpServer, options = {}) {
             io.to(code).emit('lobby:terminated', {
                 lobbyCode: code,
                 reason
-            });
-        }
-
-        try {
-            const summary = await mediaProxyService.deleteLobbyCache(code);
-            telemetry.info('media.cache_lobby_deleted_on_terminate', {
-                lobbyCode: code,
-                reason,
-                ...summary
-            });
-        } catch (err) {
-            telemetry.warn('media.cache_lobby_delete_on_terminate_failed', {
-                lobbyCode: code,
-                reason,
-                error: err?.message || String(err)
             });
         }
 

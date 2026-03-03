@@ -1,6 +1,6 @@
 # API Reference
 
-Last updated: 2026-02-28
+Last updated: 2026-03-03
 
 Base URL (local): `http://localhost:3000`  
 API prefix: `/api`
@@ -357,7 +357,7 @@ Streams signed media URL through backend cache/proxy.
 Notes:
 
 - This endpoint is signature-protected, not bearer-token protected.
-- `l` is optional lobby scope used by signed URLs.
+- `l` is an optional signature scope value; cache storage itself is global/shared (not lobby-scoped).
 - Route-level rate limit applies and may return `429` with `Retry-After`.
 
 ## Error Format
