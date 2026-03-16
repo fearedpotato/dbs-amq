@@ -704,7 +704,8 @@ function attachRealtime(httpServer, options = {}) {
     async function prewarmFirstRoundOrThrow(preloadManifest) {
         const summary = await mediaProxyService.prewarmManifest(preloadManifest, {
             roundLimit: 1,
-            maxConcurrent: 2
+            maxConcurrent: 4,
+            audioOnly: true
         });
         telemetry.info('media.prewarm_first_round', summary);
 
@@ -1180,8 +1181,9 @@ function attachRealtime(httpServer, options = {}) {
                 sessionActivated = true;
 
                 mediaProxyService.prewarmManifest(preloadManifest, {
-                    roundLimit: 3,
-                    maxConcurrent: 2
+                    roundLimit: 5,
+                    maxConcurrent: 4,
+                    audioOnly: true
                 }).catch((err) => {
                     telemetry.warn('media.prewarm_background_failed', {
                         lobbyCode: code,

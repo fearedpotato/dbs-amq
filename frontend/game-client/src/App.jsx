@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiFetch, getAuthToken, redirectToLogin } from './apiClient';
 import { closeGameSocket, getGameSocket } from './socketClient';
+import malBadgeImage from './assets/mal-badge.png';
 
 const SOURCE_MODES = ['POPULAR', 'MAL_ONLY', 'HYBRID'];
 const SELECTION_MODES = ['STANDARD', 'BALANCED_RELAXED'];
@@ -485,6 +486,7 @@ export default function App() {
     const lastSubmittedGuessRef = useRef({ roundId: null, key: '' });
     const guessTextRef = useRef('');
     const guessAnimeIdRef = useRef(null);
+    const hostBackdropPointerDownRef = useRef(false);
 
     const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState('');
@@ -539,6 +541,7 @@ export default function App() {
     const [preloadProgress, setPreloadProgress] = useState({ ready: 0, failed: 0, total: 0 });
     const [preloadGateError, setPreloadGateError] = useState('');
     const [preloadRetrying, setPreloadRetrying] = useState(false);
+    const [roundPreparation, setRoundPreparation] = useState({ active: false, nextRoundIndex: null });
     const [suddenDeathState, setSuddenDeathState] = useState(null);
     const [mediaSourceStatus, setMediaSourceStatus] = useState(null);
     const [mediaSourceError, setMediaSourceError] = useState('');
@@ -566,6 +569,11 @@ export default function App() {
                 : previous
         ));
     }, []);
+
+    useEffect(() => {
+        if (phase === 'WAITING' && lobby?.status === 'WAITING') return;
+        hideFloatingTooltip();
+    }, [phase, lobby?.status, hideFloatingTooltip]);
 
     const handleCreateMaxPlayersChange = useCallback((rawValue) => {
         const nextInput = normalizeMaxPlayersInput(rawValue);
@@ -658,6 +666,22 @@ export default function App() {
     useEffect(() => {
         guessAnimeIdRef.current = Number.isInteger(guessAnimeId) ? guessAnimeId : null;
     }, [guessAnimeId]);
+
+    useEffect(() => {
+        if (hostModalOpen) {
+            hostBackdropPointerDownRef.current = false;
+        }
+    }, [hostModalOpen]);
+
+    const handleHostBackdropPointerDown = useCallback((event) => {
+        hostBackdropPointerDownRef.current = event.target === event.currentTarget;
+    }, []);
+
+    const handleHostBackdropClick = useCallback((event) => {
+        if (event.target !== event.currentTarget) return;
+        if (!hostBackdropPointerDownRef.current) return;
+        setHostModalOpen(false);
+    }, []);
 
     useEffect(() => {
         if (!hostModalOpen && !settingsModalOpen && !promoteConfirmTarget && !kickConfirmTarget) return undefined;
@@ -967,7 +991,9 @@ export default function App() {
             return false;
         }
 
-        const urls = [entry.audioUrl, entry.videoUrl].filter((value, pos, arr) => value && arr.indexOf(value) === pos);
+        const primaryUrl = entry.audioUrl || entry.videoUrl || null;
+        const secondaryUrl = entry.audioUrl && entry.videoUrl ? entry.videoUrl : null;
+        const urls = [primaryUrl, secondaryUrl].filter((value, pos, arr) => value && arr.indexOf(value) === pos);
         preloadRoundUrlsRef.current.set(index, new Set(urls));
         preloadRoundStatusRef.current.set(index, 'loading');
         updatePreloadProgress();
@@ -978,13 +1004,28 @@ export default function App() {
                 return false;
             }
 
-            const results = await Promise.allSettled(urls.map((url) => {
-                const mediaKind = entry.audioUrl && url === entry.audioUrl ? 'audio' : 'video';
-                return preloadSingleUrl(url, mediaKind);
-            }));
-            const ok = results.some((result) => result.status === 'fulfilled');
-            preloadRoundStatusRef.current.set(index, ok ? 'ready' : 'failed');
-            return ok;
+            const primaryKind = entry.audioUrl && primaryUrl === entry.audioUrl ? 'audio' : 'video';
+            const primaryResult = await Promise.allSettled([
+                preloadSingleUrl(primaryUrl, primaryKind)
+            ]);
+            const primaryReady = primaryResult.some((result) => result.status === 'fulfilled');
+            if (primaryReady) {
+                preloadRoundStatusRef.current.set(index, 'ready');
+                return true;
+            }
+
+            if (!secondaryUrl || secondaryUrl === primaryUrl) {
+                preloadRoundStatusRef.current.set(index, 'failed');
+                return false;
+            }
+
+            const secondaryKind = entry.audioUrl && secondaryUrl === entry.audioUrl ? 'audio' : 'video';
+            const secondaryResult = await Promise.allSettled([
+                preloadSingleUrl(secondaryUrl, secondaryKind)
+            ]);
+            const secondaryReady = secondaryResult.some((result) => result.status === 'fulfilled');
+            preloadRoundStatusRef.current.set(index, secondaryReady ? 'ready' : 'failed');
+            return secondaryReady;
         })().finally(() => {
             preloadRoundPromiseRef.current.delete(index);
             updatePreloadProgress();
@@ -1380,6 +1421,7 @@ export default function App() {
         setSampleAutoplayBlocked(false);
         setSamplePlaybackSource(null);
         setSolutionVideoAutoplayBlocked(false);
+        setRoundPreparation({ active: false, nextRoundIndex: null });
         setSuddenDeathState(null);
         setGameStartPending(false);
     }, [resetPreloadManager, stopSamplePlayback, stopSolutionVideoPlayback]);
@@ -1890,6 +1932,7 @@ export default function App() {
             setPreloadBlocking(false);
             setPreloadGateError('');
             setPreloadRetrying(false);
+            setRoundPreparation({ active: false, nextRoundIndex: null });
             setPhase('GUESSING');
             setPhaseEndsAt(payload?.endsAt || null);
             setRound(payload || null);
@@ -1924,12 +1967,14 @@ export default function App() {
             preloadRollingWindow(payload?.index);
         };
         const onAnswersReveal = (payload) => {
+            setRoundPreparation({ active: false, nextRoundIndex: null });
             setPhase('ANSWERS_REVEAL');
             setPhaseEndsAt(payload?.endsAt || null);
             setAnswers(Array.isArray(payload?.answers) ? payload.answers : []);
         };
         const onSolution = (payload) => {
             stopSamplePlayback();
+            setRoundPreparation({ active: false, nextRoundIndex: null });
             setPhase('SOLUTION_REVEAL');
             setPhaseEndsAt(payload?.endsAt || null);
             setSolution(payload || null);
@@ -1944,6 +1989,7 @@ export default function App() {
             resetPreloadManager();
             stopSamplePlayback();
             stopSolutionVideoPlayback();
+            setRoundPreparation({ active: false, nextRoundIndex: null });
             setPhase('FINISHED');
             setGameStartPending(false);
             setPhaseEndsAt(null);
@@ -1957,6 +2003,23 @@ export default function App() {
             setSuddenDeathState(null);
             setLobbyReadyUserIds([]);
             setLobbyReadyRequiredUserIds([]);
+        };
+        const onRoundPreparing = (payload) => {
+            const eventCode = toCode(payload?.lobbyCode);
+            const currentCode = toCode(lobbyRef.current?.code);
+            if (eventCode && currentCode && eventCode !== currentCode) return;
+
+            const preparing = payload?.preparing === true;
+            if (!preparing) {
+                setRoundPreparation({ active: false, nextRoundIndex: null });
+                return;
+            }
+
+            const nextRoundIndex = Number.parseInt(payload?.nextRoundIndex, 10);
+            setRoundPreparation({
+                active: true,
+                nextRoundIndex: Number.isInteger(nextRoundIndex) ? nextRoundIndex : null
+            });
         };
         const onSuddenDeath = (payload) => {
             const tiedUserIds = Array.isArray(payload?.tiedUserIds)
@@ -2051,6 +2114,7 @@ export default function App() {
         socket.on('game:started', onGameStarted);
         socket.on('game:start_cancelled', onGameStartCancelled);
         socket.on('round:started', onRoundStarted);
+        socket.on('round:preparing', onRoundPreparing);
         socket.on('round:answers_reveal', onAnswersReveal);
         socket.on('round:solution', onSolution);
         socket.on('game:finished', onFinished);
@@ -2072,6 +2136,7 @@ export default function App() {
             socket.off('game:started', onGameStarted);
             socket.off('game:start_cancelled', onGameStartCancelled);
             socket.off('round:started', onRoundStarted);
+            socket.off('round:preparing', onRoundPreparing);
             socket.off('round:answers_reveal', onAnswersReveal);
             socket.off('round:solution', onSolution);
             socket.off('game:finished', onFinished);
@@ -2802,7 +2867,11 @@ export default function App() {
                     </article>
 
                     {hostModalOpen ? (
-                        <div className="gmq-modal-backdrop" onClick={() => setHostModalOpen(false)}>
+                        <div
+                            className="gmq-modal-backdrop"
+                            onPointerDown={handleHostBackdropPointerDown}
+                            onClick={handleHostBackdropClick}
+                        >
                             <article className="gmq-card gmq-modal-card" onClick={(event) => event.stopPropagation()}>
                                 <div className="gmq-modal-header">
                                     <h2>Host Lobby</h2>
@@ -2920,14 +2989,16 @@ export default function App() {
                                     <span className="gmq-player-name">
                                         <span>{player.displayName}{player.userId === lobby.host?.id ? ' (Host)' : ''}{!player.isConnected ? ' (offline)' : ''}</span>
                                         {player.hasMalConnected ? (
-                                            <span
+                                            <img
                                                 className="gmq-mal-badge"
+                                                src={malBadgeImage}
+                                                alt="MAL connected"
+                                                draggable={false}
+                                                onDragStart={(event) => event.preventDefault()}
                                                 onMouseEnter={showMalBadgeTooltipAtCursor}
                                                 onMouseMove={showMalBadgeTooltipAtCursor}
                                                 onMouseLeave={hideFloatingTooltip}
-                                            >
-                                                MAL
-                                            </span>
+                                            />
                                         ) : null}
                                     </span>
                                     {lobby.status === 'WAITING' ? (
@@ -2977,7 +3048,7 @@ export default function App() {
                                     </p>
                                 </div>
                                 {gameStartPending
-                                    ? <p className="gmq-muted">Starting game...</p>
+                                    ? <p className="gmq-muted">Preparing game...</p>
                                     : isHost
                                     ? (
                                         <>
@@ -3052,7 +3123,6 @@ export default function App() {
 
                                 <section className="gmq-match-center-column">
                                     <div className="gmq-match-panel gmq-video-panel">
-                                        <h3>Video</h3>
                                         {round?.sample?.audioUrl ? (
                                             <audio
                                                 key={`audio-${round.roundId}`}
@@ -3159,6 +3229,9 @@ export default function App() {
                                                 onChange={onSampleVolumeChange}
                                             />
                                         </label>
+                                        {roundPreparation.active ? (
+                                            <p className="gmq-muted gmq-round-preparing">Preparing next round...</p>
+                                        ) : null}
                                     </div>
 
                                     <div className="gmq-match-panel gmq-guess-panel">

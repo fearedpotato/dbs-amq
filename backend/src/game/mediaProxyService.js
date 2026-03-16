@@ -758,6 +758,7 @@ async function evictCacheForMediaUrls(mediaUrls = []) {
 async function prewarmManifest(manifest = [], options = {}) {
     const roundLimit = parsePositiveInt(options.roundLimit, 3);
     const maxConcurrent = Math.max(1, Math.min(parsePositiveInt(options.maxConcurrent, 2), 6));
+    const audioOnly = options.audioOnly === true;
     const rows = (Array.isArray(manifest) ? manifest : [])
         .map((row) => ({
             index: Number.parseInt(row?.index, 10),
@@ -771,6 +772,14 @@ async function prewarmManifest(manifest = [], options = {}) {
     const urls = [];
     const seen = new Set();
     for (const row of rows) {
+        if (audioOnly) {
+            const candidate = row.audioUrl || row.videoUrl;
+            if (!candidate || seen.has(candidate)) continue;
+            seen.add(candidate);
+            urls.push(candidate);
+            continue;
+        }
+
         for (const candidate of [row.audioUrl, row.videoUrl]) {
             if (!candidate || seen.has(candidate)) continue;
             seen.add(candidate);

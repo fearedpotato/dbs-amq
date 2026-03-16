@@ -309,7 +309,7 @@ describe('round engine', () => {
             expect.arrayContaining([
                 expect.objectContaining({ index: 2 })
             ]),
-            expect.objectContaining({ roundLimit: 1, maxConcurrent: 2 })
+            expect.objectContaining({ roundLimit: 1, maxConcurrent: 4, audioOnly: true })
         );
     });
 });

@@ -441,11 +441,11 @@ describe('socket gateway', () => {
         expect(ack.ok).toBe(true);
         expect(mediaProxyService.prewarmManifest).toHaveBeenCalledWith(
             expect.any(Array),
-            expect.objectContaining({ roundLimit: 1, maxConcurrent: 2 })
+            expect.objectContaining({ roundLimit: 1, maxConcurrent: 4, audioOnly: true })
         );
         expect(mediaProxyService.prewarmManifest).toHaveBeenCalledWith(
             expect.any(Array),
-            expect.objectContaining({ roundLimit: 3, maxConcurrent: 2 })
+            expect.objectContaining({ roundLimit: 5, maxConcurrent: 4, audioOnly: true })
         );
     });
 

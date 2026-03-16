@@ -9,7 +9,9 @@ const telemetry = require('../lib/telemetry');
 
 const MAX_SUDDEN_DEATH_ROUNDS = 20;
 const DEFAULT_ZERO_CONNECTED_ROUNDS_TO_KILL = 3;
+const DEFAULT_NEXT_ROUND_PREP_RETRY_MS = 750;
 const ALL_READY_REVEAL_DELAY_MS = 1_000;
+const ROUND_PREWARM_MAX_CONCURRENT = 4;
 const INVISIBLE_WHITESPACE_REGEX = /[\u200B-\u200D\u2060\uFEFF]/gu;
 
 function parsePositiveInt(value, fallback) {
@@ -24,9 +26,24 @@ function getZeroConnectedRoundsToKill() {
     );
 }
 
+function getNextRoundPreparationRetryMs() {
+    const explicit = process.env.ROUND_PREPARE_RETRY_MS;
+    if (explicit != null) {
+        return parsePositiveInt(explicit, DEFAULT_NEXT_ROUND_PREP_RETRY_MS);
+    }
+    return parsePositiveInt(
+        process.env.ROUND_PREPARE_WAIT_MS,
+        DEFAULT_NEXT_ROUND_PREP_RETRY_MS
+    );
+}
+
 function createRoundEngine(io, options = {}) {
     const stateByLobby = new Map();
     const englishTitleByAnimeId = new Map();
+
+    function waitMs(ms) {
+        return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+    }
 
     async function getEnglishAnimeTitle(animeId) {
         if (process.env.NODE_ENV === 'test') return null;
@@ -141,7 +158,9 @@ function createRoundEngine(io, options = {}) {
             readyUserIds: new Set(),
             suddenDeathRounds: 0,
             zeroConnectedRoundStreak: 0,
-            prewarmingRoundIndexes: new Set()
+            prewarmingRoundIndexes: new Set(),
+            prewarmPromisesByRoundIndex: new Map(),
+            prewarmedRoundIndexes: new Set()
         };
     }
 
@@ -160,55 +179,140 @@ function createRoundEngine(io, options = {}) {
     }
 
     async function prewarmRoundMedia(state, round, reason = 'round_prefetch') {
-        if (!state || !round) return;
+        if (!state || !round) return false;
+
+        const index = Number.parseInt(round?.index, 10);
 
         const manifestEntry = buildRoundMediaManifestEntry(round);
-        if (!manifestEntry) return;
+        if (!manifestEntry) return false;
 
         const summary = await prewarmManifest([manifestEntry], {
             roundLimit: 1,
-            maxConcurrent: 2
+            maxConcurrent: ROUND_PREWARM_MAX_CONCURRENT,
+            audioOnly: true
         });
+        const ready = summary.attempted <= 0 || summary.warmed > 0;
+        if (ready && Number.isInteger(index) && index > 0) {
+            state.prewarmedRoundIndexes.add(index);
+        }
         telemetry.info('media.prewarm_round', {
             lobbyCode: state.lobbyCode,
             sessionId: state.sessionId,
             roundId: round.id,
             index: round.index,
             reason,
+            ready,
             ...summary
         });
+        return ready;
     }
 
     async function prewarmUpcomingRound(state, nextIndex) {
-        if (!state) return;
+        if (!state) return false;
         const index = Number.parseInt(nextIndex, 10);
-        if (!Number.isInteger(index) || index <= 0) return;
+        if (!Number.isInteger(index) || index <= 0) return false;
 
         const maxPotentialRoundIndex = state.baseRoundCount + MAX_SUDDEN_DEATH_ROUNDS;
-        if (index > maxPotentialRoundIndex) return;
-        if (state.prewarmingRoundIndexes.has(index)) return;
+        if (index > maxPotentialRoundIndex) return false;
+        if (state.prewarmedRoundIndexes.has(index)) return true;
+        const inFlight = state.prewarmPromisesByRoundIndex.get(index);
+        if (inFlight) return inFlight;
         state.prewarmingRoundIndexes.add(index);
 
-        try {
+        const promise = (async () => {
             const session = await roundService.getSessionById(state.sessionId);
-            if (!session || session.status !== 'IN_PROGRESS') return;
+            if (!session || session.status !== 'IN_PROGRESS') return false;
 
             const upcomingRound = await roundService.ensureRoundForIndex({
                 session,
                 index,
                 lobbyPlayers: session.lobby.players
             });
-            await prewarmRoundMedia(state, upcomingRound, 'upcoming_round');
-        } catch (err) {
+            return prewarmRoundMedia(state, upcomingRound, 'upcoming_round');
+        })().catch((err) => {
             telemetry.warn('media.prewarm_upcoming_round_failed', {
                 lobbyCode: state.lobbyCode,
                 sessionId: state.sessionId,
                 index,
                 error: err?.message || String(err)
             });
-        } finally {
+            return false;
+        }).finally(() => {
             state.prewarmingRoundIndexes.delete(index);
+            state.prewarmPromisesByRoundIndex.delete(index);
+        });
+
+        state.prewarmPromisesByRoundIndex.set(index, promise);
+        return promise;
+    }
+
+    async function ensureUpcomingRoundPrepared(state, nextRoundIndex) {
+        if (!state) return;
+        const index = Number.parseInt(nextRoundIndex, 10);
+        if (!Number.isInteger(index) || index <= 0) return;
+        if (state.prewarmedRoundIndexes.has(index)) return;
+
+        const retryMs = getNextRoundPreparationRetryMs();
+
+        const waitStartedAt = Date.now();
+        io.to(state.lobbyCode).emit('round:preparing', {
+            lobbyCode: state.lobbyCode,
+            nextRoundIndex: index,
+            preparing: true,
+            strict: true
+        });
+
+        telemetry.info('round.preparing_next_round', {
+            lobbyCode: state.lobbyCode,
+            sessionId: state.sessionId,
+            nextRoundIndex: index,
+            strict: true,
+            retryMs
+        });
+
+        let attempts = 0;
+        while (!state.prewarmedRoundIndexes.has(index)) {
+            attempts += 1;
+
+            let warmed = false;
+            try {
+                warmed = await prewarmUpcomingRound(state, index);
+            } catch (_err) {
+                warmed = false;
+            }
+            if (warmed || state.prewarmedRoundIndexes.has(index)) break;
+
+            if (stateByLobby.get(state.lobbyCode) !== state) break;
+
+            telemetry.warn('round.preparing_next_round_retry', {
+                lobbyCode: state.lobbyCode,
+                sessionId: state.sessionId,
+                nextRoundIndex: index,
+                attempt: attempts,
+                retryMs
+            });
+            await waitMs(retryMs);
         }
+
+        const warmed = state.prewarmedRoundIndexes.has(index);
+        const waitedMs = Date.now() - waitStartedAt;
+        io.to(state.lobbyCode).emit('round:preparing', {
+            lobbyCode: state.lobbyCode,
+            nextRoundIndex: index,
+            preparing: false,
+            warmed,
+            waitedMs,
+            strict: true
+        });
+        telemetry.info('round.preparing_next_round_done', {
+            lobbyCode: state.lobbyCode,
+            sessionId: state.sessionId,
+            nextRoundIndex: index,
+            warmed,
+            waitedMs,
+            strict: true,
+            attempts
+        });
     }
 
     function parseScoreValue(value) {
@@ -547,14 +651,16 @@ function createRoundEngine(io, options = {}) {
 
         const isPlannedRoundsComplete = state.currentRound.index >= state.baseRoundCount;
         if (!isPlannedRoundsComplete) {
+            const nextRoundIndex = state.currentRound.index + 1;
             telemetry.info('round.completed', {
                 lobbyCode,
                 sessionId: state.sessionId,
                 roundId: state.currentRound.id,
                 index: state.currentRound.index,
-                nextRoundIndex: state.currentRound.index + 1
+                nextRoundIndex
             });
-            return startRound(lobbyCode, state.currentRound.index + 1);
+            await ensureUpcomingRoundPrepared(state, nextRoundIndex);
+            return startRound(lobbyCode, nextRoundIndex);
         }
 
         const topScore = scores.length > 0 ? scores[0].score : 0;
@@ -580,7 +686,9 @@ function createRoundEngine(io, options = {}) {
             tiedUserIds: tied.map((item) => item.userId)
         });
 
-        return startRound(lobbyCode, state.currentRound.index + 1);
+        const nextRoundIndex = state.currentRound.index + 1;
+        await ensureUpcomingRoundPrepared(state, nextRoundIndex);
+        return startRound(lobbyCode, nextRoundIndex);
     }
 
     async function startSession({ lobbyCode, session, lobby, deferFirstRound = false }) {
